@@ -1,0 +1,30 @@
+.build/
+.swiftpm/
+DerivedData/
+dist/
+Resources/Hajimi.icns
+Resources/Hajimi.iconset/
+.DS_Store
+.staging/
+*.xcuserstate
+*.log
+.env
+.env.*
+profile.conf
+*.local.conf
+
+# Local editor/compiler state and generated Python bytecode.
+.vscode/
+__pycache__/
+*.py[cod]
+*.o
+*.a
+*.dylib
+*.so
+*.app/
+
+# Private signing material must not be published with the source.
+*.p12
+*.pfx
+*.mobileprovision
+*.provisionprofile
