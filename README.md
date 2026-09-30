@@ -126,4 +126,4 @@ FINAL,DIRECT
 
 本项目从用户指定的 Lurge 工作目录复制而来；旧 LurgeQUICBridge/Go 目录仅作历史参考，不再参与构建。原参考目录包含未提交改动，项目不附其顶层授权文件。许可证和参考来源见 Resources/ThirdPartyNotices.txt；改写语言不自动消除派生源码的许可义务。公开分发前必须核实参考源码使用权、第三方许可证、相应源码提供义务，以及 Developer ID / Apple 授权签名要求；当前验证为本地开发构建。
 
-本项目由OpenAI的6.0sol模型编写，感谢模型提供者：𝔁𝓲 𝓬𝓱𝓮𝓷 https://t.me/PastKing｜Dakota Riley https://t.me/jayshouxx
+本项目由OpenAI的6.0sol模型编写，感谢模型提供者：𝔁𝓲 𝓬𝓱𝓮𝓷 https://t.me/PastKing ｜ Dakota Riley https://t.me/jayshouxx
