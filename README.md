@@ -1,6 +1,6 @@
 # 哈基米 (Hajimi) for macOS
 
-哈基米是 macOS 13+ 的本地代理应用。HTTP/HTTPS、SOCKS5/SOCKS5-TLS、Shadowsocks（含 2022）、VMess、VLESS、Trojan、AnyTLS、Hysteria v1/v2、TUIC v5 的实际协议内核统一使用 C++17，包括认证、加解密、流/会话与 UDP 封装；不再链接 Go 协议库或 Go 运行时。Swift 负责界面、配置、路由与应用调度，Objective-C/Objective-C++ 负责系统网络 I/O 与桥接，C 负责 IP 报文处理。
+哈基米是由 OpenAI 6.1 sol 编写的 macOS 13+ 本地自用代理应用。HTTP/HTTPS、SOCKS5/SOCKS5-TLS、Shadowsocks（含 2022）、VMess、VLESS、Trojan、AnyTLS、Hysteria v1/v2、TUIC v5 的实际协议内核统一使用 C++17，包括认证、加解密、流/会话与 UDP 封装；不再链接 Go 协议库或 Go 运行时。Swift 负责界面、配置、路由与应用调度，Objective-C/Objective-C++ 负责系统网络 I/O 与桥接，C 负责 IP 报文处理。
 ## 当前架构与边界
 
 | 部分 | 实际实现 |
@@ -126,4 +126,4 @@ FINAL,DIRECT
 
 本项目从用户指定的 Lurge 工作目录复制而来；旧 LurgeQUICBridge/Go 目录仅作历史参考，不再参与构建。原参考目录包含未提交改动，项目不附其顶层授权文件。许可证和参考来源见 Resources/ThirdPartyNotices.txt；改写语言不自动消除派生源码的许可义务。公开分发前必须核实参考源码使用权、第三方许可证、相应源码提供义务，以及 Developer ID / Apple 授权签名要求；当前验证为本地开发构建。
 
-本项目由OpenAI的6.0sol模型编写，感谢模型提供者：𝔁𝓲 𝓬𝓱𝓮𝓷 https://t.me/PastKing ｜ Dakota Riley https://t.me/jayshouxx
+本项目由OpenAI的6.1sol模型编写，感谢模型提供者：𝔁𝓲 𝓬𝓱𝓮𝓷 https://t.me/PastKing ｜ Dakota Riley https://t.me/jayshouxx
