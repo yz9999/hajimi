@@ -1,0 +1,16 @@
+.DS_Store
+**/.DS_Store
+.build/
+.swiftpm/
+*.xcuserstate
+xcuserdata/
+DerivedData/
+/dist/
+*.dmg
+*.ipa
+*.p12
+*.mobileprovision
+.env
+# 本地测试节点配置（可能包含真实服务器凭据）
+测试节点配置-*
+Resources/测试节点配置-*

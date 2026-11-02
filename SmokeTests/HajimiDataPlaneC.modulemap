@@ -1,0 +1,4 @@
+module HajimiDataPlaneC {
+    header "../Sources/HajimiDataPlaneC/include/hajimi_dataplane.h"
+    export *
+}

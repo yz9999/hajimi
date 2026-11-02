@@ -1,0 +1,46 @@
+Hajimi source and third-party components
+========================================
+
+This project adapts files from the user-provided local Lurge checkout. That
+checkout did not contain a top-level license grant; confirm the right to
+redistribute derivative source and binaries before publication.
+
+The proxy engines in Sources/HajimiProtocolsCXX are compiled C++ implementations.
+The following C libraries are statically linked; none is launched as a separate
+proxy process. Dependencies are built locally, not installed globally.
+
+- OpenSSL (local verification: 3.6.2; requires >=3.5) — Apache License 2.0
+  https://github.com/openssl/openssl
+- ngtcp2 v1.18.0 — MIT License
+  https://github.com/ngtcp2/ngtcp2
+- nghttp3 v1.12.0 — MIT License
+  https://github.com/ngtcp2/nghttp3
+- libssh2 — BSD-3-Clause License
+  Pinned commit 2e1717456b8dd4c980e8e48d6dbfec524c2e62d1
+  https://github.com/libssh2/libssh2
+
+Exact QUIC/SSH source archive hashes and revisions are locked in
+scripts/build_cpp_quic.sh and scripts/build_cpp_ssh.sh. OpenSSL is supplied by
+HAJIMI_OPENSSL_ROOT; use the notices/licenses from that exact build when
+distributing. Full dependency licenses are available in .build/Vendor sources.
+
+Protocol specifications/reference sources used during the C++ migration:
+
+- sing-anytls v0.0.11 — GNU General Public License v3.0
+  https://github.com/anytls/sing-anytls
+- Hysteria core/extras v2.10.0 — MIT License
+  https://github.com/apernet/hysteria
+- quic-go (historical reference; NOT linked) — MIT License
+  https://github.com/quic-go/quic-go
+- golang.org/x/crypto (historical reference; NOT linked) — BSD-3-Clause License
+  https://cs.opensource.google/go/x/crypto
+- google/uuid (historical reference; NOT linked) — BSD-3-Clause License
+  https://github.com/google/uuid
+- Argon2 reference implementation (historical reference; NOT linked) — CC0 / Apache-2.0
+  https://github.com/P-H-C/phc-winner-argon2
+
+The historical reference revisions remain recorded in Native/LurgeQUIC/go.mod.
+Those Go archives and the old Swift/Go codecs are not the active native protocol
+path. Language rewrites do not automatically remove derivative-source licensing
+obligations; review reference-code usage and corresponding-source requirements
+before redistributing, especially GPLv3 AnyTLS references.

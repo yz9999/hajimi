@@ -1,0 +1,4 @@
+module HajimiRoutingCXX {
+    header "../Sources/HajimiRoutingCXX/include/HajimiRoutingCXX.h"
+    export *
+}
