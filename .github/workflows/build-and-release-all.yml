@@ -1,0 +1,264 @@
+name: Build & Release Hajimi (Intel + ARM64 + Universal)
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '自定义 Release 标签名 (留空则自动读取 Info.plist 生成如 v0.1.0-Build44)'
+        required: false
+        default: ''
+        type: string
+      run_smoke_tests:
+        description: '编译后执行内建自检验证 (推荐开启)'
+        required: false
+        default: true
+        type: boolean
+
+# 授予 Releases 写入权限，确保自动创建/更新 GitHub Releases
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MACOSX_DEPLOYMENT_TARGET: '13.0'
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  HOMEBREW_NO_INSTALL_CLEANUP: '1'
+  HOMEBREW_NO_ENV_HINTS: '1'
+
+jobs:
+  # ============================================================================
+  # 第一阶段：矩阵并行编译 Intel (x86_64)、Apple Silicon (arm64) 与双架构通用版 (universal)
+  # ============================================================================
+  build:
+    name: Build 哈基米 (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: x86_64
+            label: Intel x86_64
+            os: macos-15-intel
+            archs: 'x86_64'
+          - flavor: arm64
+            label: Apple Silicon arm64
+            os: macos-15
+            archs: 'arm64'
+          - flavor: universal
+            label: Universal (x86_64 + arm64)
+            os: macos-15
+            archs: 'x86_64 arm64'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Locate Project Root, Read Version & Clean Stale Local Artifacts
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "Package.swift" ] && [ -f "Makefile" ]; then
+            PROJECT_DIR="$PWD"
+          else
+            PROJECT_DIR="$(find "$PWD" -maxdepth 3 -name "Package.swift" -exec dirname {} \; | head -n 1)"
+          fi
+          if [ -z "$PROJECT_DIR" ] || [ ! -f "$PROJECT_DIR/Makefile" ]; then
+            echo "::error::未找到 Package.swift 或 Makefile，请检查仓库目录结构。"
+            exit 1
+          fi
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+          cd "$PROJECT_DIR"
+          APP_VER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist 2>/dev/null || echo '0.1.0')"
+          BUILD_NO="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Resources/Info.plist 2>/dev/null || echo '44')"
+          echo "app_version=$APP_VER" >> "$GITHUB_OUTPUT"
+          echo "build_number=$BUILD_NO" >> "$GITHUB_OUTPUT"
+          echo "Located project: $PROJECT_DIR (v${APP_VER} Build ${BUILD_NO})"
+
+          # 赋予所有构建与签名脚本可执行权限（防止网页上传或解压丢失 +x 权限导致 Permission denied）
+          chmod +x scripts/*.sh SmokeTests/*.sh NetworkExtension/*.sh 编译打包.command 2>/dev/null || true
+
+          # 清理本地打包遗留的 .build 缓存（保留 Vendor 目录以便命中缓存），避免残留绝对路径导致 SwiftPM 报错
+          if [ -d ".build" ]; then
+            find .build -mindepth 1 -maxdepth 1 ! -name 'Vendor' -exec rm -rf {} +
+          fi
+
+      - name: Cache Native C/C++ Vendor Dependencies (${{ matrix.flavor }})
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.locate.outputs.project_dir }}/.build/Vendor
+          key: hajimi-vendor-macos13-${{ matrix.flavor }}-${{ hashFiles('**/scripts/build_native_core.sh', '**/scripts/build_cpp_quic.sh', '**/scripts/build_cpp_ssh.sh') }}
+          restore-keys: |
+            hajimi-vendor-macos13-${{ matrix.flavor }}-
+
+      - name: Build Native C/C++ Core (OpenSSL 3.5+ Static, QUIC & SSH)
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          export HAJIMI_ARCHS="${{ matrix.archs }}"
+          export HAJIMI_BUILD_JOBS="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+
+          # Universal 双架构编译时，强制使用源码编译含双架构切片的静态 OpenSSL 3.5+
+          if [ "${{ matrix.flavor }}" = "universal" ]; then
+            export HAJIMI_OPENSSL_ROOT="$PWD/.build/Vendor/OpenSSL"
+          fi
+
+          ./scripts/build_native_core.sh
+
+          test -f ".build/Vendor/OpenSSL/lib/libssl.a"
+          test -f ".build/Vendor/OpenSSL/lib/libcrypto.a"
+          test -f ".build/Vendor/HajimiQUIC/lib/libngtcp2.a"
+          test -f ".build/Vendor/HajimiQUIC/lib/libngtcp2_crypto_ossl.a"
+          test -f ".build/Vendor/HajimiQUIC/lib/libnghttp3.a"
+          test -f ".build/Vendor/HajimiSSH/lib/libssh2.a"
+
+      - name: Build & Package 哈基米.app (${{ matrix.flavor }})
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          VENDOR_OPENSSL="$PWD/.build/Vendor/OpenSSL"
+
+          # 显式指定 HAJIMI_OPENSSL_ROOT 指向已通过 QUIC API 校验的 .build/Vendor/OpenSSL
+          make app archive \
+            ARCHS="${{ matrix.archs }}" \
+            BUILD_CONFIG=release \
+            HAJIMI_OPENSSL_ROOT="$VENDOR_OPENSSL"
+
+      - name: Verify Bundle Integrity, Architecture Slices & Self-Tests
+        if: ${{ inputs.run_smoke_tests != false }}
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          APP_BUNDLE="dist/哈基米.app"
+          MAIN_BIN="$APP_BUNDLE/Contents/MacOS/Hajimi"
+          HELPER_BIN="$APP_BUNDLE/Contents/Resources/HajimiHelper"
+
+          file "$MAIN_BIN"
+          file "$HELPER_BIN"
+          for arch in ${{ matrix.archs }}; do
+            /usr/bin/lipo -archs "$MAIN_BIN" | grep -qw "$arch"
+            /usr/bin/lipo -archs "$HELPER_BIN" | grep -qw "$arch"
+          done
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+          /usr/bin/plutil -lint "$APP_BUNDLE/Contents/Info.plist"
+
+          # 运行无网络副作用的内建安全与协议自检
+          "$MAIN_BIN" --native-quic-codec-test
+          "$MAIN_BIN" --protocol-adapter-smoke-test
+          "$MAIN_BIN" --ingress-security-self-test
+          "$MAIN_BIN" --network-optimization-self-test
+          "$MAIN_BIN" --native-dataplane-self-test
+          "$HELPER_BIN" --self-test
+
+      - name: Create Distributable DMG Installer (${{ matrix.flavor }})
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          APP_VER="${{ steps.locate.outputs.app_version }}"
+          FLAVOR="${{ matrix.flavor }}"
+          DMG_STAGE="$(mktemp -d)"
+          cp -R "dist/哈基米.app" "$DMG_STAGE/"
+          ln -s /Applications "$DMG_STAGE/Applications"
+          hdiutil create -volname "哈基米" \
+            -srcfolder "$DMG_STAGE" \
+            -ov -format UDZO \
+            "dist/哈基米-${APP_VER}-${FLAVOR}.dmg"
+          rm -rf "$DMG_STAGE"
+          ls -lh dist/
+
+      - name: Upload Matrix Artifacts (${{ matrix.flavor }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hajimi-pkg-${{ matrix.flavor }}
+          path: |
+            ${{ steps.locate.outputs.project_dir }}/dist/*.zip
+            ${{ steps.locate.outputs.project_dir }}/dist/*.dmg
+            ${{ steps.locate.outputs.project_dir }}/Resources/Info.plist
+          if-no-files-found: error
+          retention-days: 30
+
+  # ============================================================================
+  # 第二阶段：汇总全部架构产物（x86_64 / arm64 / universal），生成校验和并自动同步到 Releases
+  # ============================================================================
+  release:
+    name: Sync All Builds to GitHub Releases
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Download All Architecture Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: Hajimi-pkg-*
+          path: release_raw
+          merge-multiple: true
+
+      - name: Prepare Release Assets & SHA256 Checksums
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release_assets
+          find release_raw -maxdepth 3 \( -name "*.dmg" -o -name "*.zip" \) -exec cp -f {} release_assets/ \;
+
+          # 从 Info.plist 提取版本号与 Build 号
+          PLIST_FILE="$(find release_raw -name "Info.plist" | head -n 1 || true)"
+          if [ -n "$PLIST_FILE" ] && [ -f "$PLIST_FILE" ]; then
+            APP_VER="$(python3 -c "import plistlib; p=plistlib.load(open('$PLIST_FILE','rb')); print(p.get('CFBundleShortVersionString','0.1.0'))")"
+            BUILD_NO="$(python3 -c "import plistlib; p=plistlib.load(open('$PLIST_FILE','rb')); print(p.get('CFBundleVersion','44'))")"
+          else
+            APP_VER="0.1.0"
+            BUILD_NO="44"
+          fi
+
+          # 计算 Release 标签名：优先使用手动输入 -> Git Tag -> 自动生成的 v0.1.0-Build44
+          INPUT_TAG="${{ inputs.release_tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            TAG_NAME="$INPUT_TAG"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG_NAME="${{ github.ref_name }}"
+          else
+            TAG_NAME="v${APP_VER}-Build${BUILD_NO}"
+          fi
+
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "release_title=哈基米 (Hajimi) ${TAG_NAME} (Intel + Apple Silicon + Universal)" >> "$GITHUB_OUTPUT"
+
+          cd release_assets
+          sha256sum *.dmg *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          ls -lh
+
+      - name: Publish / Sync to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag_name }}
+          name: ${{ steps.meta.outputs.release_title }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          body: |
+            ### 哈基米 (Hajimi) for macOS 13.0+ 自动编译发布
+            - **Apple Silicon (`arm64`) 专版**：适用于 M1 / M2 / M3 / M4 系列芯片 Mac（`哈基米-*-arm64.dmg` / `.zip`）
+            - **Intel (`x86_64`) 专版**：适用于 Intel 芯片 Mac（`哈基米-*-x86_64.dmg` / `.zip`）
+            - **Universal (`universal`) 通用版**：双架构合一，支持所有 Intel 与 Apple Silicon Mac（`哈基米-*-universal.dmg` / `.zip`）
+            - **完整性校验**：详见附件 `SHA256SUMS.txt`
+          files: |
+            release_assets/*.dmg
+            release_assets/*.zip
+            release_assets/SHA256SUMS.txt
