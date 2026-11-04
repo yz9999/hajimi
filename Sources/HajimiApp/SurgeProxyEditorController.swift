@@ -444,8 +444,9 @@ final class SurgeProxyEditorController: NSWindowController {
     }
 
     private static func supportsUnderlyingProxy(for type: String) -> Bool {
-        ["http", "https", "socks5", "socks5-tls", "ss", "ssr",
-         "vmess", "vless", "trojan"].contains(type)
+        ["http", "https", "socks5", "socks5-tls", "ss", "ssr", "snell",
+         "vmess", "vless", "trojan", "anytls", "sudoku", "mieru",
+         "trusttunnel", "hysteria", "hysteria2", "tuic", "ssh", "wireguard"].contains(type)
     }
 
     private func configureCommonControls() {
@@ -725,7 +726,7 @@ final class SurgeProxyEditorController: NSWindowController {
             return [
                 text("psk", "PSK 密钥", "必填", true),
                 select("version", "协议版本", [
-                    ("v4 (推荐)", "4"), ("v5", "5"), ("v3", "3"), ("v2", "2"), ("v1", "1")
+                    ("v6", "6"), ("v5", "5"), ("v4 (推荐)", "4")
                 ], default: "4"),
                 toggle("reuse", "启用连接复用 (reuse)", defaultOn: true)
             ]

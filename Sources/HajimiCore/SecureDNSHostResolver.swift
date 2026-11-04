@@ -197,7 +197,12 @@ public final class SecureDNSHostResolver {
             let deadline = DispatchWorkItem { [weak self, weak request] in
                 guard let self, let request, self.requests[name] === request else { return }
                 if request.answers.isEmpty {
-                    self.finish(name, request, .failure(Self.failure("代理服务器的加密 DNS 引导超时")))
+                    let stale = self.sameGenerationStaleAddresses(for: name, generation: request.generation)
+                    if !stale.isEmpty {
+                        self.finish(name, request, .success(stale))
+                    } else {
+                        self.finish(name, request, .failure(Self.failure("代理服务器的加密 DNS 引导超时")))
+                    }
                 } else { self.completeAnswers(name, request) }
             }
             request.deadline = deadline
@@ -220,6 +225,17 @@ public final class SecureDNSHostResolver {
                 }
                 return
             }
+        }
+    }
+
+    private func sameGenerationStaleAddresses(for name: String, generation: UInt64) -> [String] {
+        let referenceNow = now()
+        return fastCacheLock.withLock {
+            guard let stale = staleFastCache[name],
+                  stale.generation == generation,
+                  isCurrentGeneration(generation),
+                  stale.expiry > referenceNow else { return [] }
+            return stale.addresses
         }
     }
 
@@ -268,7 +284,12 @@ public final class SecureDNSHostResolver {
                    outcome: .cancelled); return
         }
         guard request.round < endpoints.count else {
-            finish(name, request, .failure(Self.failure("代理服务器的加密 DNS 引导失败；未回退系统 DNS")))
+            let stale = sameGenerationStaleAddresses(for: name, generation: request.generation)
+            if !stale.isEmpty {
+                finish(name, request, .success(stale))
+            } else {
+                finish(name, request, .failure(Self.failure("代理服务器的加密 DNS 引导失败；未回退系统 DNS")))
+            }
             return
         }
         request.cancellations.forEach { $0() }
@@ -321,7 +342,10 @@ public final class SecureDNSHostResolver {
             return
         }
         let values = Array(addresses)
-        let ttl = min(request.answers.map(\.ttl).min() ?? 0, 300)
+        let rawTTL = request.answers.map(\.ttl).min() ?? 0
+        // Enforce a 60s minimum floor for positive TTLs so 30s DDNS/CDN node records
+        // do not stall Mieru-UDP stream dials every 30s (as seen in 235847.json att[30..114]).
+        let ttl = rawTTL > 0 ? min(max(rawTTL, 60), 300) : 0
         if ttl > 0 {
             if cache.count >= 512 {
                 cache = cache.filter { $0.value.expiry > now() }

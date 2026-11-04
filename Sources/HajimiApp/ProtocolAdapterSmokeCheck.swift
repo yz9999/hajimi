@@ -564,12 +564,14 @@ func runProtocolAdapterSmokeCheck() -> Int32 {
             throw SmokeCheckError("部分协议没有被提升为原生出站")
         }
         let udpExpected: Set<String> = ["SS", "SSR", "Snell", "VMess", "VLESS", "Trojan",
-                                        "AnyTLS", "Hysteria", "Hysteria2", "TUIC"]
+                                        "AnyTLS", "Sudoku", "Mieru", "TrustTunnel",
+                                        "Hysteria", "Hysteria2", "TUIC"]
         guard profile.adapterPolicies.filter(NativeOutboundFactory.supportsUDP)
                 .reduce(into: Set<String>(), { $0.insert($1.name) }) == udpExpected else {
             throw SmokeCheckError("原生 UDP 能力矩阵不一致")
         }
-        let streamUDPExpected: Set<String> = ["Snell", "VMess", "VLESS", "Trojan", "AnyTLS"]
+        let streamUDPExpected: Set<String> = ["Snell", "VMess", "VLESS", "Trojan", "AnyTLS",
+                                              "Sudoku", "Mieru", "TrustTunnel"]
         guard profile.adapterPolicies.filter(NativeOutboundFactory.carriesUDPOverReliableStream)
                 .reduce(into: Set<String>(), { $0.insert($1.name) }) == streamUDPExpected else {
             throw SmokeCheckError("QUIC TCP 回退能力矩阵不一致")

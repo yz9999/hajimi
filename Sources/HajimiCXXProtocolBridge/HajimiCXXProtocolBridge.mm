@@ -3,6 +3,7 @@
 #include "Runtime.hpp"
 #include "AnyTLS.hpp"
 #include "MieruProtocol.hpp"
+#include "WireGuardProtocol.hpp"
 #include "ServerProtocols.hpp"
 #include <algorithm>
 #include <arpa/inet.h>
@@ -42,6 +43,29 @@ NSError *nativeError(const Error &error, bool cancelled = false) {
     if(auto platform=std::dynamic_pointer_cast<const PlatformErrorMetadata>(error.metadata()))return platform->native();
     if(error=="Stream closed" || error=="Protocol client cancelled" || error=="Native UDP connection cancelled" || error=="Datagram session closed" || error=="Mieru UDP session closed")return cancelledError();
     NSString *message=[[NSString alloc]initWithBytes:error.data() length:error.size() encoding:NSUTF8StringEncoding];
+    if(error=="Mieru UDP session handshake timed out" ||
+       error=="Mieru UDP retransmission limit exceeded" ||
+       error=="C++ protocol connection timed out" ||
+       error=="Sudoku KIP handshake timed out" ||
+       error=="TrustTunnel CONNECT handshake timed out" ||
+       error=="Snell handshake timed out" ||
+       error=="SSH handshake timed out" ||
+       error=="WireGuard handshake timed out" ||
+       error=="WireGuard TCP connect timed out" ||
+       error=="WireGuard in-tunnel DNS timed out"){
+        return [NSError errorWithDomain:NSPOSIXErrorDomain code:ETIMEDOUT userInfo:@{NSLocalizedDescriptionKey:message?:@"Connection timed out"}];
+    }
+    if(error=="Mieru UDP socket error" ||
+       error=="Mieru UDP target connection closed by server" ||
+       error=="Mieru UDP dial failed" ||
+       error=="UDP transport send failed" ||
+       error=="UDP transport receive failed" ||
+       error=="Native UDP connection failed" ||
+       error=="UDP transport closed" ||
+       error=="WireGuard remote peer reset TCP connection" ||
+       error=="WireGuard UDP carrier failed"){
+        return [NSError errorWithDomain:NSPOSIXErrorDomain code:ECONNRESET userInfo:@{NSLocalizedDescriptionKey:message?:@"Connection reset by peer"}];
+    }
     return [NSError errorWithDomain:HJCppProtocolErrorDomain code:1 userInfo:@{NSLocalizedDescriptionKey:message?:@"Native protocol failure"}];
 }
 Error cppError(NSError *error) {
@@ -197,6 +221,82 @@ void closeOwnedSocket(const std::shared_ptr<std::atomic<int>> &owner) noexcept {
 // High-performance non-blocking POSIX UDP datagram transport with 4 MB kernel
 // socket buffers, synchronous zero-copy ::send (guaranteeing closeSessionRequest
 // delivery before socket teardown), and batched DISPATCH_SOURCE_TYPE_READ receive.
+class PreparedStreamDatagram final:public Datagram,public std::enable_shared_from_this<PreparedStreamDatagram>{
+    id<HJByteStream> native_;
+    dispatch_queue_t queue_;
+    Target peer_;
+    bool closed_ = false, started_ = false;
+    PacketCallback receive_;
+    WriteCallback failure_;
+    void pumpRead() {
+        if (closed_ || !started_ || !native_) return;
+        auto self = shared_from_this();
+        [native_ receiveWithMaximum:65536 completion:^(dispatch_data_t content, BOOL eof, NSError *error) {
+            Buffer value;
+            auto failure = cppError(error);
+            bool ended = eof;
+            try { value = dispatchBuffer(content); }
+            catch (const std::exception &ex) {
+                if (failure.empty()) failure = ex.what();
+                ended = true;
+            }
+            post(self->queue_, [self, value = std::move(value), ended, failure]() mutable {
+                if (self->closed_) return;
+                if (!value.empty() && self->receive_) {
+                    self->receive_(self->peer_, std::move(value));
+                }
+                if (!failure.empty() || ended) {
+                    auto cb = std::move(self->failure_);
+                    self->close();
+                    if (cb) cb(failure.empty() ? Error("Chained UDP transport closed") : failure);
+                    return;
+                }
+                self->pumpRead();
+            });
+        }];
+    }
+public:
+    PreparedStreamDatagram(id<HJByteStream> native, dispatch_queue_t queue, Target peer)
+        : native_(native), queue_(queue), peer_(std::move(peer)) {}
+    ~PreparedStreamDatagram() override { close(); }
+    void send(Target, Buffer value, WriteCallback completion) override {
+        if (closed_ || !native_) {
+            if (completion) completion("UDP transport closed");
+            return;
+        }
+        NSData *payload = data(std::move(value));
+        auto self = shared_from_this();
+        const auto dispatchBytes = dispatch_data_create(payload.bytes, payload.length, nullptr, ^{ (void)payload; });
+        [native_ sendContent:dispatchBytes isComplete:NO completion:^(NSError *error) {
+            auto failure = cppError(error);
+            post(self->queue_, [self, completion, failure] {
+                if (completion) completion(failure);
+            });
+        }];
+    }
+    void start(PacketCallback receive, WriteCallback failure) override {
+        if (closed_ || !native_) {
+            if (failure) failure("UDP transport closed");
+            return;
+        }
+        if (started_) {
+            if (failure) failure("UDP receiver already started");
+            return;
+        }
+        started_ = true;
+        receive_ = std::move(receive);
+        failure_ = std::move(failure);
+        pumpRead();
+    }
+    void close() override {
+        if (closed_) return;
+        closed_ = true;
+        receive_ = nullptr;
+        failure_ = nullptr;
+        [native_ cancel];
+    }
+};
+
 class PlatformDatagram final:public Datagram,public std::enable_shared_from_this<PlatformDatagram>{
     std::shared_ptr<std::atomic<int>> fdOwner_;
     dispatch_queue_t queue_;
@@ -369,10 +469,12 @@ std::shared_ptr<PlatformDatagram> dialPOSIXDatagram(const Node &node, dispatch_q
             }
 #endif
         }
-        for (int bufSize : {4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024, 512 * 1024}) {
+        // Right-size per-socket UDP buffers (1 MB RCV / 512 KB SND) so 30-60 concurrent
+        // per-stream Mieru-UDP sockets cannot exhaust macOS XNU kernel mbuf clusters (ENOBUFS).
+        for (int bufSize : {1024 * 1024, 512 * 1024, 256 * 1024}) {
             if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufSize, sizeof(bufSize)) == 0) break;
         }
-        for (int bufSize : {4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024, 512 * 1024}) {
+        for (int bufSize : {512 * 1024, 256 * 1024}) {
             if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufSize, sizeof(bufSize)) == 0) break;
         }
         if (::connect(fd, addr->ai_addr, addr->ai_addrlen) != 0) {
@@ -474,6 +576,7 @@ struct Context:std::enable_shared_from_this<Context>{
     void cancel(){
         if(closed)return;closed=true;cancellationSignal=true;
         resetAnyTLSClient(factory);
+        resetWireGuardClient(factory);
         scopeSetupDatagrams.clear();
         scopeOperations.clear();
         {
@@ -489,7 +592,7 @@ struct Context:std::enable_shared_from_this<Context>{
         auto oldDatagrams=std::move(datagrams);datagrams.clear();for(auto &weak:oldDatagrams)if(auto value=weak.lock())value->close();dialer=nil;physicalDialer=nil;scopedPhysicalDialer=nil;scopedPreparedDialer=nil;
     }
     bool usesSharedFactory()const{
-        return node.type=="anytls" || node.type=="ssh" || node.type=="hysteria" || node.type=="hysteria2" || node.type=="tuic";
+        return node.type=="anytls" || node.type=="ssh" || node.type=="snell" || node.type=="wireguard" || node.type=="hysteria" || node.type=="hysteria2" || node.type=="tuic";
     }
     std::shared_ptr<TransportFactory> factoryForScope(NSUUID *scope);
     void dialTCP(const Node &,const TLSOptions &,NSUUID *scope,StreamCallback);
@@ -518,7 +621,7 @@ std::shared_ptr<TransportFactory> Context::factoryForScope(NSUUID *scope){
             context->dialTCP(node,tls,identity,std::move(completion));
         };
     }
-    if (!scopeKey.empty()) {
+    if (!scopeKey.empty() || scopedPreparedDialer) {
         scoped->udp=[weak,scopeKey](const Node &node,DatagramCallback completion){
             auto context=weak.lock();if(!context){completion(nullptr,"Protocol client cancelled");return;}
             context->dialUDP(node,scopeKey,std::move(completion));
@@ -573,6 +676,34 @@ void Context::dialUDP(const Node &node,const std::string &scopeKey,DatagramCallb
             completion(nullptr,"Native UDP connection cancelled");
             return;
         }
+    }
+    if ((dialer || scopedPreparedDialer) && !node.option("underlying-proxy", node.option("dialer-proxy")).empty()) {
+        auto context = shared_from_this();
+        auto attempt = ++nextAttempt;
+        Target peerTarget{node.dialHost(), node.port, true, false};
+        auto ready = ^(id<HJByteStream> stream, NSError *error) {
+            auto failure = cppError(error);
+            post(context->queue, [context, stream, completion, failure, attempt, peerTarget]() mutable {
+                context->attempts.erase(attempt);
+                if (context->closed) { [stream cancel]; completion(nullptr, "Protocol client cancelled"); return; }
+                if (!failure.empty() || !stream) {
+                    [stream cancel];
+                    completion(nullptr, failure.empty() ? "Chained UDP transport did not return a stream" : failure);
+                    return;
+                }
+                auto value = std::make_shared<PreparedStreamDatagram>(stream, context->queue, std::move(peerTarget));
+                context->prune(context->datagrams);
+                context->datagrams.push_back(value);
+                completion(std::move(value), {});
+            });
+        };
+        if (dialer) { dialer(ready); return; }
+        NSUUID *scopeUUID = (!usesSharedFactory() && !scopeKey.empty())
+            ? [[NSUUID alloc] initWithUUIDString:[NSString stringWithUTF8String:scopeKey.c_str()]]
+            : nil;
+        dispatch_block_t cancel = scopedPreparedDialer(scopeUUID, ready);
+        attempts[attempt] = [cancel] { if (cancel) cancel(); };
+        return;
     }
     Error err;
     auto value=dialPOSIXDatagram(node,queue,err);
@@ -719,7 +850,7 @@ void deliver(dispatch_queue_t queue,HJStreamWriteCompletion completion,Error err
         auto network=node.option("network",node.option("transport","tcp"));
         std::transform(network.begin(),network.end(),network.begin(),[](unsigned char c){return char(std::tolower(c));});
         bool quic=node.type=="hysteria" || node.type=="hysteria2" || node.type=="tuic";
-        bool selfManaged=node.type=="mieru" || node.type=="sudoku" || node.type=="trusttunnel" || node.type=="snell" || node.type=="anytls" || node.type=="ssh";
+        bool selfManaged=node.type=="mieru" || node.type=="sudoku" || node.type=="trusttunnel" || node.type=="snell" || node.type=="anytls" || node.type=="ssh" || node.type=="wireguard";
         bool needsCarrier=!quic && !selfManaged && network!="tcp" && !network.empty();
         bool reality=node.parameters.count("reality-public-key") || node.option("security")=="reality";
         if((needsCarrier || reality) && !dialer){if(error)*error=nativeError("This configuration requires a prepared carrier adapter");return nil;}
@@ -842,4 +973,5 @@ void deliver(dispatch_queue_t queue,HJStreamWriteCompletion completion,Error err
 void HJFlushCachedBridgeInterfaces(void) {
     flushCachedBridgeInterfaces();
     hajimi::resetAnyTLSClients();
+    hajimi::resetWireGuardClient(nullptr);
 }

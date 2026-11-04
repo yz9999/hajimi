@@ -223,20 +223,37 @@ final class RealityTLSByteTransport: VisionDirectByteTransport {
     }
 
     func enableVisionDirectWrite() {
-        onQueueSync { self.visionDirectWrite = true }
+        onQueue { self.visionDirectWrite = true }
     }
 
     func enableVisionDirectRead() {
-        onQueueSync {
+        onQueue {
             guard !self.visionDirectRead else { return }
             self.visionDirectRead = true
             self.directReadBuffer.append(self.recordReader.takePendingBytes())
+            if self.plaintextHead >= self.plaintextQueue.count,
+               !self.directReadBuffer.isEmpty,
+               let completion = self.receiveCompletion {
+                let value = self.directReadBuffer
+                self.directReadBuffer.removeAll(keepingCapacity: true)
+                self.receiveCompletion = nil
+                completion(value, false, nil)
+            }
         }
     }
 
-    private func onQueueSync(_ body: () -> Void) {
+    /// Dispatches Vision direct-mode transitions onto `self.queue` without
+    /// `dispatch_sync`. Because `self.queue` and `HJCppProtocolClient`'s
+    /// `"app.hajimi.cpp-protocol.strand"` share the same target queue
+    /// (`"app.hajimi.cpp-client.transport"`), calling `queue.sync` from the C++
+    /// strand traps in libdispatch (`dispatch_sync called on queue already owned
+    /// by current thread`). Since `send(_:completion:)` and `receive(completion:)`
+    /// also enqueue on `self.queue` via `queue.async`, FIFO serial ordering on
+    /// `self.queue` strictly guarantees that the direct-mode flag flip runs
+    /// before any subsequent raw Vision write or read.
+    private func onQueue(_ body: @escaping () -> Void) {
         if DispatchQueue.getSpecific(key: queueKey) != nil { body() }
-        else { queue.sync(execute: body) }
+        else { queue.async(execute: body) }
     }
 
     func cancel() { queue.async { self.close(nil) } }
@@ -540,6 +557,37 @@ public enum RealityTLSSelfTest {
             throw NativeOutboundError.protocolError("REALITY 分享链接导入自测失败")
         }
         try GenevaDesyncEngine.selfTest()
+        try siblingStrandTargetQueueSelfTest()
+    }
+
+    /// Regression test: invoking `enableVisionDirectWrite()` and
+    /// `enableVisionDirectRead()` from a sibling serial queue that shares the
+    /// same target queue (`"app.hajimi.cpp-client.transport"` hierarchy) must
+    /// never deadlock or trigger libdispatch's target-queue ownership trap.
+    private static func siblingStrandTargetQueueSelfTest() throws {
+        let sharedTarget = DispatchQueue(label: "app.hajimi.reality-selftest.transport")
+        let strand = DispatchQueue(label: "app.hajimi.reality-selftest.strand", target: sharedTarget)
+        let realityQueue = DispatchQueue(label: "app.hajimi.reality-selftest.reality", target: sharedTarget)
+        let key = DispatchSpecificKey<UInt8>()
+        realityQueue.setSpecific(key: key, value: 1)
+        var directWrite = false
+        var directRead = false
+        strand.sync {
+            if DispatchQueue.getSpecific(key: key) != nil {
+                directWrite = true
+            } else {
+                realityQueue.async { directWrite = true }
+            }
+            if DispatchQueue.getSpecific(key: key) != nil {
+                directRead = true
+            } else {
+                realityQueue.async { directRead = true }
+            }
+        }
+        realityQueue.sync {}
+        guard directWrite && directRead else {
+            throw NativeOutboundError.protocolError("REALITY 共享 target queue 异步切换自测失败")
+        }
     }
 }
 

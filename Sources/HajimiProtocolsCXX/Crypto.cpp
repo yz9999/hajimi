@@ -30,9 +30,9 @@ const EVP_MD *mdForName(const std::string &name) {
     if (name == "SHA256" || name == "sha256") return EVP_sha256();
     if (name == "SHA1" || name == "sha1") return EVP_sha1();
     if (name == "MD5" || name == "md5") return EVP_md5();
-    if (name == "SHA224" || name == "sha224") return EVP_sha224();
-    if (name == "SHA384" || name == "sha384") return EVP_sha384();
-    if (name == "SHA512" || name == "sha512") return EVP_sha512();
+    if (name == "SHA224" || name == "SHA-224" || name == "sha224") return EVP_sha224();
+    if (name == "SHA384" || name == "SHA-384" || name == "sha384") return EVP_sha384();
+    if (name == "SHA512" || name == "SHA-512" || name == "sha512") return EVP_sha512();
     return EVP_get_digestbyname(name.c_str());
 }
 uint32_t load32(const uint8_t *p) noexcept {
@@ -65,11 +65,16 @@ void hChaCha20Into(const Buffer &key, const Buffer &nonce, std::array<uint8_t, 3
         std::array<uint8_t, 32> key{};
         std::array<uint8_t, 16> nonce16{};
         std::array<uint8_t, 32> derived{};
+        ~HChaChaCache() {
+            OPENSSL_cleanse(key.data(), key.size());
+            OPENSSL_cleanse(nonce16.data(), nonce16.size());
+            OPENSSL_cleanse(derived.data(), derived.size());
+        }
     };
     thread_local HChaChaCache cache;
     if (cache.valid &&
         std::memcmp(cache.nonce16.data(), nonce.data(), 16) == 0 &&
-        std::memcmp(cache.key.data(), key.data(), 32) == 0) {
+        CRYPTO_memcmp(cache.key.data(), key.data(), 32) == 0) {
         out = cache.derived;
         return;
     }
@@ -86,6 +91,7 @@ void hChaCha20Into(const Buffer &key, const Buffer &nonce, std::array<uint8_t, 3
         store32(state[i], out.data()+i*4);
         store32(state[i+12], out.data()+(i+4)*4);
     }
+    OPENSSL_cleanse(state.data(), sizeof(state));
     std::memcpy(cache.key.data(), key.data(), 32);
     std::memcpy(cache.nonce16.data(), nonce.data(), 16);
     cache.derived = out;
@@ -140,13 +146,17 @@ Buffer randomBytes(size_t count) {
     require(RAND_bytes(result.data(), length(count)) == 1, "Secure random generator failed");
     return result;
 }
-Buffer digest(const std::string &name, const Buffer &input) {
+Buffer digestSlice(const std::string &name, const uint8_t *input, size_t inputLen) {
     const EVP_MD *algorithm = mdForName(name);
     require(algorithm != nullptr, "Unknown hash algorithm");
     Buffer output(EVP_MD_get_size(algorithm)); unsigned written = 0;
-    require(EVP_Digest(input.data(), input.size(), output.data(), &written, algorithm, nullptr) == 1,
+    static const uint8_t emptyByte = 0;
+    require(EVP_Digest(inputLen ? input : &emptyByte, inputLen, output.data(), &written, algorithm, nullptr) == 1,
             "Hash calculation failed");
     output.resize(written); return output;
+}
+Buffer digest(const std::string &name, const Buffer &input) {
+    return digestSlice(name, input.data(), input.size());
 }
 EVP_MAC_CTX *reusableHMACContextFor(const std::string &name, const uint8_t *keyPtr, size_t keyLen) {
     static EVP_MAC *const mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
@@ -161,9 +171,11 @@ EVP_MAC_CTX *reusableHMACContextFor(const std::string &name, const uint8_t *keyP
     if (name == "SHA256" || name == "sha256") { slotIdx = 0; canonical = "SHA256"; }
     else if (name == "SHA1" || name == "sha1") { slotIdx = 1; canonical = "SHA1"; }
     else if (name == "MD5" || name == "md5") { slotIdx = 2; canonical = "MD5"; }
+    else if (name == "SHA384" || name == "sha384") { slotIdx = 3; canonical = "SHA384"; }
+    else if (name == "SHA512" || name == "sha512") { slotIdx = 4; canonical = "SHA512"; }
 
     if (slotIdx >= 0) {
-        thread_local BoundMacSlot slots[3];
+        thread_local BoundMacSlot slots[5];
         BoundMacSlot &slot = slots[slotIdx];
         require(slot.ctx != nullptr, "HMAC context allocation failed");
         EVP_MAC_CTX *raw = slot.ctx.get();
@@ -191,15 +203,19 @@ EVP_MAC_CTX *reusableHMACContextFor(const std::string &name, const uint8_t *keyP
     require(EVP_MAC_init(fallbackCtx.get(), keyPtr, keyLen, params) == 1, "HMAC initialization failed");
     return fallbackCtx.get();
 }
-Buffer hmac(const std::string &name, const Buffer &key, const Buffer &input) {
+Buffer hmacSlice(const std::string &name, const uint8_t *key, size_t keyLen,
+                 const uint8_t *input, size_t inputLen) {
     static const uint8_t emptyKey = 0;
-    EVP_MAC_CTX *ctx = reusableHMACContextFor(name, key.empty() ? &emptyKey : key.data(), key.size());
-    require(EVP_MAC_update(ctx, input.data(), input.size()) == 1, "HMAC update failed");
+    EVP_MAC_CTX *ctx = reusableHMACContextFor(name, (keyLen == 0 || !key) ? &emptyKey : key, keyLen);
+    require(EVP_MAC_update(ctx, inputLen ? input : &emptyKey, inputLen) == 1, "HMAC update failed");
     Buffer output(EVP_MAC_CTX_get_mac_size(ctx));
     size_t written = 0;
     require(EVP_MAC_final(ctx, output.data(), &written, output.size()) == 1, "HMAC finalization failed");
     output.resize(written);
     return output;
+}
+Buffer hmac(const std::string &name, const Buffer &key, const Buffer &input) {
+    return hmacSlice(name, key.data(), key.size(), input.data(), input.size());
 }
 Buffer hkdf(const std::string &name, const Buffer &key, const Buffer &salt, const Buffer &info, size_t count) {
     static const uint8_t emptyKey = 0;
@@ -263,14 +279,19 @@ Buffer aesECBBlock(const Buffer &block, const Buffer &key, bool encrypt) {
 }
 
 namespace {
-Buffer aead(bool encrypt, AEAD method, const Buffer &key, const Buffer &nonce,
-            const Buffer &input, const Buffer &aad) {
+Buffer aeadSlice(bool encrypt, AEAD method, const Buffer &key, const Buffer &nonce,
+                 const uint8_t *inputPtr, size_t inputLen, const Buffer &aad) {
     const EVP_CIPHER *algorithm = cipherFor(method);
     require(key.size() == size_t(EVP_CIPHER_get_key_length(algorithm)),"AEAD key length invalid");
     require(nonce.size() == (method == AEAD::XChaCha20Poly1305 ? 24u : 12u),"AEAD nonce length invalid");
-    require(encrypt || input.size() >= 16,"AEAD ciphertext is truncated");
+    require(encrypt || inputLen >= 16,"AEAD ciphertext is truncated");
     std::array<uint8_t, 32> derivedKey{};
     std::array<uint8_t, 12> derivedNonce{};
+    struct SubkeyGuard {
+        std::array<uint8_t, 32> &k;
+        bool active;
+        ~SubkeyGuard() { if (active) OPENSSL_cleanse(k.data(), k.size()); }
+    } guard{derivedKey, method == AEAD::XChaCha20Poly1305};
     const uint8_t *keyPtr = key.data();
     const uint8_t *noncePtr = nonce.data();
     if (method == AEAD::XChaCha20Poly1305) {
@@ -286,14 +307,14 @@ Buffer aead(bool encrypt, AEAD method, const Buffer &key, const Buffer &nonce,
                 "AEAD associated data processing failed");
         written = 0;
     }
-    size_t dataLength = encrypt ? input.size() : input.size()-16;
+    size_t dataLength = encrypt ? inputLen : inputLen-16;
     Buffer output(dataLength + 16);
     if (dataLength > 0) {
-        require(EVP_CipherUpdate(ctx,output.data(),&written,input.data(),length(dataLength)) == 1,
+        require(EVP_CipherUpdate(ctx,output.data(),&written,inputPtr,length(dataLength)) == 1,
                 "AEAD processing failed");
     }
     if (!encrypt) require(EVP_CIPHER_CTX_ctrl(ctx,EVP_CTRL_AEAD_SET_TAG,16,
-                                const_cast<uint8_t *>(input.data()+dataLength)) == 1,"AEAD tag setup failed");
+                                const_cast<uint8_t *>(inputPtr+dataLength)) == 1,"AEAD tag setup failed");
     if (EVP_CipherFinal_ex(ctx,output.data()+written,&final) != 1) {
         OPENSSL_cleanse(output.data(),output.size());
         throw std::runtime_error("AEAD authentication failed");
@@ -309,10 +330,18 @@ Buffer aead(bool encrypt, AEAD method, const Buffer &key, const Buffer &nonce,
 }
 }
 Buffer seal(AEAD method, const Buffer &key, const Buffer &nonce, const Buffer &plain, const Buffer &aad) {
-    return aead(true,method,key,nonce,plain,aad);
+    return aeadSlice(true,method,key,nonce,plain.data(),plain.size(),aad);
 }
 Buffer open(AEAD method, const Buffer &key, const Buffer &nonce, const Buffer &sealed, const Buffer &aad) {
-    return aead(false,method,key,nonce,sealed,aad);
+    return aeadSlice(false,method,key,nonce,sealed.data(),sealed.size(),aad);
+}
+Buffer sealSlice(AEAD method, const Buffer &key, const Buffer &nonce,
+                 const uint8_t *plain, size_t plainLen, const Buffer &aad) {
+    return aeadSlice(true,method,key,nonce,plain,plainLen,aad);
+}
+Buffer openSlice(AEAD method, const Buffer &key, const Buffer &nonce,
+                 const uint8_t *sealed, size_t sealedLen, const Buffer &aad) {
+    return aeadSlice(false,method,key,nonce,sealed,sealedLen,aad);
 }
 
 std::string base64Encode(const Buffer &input) {

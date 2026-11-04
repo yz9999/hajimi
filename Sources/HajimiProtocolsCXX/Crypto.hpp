@@ -8,7 +8,10 @@ namespace hajimi::crypto {
 enum class AEAD { AES128GCM, AES192GCM, AES256GCM, ChaCha20Poly1305, XChaCha20Poly1305 };
 Buffer randomBytes(size_t count);
 Buffer digest(const std::string &name, const Buffer &input);
+Buffer digestSlice(const std::string &name, const uint8_t *input, size_t inputLen);
 Buffer hmac(const std::string &name, const Buffer &key, const Buffer &input);
+Buffer hmacSlice(const std::string &name, const uint8_t *key, size_t keyLen,
+                 const uint8_t *input, size_t inputLen);
 Buffer hkdf(const std::string &digestName, const Buffer &key, const Buffer &salt,
             const Buffer &info, size_t count);
 Buffer hkdfSHA1(const Buffer &key, const Buffer &salt, const Buffer &info, size_t count);
@@ -18,6 +21,12 @@ Buffer seal(AEAD method, const Buffer &key, const Buffer &nonce, const Buffer &p
             const Buffer &associatedData = {});
 Buffer open(AEAD method, const Buffer &key, const Buffer &nonce, const Buffer &sealed,
             const Buffer &associatedData = {});
+Buffer sealSlice(AEAD method, const Buffer &key, const Buffer &nonce,
+                 const uint8_t *plain, size_t plainLen,
+                 const Buffer &associatedData = {});
+Buffer openSlice(AEAD method, const Buffer &key, const Buffer &nonce,
+                 const uint8_t *sealed, size_t sealedLen,
+                 const Buffer &associatedData = {});
 Buffer blake3(const Buffer &input, size_t count = 32);
 Buffer blake3Keyed(const Buffer &key, const Buffer &input, size_t count = 32);
 Buffer blake3DeriveKey(const std::string &context, const Buffer &material, size_t count = 32);

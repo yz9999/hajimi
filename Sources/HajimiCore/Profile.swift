@@ -501,11 +501,36 @@ public enum ProfileParser {
         var explicitSOCKSListen = false
         var wireGuardValues: [String: [String: String]] = [:]
         var wireGuardOrder: [String] = []
+        var consumedWireGuardSections = Set<String>()
         var warnedSections = Set<String>()
         // Foundation's newline character set splits CR and LF separately.
         // Keep sourceLine aligned with physical lines for targeted UI edits.
         let lines = text.replacingOccurrences(of: "\r\n", with: "\n")
             .components(separatedBy: .newlines)
+
+        if text.range(of: "[wireguard ", options: .caseInsensitive) != nil {
+            var wgSec = ""
+            var wgDisplay = ""
+            for (idx, rawL) in lines.enumerated() {
+                let l = stripComment(rawL, preservingDNSBootstrap: false)
+                    .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{feff}")))
+                if l.isEmpty { continue }
+                if l.hasPrefix("[") && l.hasSuffix("]") && !l.contains("=") {
+                    wgDisplay = String(l.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
+                    wgSec = wgDisplay.lowercased()
+                    if wgSec.hasPrefix("wireguard ") {
+                        if wireGuardValues[wgDisplay] == nil {
+                            wireGuardValues[wgDisplay] = [:]
+                            wireGuardOrder.append(wgDisplay)
+                        }
+                    }
+                    continue
+                }
+                if wgSec.hasPrefix("wireguard "), let pair = try? keyValue(l, number: idx + 1) {
+                    wireGuardValues[wgDisplay]?[pair.0.lowercased()] = pair.1
+                }
+            }
+        }
 
         lineLoop: for (index, rawLine) in lines.enumerated() {
             let lineNumber = index + 1
@@ -550,7 +575,10 @@ public enum ProfileParser {
                 }
             case "proxy":
                 let pair = try keyValue(line, number: lineNumber)
-                let policy = try proxy(name: pair.0, value: pair.1, number: lineNumber)
+                let policy = try proxy(name: pair.0, value: pair.1, number: lineNumber,
+                                       wireGuardValues: wireGuardValues,
+                                       wireGuardOrder: wireGuardOrder,
+                                       consumedWireGuardSections: &consumedWireGuardSections)
                 profile.proxies[pair.0] = policy
                 if !["DIRECT", "REJECT"].contains(pair.0), !profile.proxyOrder.contains(pair.0) {
                     profile.proxyOrder.append(pair.0)
@@ -610,6 +638,7 @@ public enum ProfileParser {
                                 explicitHTTPListen: explicitHTTPListen,
                                 explicitSOCKSListen: explicitSOCKSListen, profile: &profile)
         for name in wireGuardOrder {
+            if consumedWireGuardSections.contains(name) { continue }
             guard let values = wireGuardValues[name] else { continue }
             let policyName = String(name.dropFirst("WireGuard ".count))
             let policy = try wireGuardPolicy(name: policyName, values: values)
@@ -928,7 +957,10 @@ public enum ProfileParser {
         return ListenAddress(host: pair.0, port: port)
     }
 
-    private static func proxy(name: String, value: String, number: Int) throws -> ProxyPolicy {
+    private static func proxy(name: String, value: String, number: Int,
+                              wireGuardValues: [String: [String: String]] = [:],
+                              wireGuardOrder: [String] = [],
+                              consumedWireGuardSections: inout Set<String>) throws -> ProxyPolicy {
         let fields = csv(value)
         guard let rawType = fields.first?.lowercased() else {
             throw ProfileParseError(line: number, message: "代理定义为空")
@@ -936,6 +968,49 @@ public enum ProfileParser {
         let type = canonicalProxyType(rawType)
         if type == "direct" { return ProxyPolicy(name: name, kind: .direct) }
         if type == "reject" { return ProxyPolicy(name: name, kind: .reject) }
+        // Support Surge `[Proxy]` WireGuard syntax: `Node = wireguard, section-name=WGTest`
+        // referencing `[WireGuard WGTest]`, or inline `wireguard, endpoint=host:port, ...`.
+        if type == "wireguard",
+           (fields.count < 3 || fields[1].contains("=") || UInt16(fields[2]) == nil) {
+            let inlineParams = advancedParameters(type: type, fields: Array(fields.dropFirst()))
+            let targetSec = (inlineParams["section-name"] ?? name).trimmingCharacters(in: .whitespaces)
+            if let matchedHeader = wireGuardOrder.first(where: {
+                String($0.dropFirst("WireGuard ".count))
+                    .trimmingCharacters(in: .whitespaces)
+                    .caseInsensitiveCompare(targetSec) == .orderedSame
+            }), let wgSection = wireGuardValues[matchedHeader] {
+                consumedWireGuardSections.insert(matchedHeader)
+                var mergedSection = wgSection
+                for (k, v) in inlineParams where k != "section-name" && mergedSection[k] == nil {
+                    mergedSection[k] = v
+                }
+                var policy = try wireGuardPolicy(name: name, values: mergedSection, line: number)
+                for (k, v) in inlineParams where k != "section-name" {
+                    policy.parameters[k] = v
+                }
+                return policy
+            }
+            if let ep = inlineParams["endpoint"], let epPair = splitHostPort(ep),
+               let epPort = UInt16(epPair.1), epPort > 0 {
+                var params = inlineParams
+                params.removeValue(forKey: "section-name")
+                params.removeValue(forKey: "endpoint")
+                if params["udp"] == nil { params["udp"] = "true" }
+                return ProxyPolicy(name: name, kind: .external, host: epPair.0, port: epPort,
+                                   adapterType: "wireguard", parameters: params)
+            }
+        }
+        // Tolerate legacy 4-positional-field SSH syntax `ssh, host, username, port, ...`
+        // in addition to standard `ssh, host, port, username=..., ...`.
+        if type == "ssh", fields.count >= 4, !fields[1].isEmpty,
+           UInt16(fields[2]) == nil, !fields[2].contains("="),
+           let altPort = UInt16(fields[3]), altPort > 0 {
+            var sshFields = ["username=\(fields[2])"]
+            sshFields.append(contentsOf: fields.dropFirst(4))
+            let parameters = advancedParameters(type: type, fields: sshFields)
+            return ProxyPolicy(name: name, kind: .external, host: fields[1], port: altPort,
+                               adapterType: type, parameters: parameters)
+        }
         guard fields.count >= 3, !fields[1].isEmpty, let port = UInt16(fields[2]), port > 0 else {
             throw ProfileParseError(line: number, message: "代理应包含类型、主机和端口")
         }
@@ -975,7 +1050,7 @@ public enum ProfileParser {
         }
         return ProxyPolicy(name: name, kind: adapterType == "http" ? .http : .socks5,
                            host: fields[1], port: port, username: username, password: password,
-                           parameters: parameters)
+                           adapterType: type, parameters: parameters)
     }
 
     private static let advancedProxyTypes: Set<String> = [
@@ -984,11 +1059,11 @@ public enum ProfileParser {
         "hysteria", "hysteria2", "tuic", "ssh", "wireguard"
     ]
 
-    private static func wireGuardPolicy(name: String, values: [String: String]) throws -> ProxyPolicy {
+    private static func wireGuardPolicy(name: String, values: [String: String], line: Int = 0) throws -> ProxyPolicy {
         guard let privateKey = values["private-key"], !privateKey.isEmpty,
-              let selfIP = values["self-ip"], !selfIP.isEmpty,
+              let selfIP = values["self-ip"] ?? values["ip"], !selfIP.isEmpty,
               let rawPeer = values["peer"] else {
-            throw ProfileParseError(line: 0,
+            throw ProfileParseError(line: line,
                                     message: "[\(name)] 缺少 private-key、self-ip 或 peer")
         }
         var peer = rawPeer.trimmingCharacters(in: .whitespaces)
@@ -1018,9 +1093,13 @@ public enum ProfileParser {
         ]
         if let ipv6 = values["self-ip-v6"] { parameters["ipv6"] = ipv6 }
         if let mtu = values["mtu"] { parameters["mtu"] = mtu }
+        if let dnsServer = values["dns-server"] { parameters["dns-server"] = dnsServer }
         if let allowedIPs = peerValues["allowed-ips"] { parameters["allowed-ips"] = allowedIPs }
-        if let preSharedKey = peerValues["pre-shared-key"] {
+        if let preSharedKey = peerValues["pre-shared-key"] ?? peerValues["preshared-key"] {
             parameters["pre-shared-key"] = preSharedKey
+        }
+        if let keepalive = peerValues["keepalive"] ?? peerValues["persistent-keepalive"] {
+            parameters["persistent-keepalive"] = keepalive
         }
         if let reserved = peerValues["reserved"] { parameters["reserved"] = reserved }
         return ProxyPolicy(name: name, kind: .external, host: endpointPair.0, port: port,
@@ -1081,16 +1160,51 @@ public enum ProfileParser {
                 if !key.isEmpty { result[key] = value }
             }
         }
+        if let method = result["encrypt-method"], result["cipher"] == nil {
+            result["cipher"] = method
+        }
+        if (type == "vmess" || type == "vless"),
+           let username = result["username"], result["uuid"] == nil {
+            result["uuid"] = username
+        }
+        if let authStr = result["auth-string"] ?? result["auth_str"], result["auth-str"] == nil {
+            result["auth-str"] = authStr
+        }
+        if let upMbps = result["up_mbps"] ?? result["upmbps"], result["up"] == nil {
+            result["up"] = upMbps
+        }
+        if let downMbps = result["down_mbps"] ?? result["downmbps"], result["down"] == nil {
+            result["down"] = downMbps
+        }
+        if type == "wireguard" {
+            if let selfIP = result.removeValue(forKey: "self-ip"), result["ip"] == nil {
+                result["ip"] = selfIP
+            }
+            if let selfIPv6 = result.removeValue(forKey: "self-ip-v6"), result["ipv6"] == nil {
+                result["ipv6"] = selfIPv6
+            }
+            if let psk = result.removeValue(forKey: "preshared-key"), result["pre-shared-key"] == nil {
+                result["pre-shared-key"] = psk
+            }
+            if result["udp"] == nil {
+                result["udp"] = "true"
+            }
+        }
         return result
     }
 
     private static func positionalParameterKeys(type: String, candidateCount: Int,
                                                 explicitKeys: Set<String>) -> [String] {
         switch type {
-        case "ss": return ["cipher", "password"]
-        case "ssr": return ["cipher", "password", "protocol", "obfs"]
+        case "ss":
+            return explicitKeys.contains("encrypt-method") && !explicitKeys.contains("cipher")
+                ? ["password"] : ["cipher", "password"]
+        case "ssr":
+            return explicitKeys.contains("encrypt-method") && !explicitKeys.contains("cipher")
+                ? ["password", "protocol", "obfs"] : ["cipher", "password", "protocol", "obfs"]
         case "snell": return ["psk", "version"]
-        case "vmess", "vless": return ["uuid"]
+        case "vmess", "vless":
+            return (explicitKeys.contains("username") || explicitKeys.contains("uuid")) ? [] : ["uuid"]
         case "trojan", "anytls", "hysteria2": return ["password"]
         case "hysteria": return ["auth-str", "up", "down"]
         case "tuic":
@@ -1107,7 +1221,7 @@ public enum ProfileParser {
     /// Known names disambiguate `key=value` options from positional secrets
     /// that themselves contain `=` (common with base64 credentials).
     private static let advancedParameterNames: Set<String> = [
-        "cipher", "password", "protocol", "protocol-param", "obfs", "obfs-param",
+        "cipher", "encrypt-method", "password", "protocol", "protocol-param", "obfs", "obfs-param",
         "obfs-mode", "obfs-host", "obfs-password", "obfs-protocol", "psk", "version",
         "reuse", "uuid", "alter-id", "alterid", "flow", "security", "tls", "alpn", "udp",
         "udp-relay", "network", "sni", "servername", "skip-cert-verify",
@@ -1121,8 +1235,9 @@ public enum ProfileParser {
         "xhttp-path", "xhttp-host", "xhttp-mode", "xhttp-padding-bytes",
         "kcp-header", "kcp-header-domain", "kcp-seed", "kcp-mtu", "kcp-tti",
         "kcp-congestion", "kcp-uplink-capacity", "kcp-downlink-capacity",
-        "grpc-max-streams", "reality-public-key", "reality-short-id",
-        "reality-support-x25519mlkem768", "auth", "auth-str", "up", "down", "up-speed",
+        "grpc-max-streams", "reality-public-key", "reality-short-id", "short-id",
+        "reality-support-x25519mlkem768", "auth", "auth-str", "auth-string", "auth_str",
+        "up", "down", "up-speed", "up_mbps", "down_mbps", "upmbps", "downmbps",
         "down-speed", "upload-bandwidth", "download-bandwidth", "ports", "recv-window",
         "recv-window-conn", "disable-mtu-discovery", "fast-open", "hop-interval", "cwnd",
         "bbr-profile", "udp-mtu", "token", "heartbeat-interval", "reduce-rtt",
@@ -1138,7 +1253,9 @@ public enum ProfileParser {
         "custom-table", "custom-tables", "enable-pure-downlink", "http-mask",
         "disable-http-mask", "http-mask-mode", "http-mask-tls", "http-mask-host",
         "http-mask-multiplex", "multiplex", "path-root", "transport", "multiplexing",
-        "handshake-mode", "port-range", "traffic-pattern", "quic"
+        "handshake-mode", "port-range", "traffic-pattern", "quic",
+        "section-name", "self-ip", "self-ip-v6", "dns-server", "keepalive",
+        "preshared-key", "endpoint"
     ]
 
     private static func rule(_ line: String, number: Int) throws -> RoutingRule? {

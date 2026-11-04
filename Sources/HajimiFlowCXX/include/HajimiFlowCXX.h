@@ -75,8 +75,9 @@ int hajimi_tcp_reassembly_finished(const hajimi_tcp_reassembly *state);
  * shared budget briefly, without allocating that artificial reservation. */
 int hajimi_flow_self_test(void);
 
-/* Kathleen Nichols 3-slot windowed Min-RTT / Max-Bandwidth filter &
- * Kleinrock BBR Bandwidth-Delay Product (BDP) window estimator. */
+/* Kathleen Nichols 3-slot windowed Min-RTT / Max-Bandwidth filter,
+ * Kleinrock BBR Bandwidth-Delay Product (BDP) window estimator, and
+ * Nichols-Jacobson CoDel (RFC 8289) standing-queue bufferbloat drain control. */
 typedef struct hajimi_window_sample {
     double value;
     double timestamp;
@@ -86,10 +87,12 @@ typedef struct hajimi_bdp_estimator {
     double window_seconds;
     double min_rtt;
     double min_rtt_timestamp;
+    double last_rtt;
     hajimi_window_sample bw_samples[3];
     size_t inflight_hi;
     size_t inflight_lo;
     uint32_t loss_events;
+    uint32_t standing_queue_rounds;
     uint8_t initialized;
 } hajimi_bdp_estimator;
 

@@ -122,6 +122,8 @@ struct Config {
         if (!obfs.empty() && obfs!="none" && obfs!="plain")
             throw std::runtime_error("Shadowsocks obfuscation plugin is not supported");
         std::string name=lower(node.option("cipher",node.option("encrypt-method")));
+        if (name.rfind("encrypt-method=",0)==0) name=name.substr(15);
+        else if (name.rfind("cipher=",0)==0) name=name.substr(7);
         modern=name.rfind("2022-blake3-",0)==0;
         if (name=="aes-128-gcm" || name=="2022-blake3-aes-128-gcm") {method=AEAD::AES128GCM;keyLength=16;}
         else if (name=="aes-192-gcm") {method=AEAD::AES192GCM;keyLength=24;}
@@ -213,10 +215,13 @@ struct Cipher {
         for (auto &byte:nonce) if (++byte!=0) return;
         exhausted=true;
     }
-    Buffer crypt(const Buffer &data,bool encrypt) {
+    Buffer cryptSlice(const uint8_t *data,size_t len,bool encrypt) {
         if (exhausted) throw std::runtime_error("Shadowsocks nonce exhausted");
-        Buffer out=encrypt?crypto::seal(method,key,nonce,data):crypto::open(method,key,nonce,data);
+        Buffer out=encrypt?crypto::sealSlice(method,key,nonce,data,len):crypto::openSlice(method,key,nonce,data,len);
         advance(); return out;
+    }
+    Buffer crypt(const Buffer &data,bool encrypt) {
+        return cryptSlice(data.data(),data.size(),encrypt);
     }
 };
 
@@ -289,19 +294,22 @@ class SSStream final : public Stream, public std::enable_shared_from_this<SSStre
         for (auto &write:pending) finishWrite(write,terminal_);
         finishRead({},true,terminal_);
     }
-    Buffer frame(const Buffer &plain) {
-        Buffer length;put16(length,plain.size());
-        Buffer out=sendCipher_->crypt(length,true);append(out,sendCipher_->crypt(plain,true));return out;
+    Buffer frame(const Buffer &plain) { return frameSlice(plain.data(),plain.size()); }
+    Buffer frameSlice(const uint8_t *plain,size_t plainLen) {
+        uint8_t length[2]{uint8_t(plainLen>>8),uint8_t(plainLen)};
+        Buffer out=sendCipher_->cryptSlice(length,2,true);
+        append(out,sendCipher_->cryptSlice(plain,plainLen,true));
+        return out;
     }
     Buffer encode(const Buffer &data) {
         if (config_.cfb) return sendCFB_->update(data);
         size_t limit=config_.modern?65535:16383;
-        if (data.size()<=limit) return frame(data);
+        if (data.size()<=limit) return frameSlice(data.data(),data.size());
         Buffer out;
         out.reserve(data.size()+((data.size()+limit-1)/limit)*34);
         for (size_t offset=0;offset<data.size();) {
             size_t take=std::min(limit,data.size()-offset);
-            append(out,frame(slice(data,offset,take)));offset+=take;
+            append(out,frameSlice(data.data()+offset,take));offset+=take;
         }
         return out;
     }

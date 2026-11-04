@@ -219,9 +219,11 @@ void connectTrustTunnel(const Node &node, const Target &target,
             return;
         }
         if (factory && factory->after) {
-            factory->after(10.0, [raw, completion]() mutable {
-                raw->close();
-                completion(nullptr, "TrustTunnel handshake timed out");
+            factory->after(10.0, [raw, doneFlag, completion]() mutable {
+                if (!*doneFlag) {
+                    raw->close();
+                    completion(nullptr, "TrustTunnel handshake timed out");
+                }
             });
         }
         try {

@@ -35,11 +35,16 @@ Error validateBasicProtocol(const Node &node,bool udp) {
         return {};
     }
     if(node.type=="vmess" || node.type=="vless") {
-        try { uuidBytes(node.option("uuid",node.option("username"))); } catch(const std::exception &e){return e.what();}
+        std::string rawUuid = node.option("uuid", node.option("username"));
+        if (rawUuid.find('=') != std::string::npos && !node.option("username").empty()) {
+            rawUuid = node.option("username");
+        }
+        try { uuidBytes(rawUuid); } catch(const std::exception &e){return e.what();}
         if(node.type=="vmess") {
             if(!node.flag("vmess-aead",true))return "VMess requires AEAD authentication";
             auto alter=node.option("alter-id",node.option("alterid","0"));if(alter!="0")return "Legacy VMess alter-id is not supported";
-            auto cipher=lower(node.option("cipher",node.option("encryption","auto")));
+            auto cipher=lower(node.option("cipher",node.option("encrypt-method",node.option("encryption","auto"))));
+            if(cipher.rfind("encrypt-method=",0)==0) cipher=cipher.substr(15);
             if(cipher!="auto" && cipher!="aes-128-gcm")return "VMess currently requires AES-128-GCM body encryption";
         } else {
             auto encryption=lower(node.option("encryption","none"));if(!encryption.empty() && encryption!="none")return "Unsupported VLESS encryption extension";
@@ -81,6 +86,7 @@ Error validateProtocol(const Node &node,bool udp) {
     if(node.type=="trusttunnel")return validateTrustTunnel(node,udp);
     if(node.type=="snell")return validateSnell(node,udp);
     if(node.type=="ssh")return validateSSH(node,udp);
+    if(node.type=="wireguard")return validateWireGuard(node,udp);
     if(node.type=="hysteria" || node.type=="hysteria2" || node.type=="tuic")return validateQUICProtocol(node,udp);
     return validateBasicProtocol(node,udp);
 }

@@ -535,6 +535,10 @@ bool testCarrierAndFakeIPCodecs() {
     const double flaky_cost = hajimi_smart_stats_cost(&flaky_node, 16.0);
     CHECK(stable_cost > 0.050 && stable_cost < 0.080);
     CHECK(flaky_cost > stable_cost * 1.5);
+    // Verify Innovation-Adaptive Kalman step-size tracks an abrupt regime shift (55ms -> 220ms) faster than fixed alpha=0.25
+    hajimi_smart_node_stats regime_node = stable_node;
+    hajimi_smart_stats_observe(&regime_node, 1, 0.220, 17.0);
+    CHECK(regime_node.ewma_rtt > 0.055 + 0.25 * (0.220 - 0.055));
 
     // 6. Constant-time authenticator & backward clock-jump resilience
     const uint8_t secret_a[] = "hajimi-commercial-secret-2026";

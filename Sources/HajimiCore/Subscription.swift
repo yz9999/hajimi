@@ -230,6 +230,30 @@ public enum SubscriptionDocument {
     /// taken verbatim rather than parsed and re-rendered. That preserves every
     /// option, including ones Hajimi does not model yet.
     private static func parseSurge(_ text: String) throws -> SubscriptionContents {
+        var wireGuardSections: [String: [String: String]] = [:]
+        do {
+            var wgSec = ""
+            for raw in text.components(separatedBy: .newlines) {
+                let line = raw.replacingOccurrences(of: "\r", with: "")
+                    .trimmingCharacters(in: .whitespaces)
+                if line.hasPrefix("[") && line.hasSuffix("]") && !line.contains("=") {
+                    let inner = String(line.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
+                    if inner.lowercased().hasPrefix("wireguard ") {
+                        wgSec = String(inner.dropFirst("wireguard ".count))
+                            .trimmingCharacters(in: .whitespaces).lowercased()
+                        if wireGuardSections[wgSec] == nil { wireGuardSections[wgSec] = [:] }
+                    } else {
+                        wgSec = ""
+                    }
+                    continue
+                }
+                guard !wgSec.isEmpty, !line.isEmpty, !line.hasPrefix("#"), !line.hasPrefix(";"),
+                      let equal = line.firstIndex(of: "=") else { continue }
+                let k = String(line[..<equal]).trimmingCharacters(in: .whitespaces).lowercased()
+                let v = String(line[line.index(after: equal)...]).trimmingCharacters(in: .whitespaces)
+                if !k.isEmpty, !v.isEmpty { wireGuardSections[wgSec]?[k] = v }
+            }
+        }
         var proxyLines: [String] = []
         var rawGroupEntries: [(name: String, rhs: String)] = []
         var usedNames = Set<String>()
@@ -260,7 +284,8 @@ public enum SubscriptionDocument {
                 usedNames.insert(uniqueName)
                 if nameMap[rawName] == nil { nameMap[rawName] = uniqueName }
                 nameMap[uniqueName] = uniqueName
-                proxyLines.append("\(uniqueName) = \(rhs)")
+                let normalizedRHS = normalizeSurgeProxyRHS(rhs, proxyName: rawName, wireGuardSections: wireGuardSections)
+                proxyLines.append("\(uniqueName) = \(normalizedRHS)")
             } else if section == "[proxy group]" {
                 usedNames.insert(uniqueName)
                 if nameMap[rawName] == nil { nameMap[rawName] = uniqueName }
@@ -300,6 +325,163 @@ public enum SubscriptionDocument {
                                     proxyNames: proxyNames,
                                     groupNames: groupLines.compactMap(name(ofDefinition:)),
                                     warnings: warnings)
+    }
+
+    /// Normalizes imported Surge `[Proxy]` definitions so legacy SSH lines such
+    /// as `ssh, host, user, port, password=...` or SSH lines without explicit
+    /// `host-key` / `skip-cert-verify` can be imported and activated cleanly.
+    private static func splitRespectingQuotes(_ text: String) -> [String] {
+        var result: [String] = []
+        var current = ""
+        var inQuotes = false
+        var parenDepth = 0
+        for ch in text {
+            if ch == "\"" {
+                inQuotes.toggle()
+                current.append(ch)
+            } else if !inQuotes && ch == "(" {
+                parenDepth += 1
+                current.append(ch)
+            } else if !inQuotes && ch == ")" && parenDepth > 0 {
+                parenDepth -= 1
+                current.append(ch)
+            } else if !inQuotes && parenDepth == 0 && ch == "," {
+                result.append(current.trimmingCharacters(in: .whitespaces))
+                current = ""
+            } else {
+                current.append(ch)
+            }
+        }
+        let tail = current.trimmingCharacters(in: .whitespaces)
+        if !tail.isEmpty || text.hasSuffix(",") {
+            result.append(tail)
+        }
+        return result
+    }
+
+    private static func normalizeSurgeProxyRHS(
+        _ rhs: String,
+        proxyName: String = "",
+        wireGuardSections: [String: [String: String]] = [:]
+    ) -> String {
+        let parts = splitRespectingQuotes(rhs)
+        guard let first = parts.first?.lowercased() else { return rhs }
+        if first == "wireguard" {
+            let hasHostPort = parts.count >= 3 && !parts[1].contains("=") && UInt16(parts[2]) != nil
+            if !hasHostPort {
+                var inlineParams: [String: String] = [:]
+                var inlineOrder: [String] = []
+                for token in parts.dropFirst() {
+                    guard let eq = token.firstIndex(of: "=") else { continue }
+                    let k = String(token[..<eq]).trimmingCharacters(in: .whitespaces).lowercased()
+                    let v = String(token[token.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+                    if !k.isEmpty {
+                        if inlineParams[k] == nil { inlineOrder.append(k) }
+                        inlineParams[k] = v
+                    }
+                }
+                let secKey = (inlineParams["section-name"] ?? proxyName)
+                    .trimmingCharacters(in: .whitespaces).lowercased()
+                let wgSec = wireGuardSections[secKey] ?? [:]
+                var peerValues: [String: String] = [:]
+                if var rawPeer = wgSec["peer"] ?? inlineParams["peer"] {
+                    rawPeer = rawPeer.trimmingCharacters(in: .whitespaces)
+                    if rawPeer.hasPrefix("("), rawPeer.hasSuffix(")") {
+                        rawPeer = String(rawPeer.dropFirst().dropLast())
+                    }
+                    for field in splitRespectingQuotes(rawPeer) {
+                        guard let eq = field.firstIndex(of: "=") else { continue }
+                        let pk = String(field[..<eq]).trimmingCharacters(in: .whitespaces).lowercased()
+                        var pv = String(field[field.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+                        if pv.count >= 2, pv.hasPrefix("\""), pv.hasSuffix("\"") {
+                            pv = String(pv.dropFirst().dropLast())
+                        }
+                        peerValues[pk] = pv
+                    }
+                }
+                let endpoint = peerValues["endpoint"] ?? inlineParams["endpoint"] ?? ""
+                if let colon = endpoint.lastIndex(of: ":"),
+                   let port = UInt16(endpoint[endpoint.index(after: colon)...].trimmingCharacters(in: .whitespaces)),
+                   port > 0 {
+                    var host = String(endpoint[..<colon]).trimmingCharacters(in: .whitespaces)
+                    if host.hasPrefix("["), host.hasSuffix("]") {
+                        host = String(host.dropFirst().dropLast())
+                    }
+                    var outFields = ["wireguard", host, String(port)]
+                    if let priv = inlineParams["private-key"] ?? wgSec["private-key"], !priv.isEmpty {
+                        outFields.append("private-key=\(priv)")
+                    }
+                    if let ip = inlineParams["ip"] ?? inlineParams["self-ip"] ?? wgSec["self-ip"] ?? wgSec["ip"], !ip.isEmpty {
+                        outFields.append("ip=\(ip)")
+                    }
+                    if let ipv6 = inlineParams["ipv6"] ?? inlineParams["self-ip-v6"] ?? wgSec["self-ip-v6"], !ipv6.isEmpty {
+                        outFields.append("ipv6=\(ipv6)")
+                    }
+                    if let pub = inlineParams["public-key"] ?? peerValues["public-key"], !pub.isEmpty {
+                        outFields.append("public-key=\(pub)")
+                    }
+                    if let psk = inlineParams["pre-shared-key"] ?? inlineParams["preshared-key"]
+                        ?? peerValues["pre-shared-key"] ?? peerValues["preshared-key"], !psk.isEmpty {
+                        outFields.append("pre-shared-key=\(psk)")
+                    }
+                    if let allowed = inlineParams["allowed-ips"] ?? peerValues["allowed-ips"], !allowed.isEmpty {
+                        let normalizedAllowed = allowed
+                            .replacingOccurrences(of: "\"", with: "")
+                            .split(separator: ",")
+                            .map { $0.trimmingCharacters(in: .whitespaces) }
+                            .filter { !$0.isEmpty }
+                            .joined(separator: ";")
+                        if !normalizedAllowed.isEmpty {
+                            outFields.append("allowed-ips=\(normalizedAllowed)")
+                        }
+                    }
+                    if let mtu = inlineParams["mtu"] ?? wgSec["mtu"], !mtu.isEmpty {
+                        outFields.append("mtu=\(mtu)")
+                    }
+                    if let ka = inlineParams["keepalive"] ?? inlineParams["persistent-keepalive"] ?? peerValues["keepalive"], !ka.isEmpty {
+                        outFields.append("persistent-keepalive=\(ka)")
+                    }
+                    if let res = inlineParams["reserved"] ?? peerValues["reserved"], !res.isEmpty {
+                        outFields.append("reserved=\(res)")
+                    }
+                    let handled: Set<String> = [
+                        "section-name", "peer", "endpoint", "private-key", "ip", "self-ip",
+                        "ipv6", "self-ip-v6", "public-key", "pre-shared-key", "preshared-key",
+                        "allowed-ips", "mtu", "keepalive", "persistent-keepalive", "reserved"
+                    ]
+                    for k in inlineOrder where !handled.contains(k) {
+                        if let v = inlineParams[k], !v.isEmpty {
+                            outFields.append("\(k)=\(v)")
+                        }
+                    }
+                    if inlineParams["udp"] == nil {
+                        outFields.append("udp=true")
+                    }
+                    return outFields.joined(separator: ", ")
+                }
+            }
+            return rhs
+        }
+        guard first == "ssh", parts.count >= 3 else {
+            return rhs
+        }
+        var fields = parts
+        if fields.count >= 4, UInt16(fields[2]) == nil, !fields[2].contains("="),
+           let port = UInt16(fields[3]), port > 0 {
+            let user = fields[2]
+            fields[2] = String(port)
+            fields[3] = "username=\(user)"
+        }
+        let hasHostKey = fields.dropFirst(3).contains {
+            $0.lowercased().hasPrefix("host-key=")
+        }
+        let hasSkipVerify = fields.dropFirst(3).contains {
+            $0.lowercased().hasPrefix("skip-cert-verify=")
+        }
+        if !hasHostKey && !hasSkipVerify {
+            fields.append("skip-cert-verify=true")
+        }
+        return fields.joined(separator: ", ")
     }
 
     static func name(ofDefinition line: String) -> String? {

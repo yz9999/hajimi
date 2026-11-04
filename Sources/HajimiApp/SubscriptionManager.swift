@@ -383,7 +383,23 @@ final class SubscriptionManager {
     /// subscription's cached configuration file (and managed/imported file on disk)
     /// so reopening the app or switching subscriptions never loses added/edited nodes.
     func syncEditedProfileText(_ text: String, proxyCount: Int) {
-        guard let sub = activeSubscription else { return }
+        let managed = SubscriptionMerge.managedNames(in: text)
+        let targetSub: Subscription? = lock.withLock {
+            if managed.count == 1, let managedName = managed.first,
+               let match = subscriptions.first(where: { $0.name == managedName }) {
+                return match
+            }
+            guard managed.isEmpty else { return nil }
+            let target = activeName.flatMap { name in
+                subscriptions.contains(where: { $0.name == name }) ? name : nil
+            } ?? subscriptions.first?.name
+            guard let target,
+                  let sub = subscriptions.first(where: { $0.name == target }) else { return nil }
+            // Do not overwrite a non-empty subscription cache with an emptied profile during subscription removal.
+            if proxyCount == 0 && sub.lastProxyCount > 0 { return nil }
+            return sub
+        }
+        guard let sub = targetSub else { return }
         record(name: sub.name, sourceURL: sub.url) {
             $0.lastProxyCount = proxyCount
         }

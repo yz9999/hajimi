@@ -754,8 +754,7 @@ Error validateAnyTLS(const Node &node, bool udp) {
     if (!node.option("security").empty() && node.option("security") != "tls") return "AnyTLS requires standard TLS security";
     if (node.flag("skip-common-name-verify") && !node.flag("skip-cert-verify"))
         return "AnyTLS partial certificate bypass is unavailable; use explicit skip-cert-verify";
-    if (!node.option("underlying-proxy").empty() || !node.option("dialer-proxy").empty())
-        return "AnyTLS proxy chaining is not configured for this native transport";
+    // underlying-proxy / dialer-proxy is handled by the prepared carrier adapter.
     if (!node.option("certificate").empty() || !node.option("private-key").empty()) return "AnyTLS client-certificate TLS is not implemented";
     if (!node.option("ca-str").empty() || !node.option("ca").empty()) return "AnyTLS custom CA stores are not implemented by this transport";
     if (!node.option("client-fingerprint").empty() || !node.option("fingerprint").empty())

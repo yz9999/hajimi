@@ -1359,11 +1359,13 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             withIdentifier: PolicySectionHeaderView.identifier)
         policyCollectionView.contextMenuProvider = { [weak self] indexPath -> NSMenu? in
             guard let self else { return nil }
-            if indexPath.section == 0, self.filteredProxyNames.indices.contains(indexPath.item) {
-                return self.makeProxyMenu(name: self.filteredProxyNames[indexPath.item])
+            let proxyNames = self.renderedProxyOrder ?? self.filteredProxyNames
+            let groupNames = self.renderedGroupOrder ?? self.profile.groupOrder
+            if indexPath.section == 0, proxyNames.indices.contains(indexPath.item) {
+                return self.makeProxyMenu(name: proxyNames[indexPath.item])
             }
-            if indexPath.section == 1, self.profile.groupOrder.indices.contains(indexPath.item) {
-                return self.makeGroupMenu(name: self.profile.groupOrder[indexPath.item])
+            if indexPath.section == 1, groupNames.indices.contains(indexPath.item) {
+                return self.makeGroupMenu(name: groupNames[indexPath.item])
             }
             return nil
         }
@@ -2982,15 +2984,6 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     private func refreshPolicyPage() {
         pruneProxyCardMetadata()
-        let currentQuery = ListSearchIndex<String>.normalizedQuery(proxySearchField.stringValue)
-        if currentQuery.isEmpty {
-            proxySearchQueue.cancelAllOperations()
-            proxySearchDebouncer.cancel()
-            applyProxySearch(names: profile.proxyOrder, query: "",
-                             total: profile.proxyOrder.count, immediately: true)
-        } else {
-            scheduleProxySearch(after: 0)
-        }
         let groupPlan = PolicyListRefreshPlan(previousOrder: renderedGroupOrder,
                                              order: profile.groupOrder, changedNames: [])
         if groupPlan.requiresReload {
@@ -2998,8 +2991,21 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             renderedGroupPolicies = profile.groups
             renderedGroupSelections = groupSelections
             pendingGroupCards.removeAll()
-            policyCollectionView.reloadSections(IndexSet(integer: 1))
+        }
+        let currentQuery = ListSearchIndex<String>.normalizedQuery(proxySearchField.stringValue)
+        if currentQuery.isEmpty {
+            proxySearchQueue.cancelAllOperations()
+            proxySearchDebouncer.cancel()
+            applyProxySearch(names: profile.proxyOrder, query: "",
+                             total: profile.proxyOrder.count, immediately: true,
+                             forceFullReload: groupPlan.requiresReload)
         } else {
+            if groupPlan.requiresReload {
+                policyCollectionView.reloadData()
+            }
+            scheduleProxySearch(after: 0)
+        }
+        if !groupPlan.requiresReload {
             let changed = Set(profile.groupOrder.filter {
                 renderedGroupPolicies[$0] != profile.groups[$0]
                     || renderedGroupSelections[$0] != groupSelections[$0]
@@ -3050,17 +3056,22 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     }
 
     private func applyProxySearch(names: [String], query: String, total: Int,
-                                  immediately: Bool = false) {
+                                  immediately: Bool = false, forceFullReload: Bool = false) {
         let plan = PolicyListRefreshPlan(previousOrder: renderedProxyOrder, order: names, changedNames: [])
         filteredProxyNames = names
         proxyCountLabel.stringValue = query.isEmpty ? "\(total) 个节点" : "\(names.count) / \(total)"
-        if plan.requiresReload {
+        if plan.requiresReload || forceFullReload || renderedGroupOrder != profile.groupOrder {
             renderedProxyOrder = names
+            renderedGroupOrder = profile.groupOrder
+            renderedGroupPolicies = profile.groups
+            renderedGroupSelections = groupSelections
             renderedActiveProxy = activeProxyCardName
+            for name in names { renderedProxyPolicies[name] = profile.proxies[name] }
             // A filtered reload covers these identities only. Hidden dirty
             // cards still need to be reconciled when they become visible.
             pendingProxyCards.subtract(Set(names))
-            policyCollectionView.reloadSections(IndexSet(integer: 0))
+            pendingGroupCards.removeAll()
+            policyCollectionView.reloadData()
         } else {
             schedulePolicyCardUpdates(immediately: immediately)
             refreshActiveProxyCards()
@@ -3123,13 +3134,33 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         pendingProxyCards.removeAll(); pendingGroupCards.removeAll()
         let proxyPlan = PolicyListRefreshPlan(previousOrder: renderedProxyOrder,
                                              order: filteredProxyNames, changedNames: proxies)
-        if !proxyPlan.paths.isEmpty { policyCollectionView.reloadItems(at: proxyPlan.paths) }
-        for name in proxies { renderedProxyPolicies[name] = profile.proxies[name] }
-        if !proxies.isEmpty { renderedActiveProxy = activeProxyCardName }
         let groupPlan = PolicyListRefreshPlan(previousOrder: renderedGroupOrder,
                                              order: profile.groupOrder, changedNames: groups)
-        if !groupPlan.paths.isEmpty {
-            policyCollectionView.reloadItems(at: Set(groupPlan.paths.map { IndexPath(item: $0.item, section: 1) }))
+        let expectedSection0 = (renderedProxyOrder ?? filteredProxyNames).count + 1
+        let expectedSection1 = (renderedGroupOrder ?? profile.groupOrder).count + 1
+        let countsConsistent = policyCollectionView.numberOfSections == 2
+            && policyCollectionView.numberOfItems(inSection: 0) == expectedSection0
+            && policyCollectionView.numberOfItems(inSection: 1) == expectedSection1
+        if proxyPlan.requiresReload || groupPlan.requiresReload || !countsConsistent {
+            renderedProxyOrder = filteredProxyNames
+            renderedGroupOrder = profile.groupOrder
+            renderedGroupPolicies = profile.groups
+            renderedGroupSelections = groupSelections
+            for name in filteredProxyNames { renderedProxyPolicies[name] = profile.proxies[name] }
+            renderedActiveProxy = activeProxyCardName
+            policyCollectionView.reloadData()
+            return
+        }
+        let validProxyPaths = Set(proxyPlan.paths.filter { $0.section == 0 && $0.item >= 0 && $0.item < expectedSection0 })
+        if !validProxyPaths.isEmpty { policyCollectionView.reloadItems(at: validProxyPaths) }
+        for name in proxies { renderedProxyPolicies[name] = profile.proxies[name] }
+        if !proxies.isEmpty { renderedActiveProxy = activeProxyCardName }
+        let validGroupPaths = Set(groupPlan.paths.compactMap { path -> IndexPath? in
+            guard path.item >= 0 && path.item < expectedSection1 else { return nil }
+            return IndexPath(item: path.item, section: 1)
+        })
+        if !validGroupPaths.isEmpty {
+            policyCollectionView.reloadItems(at: validGroupPaths)
         }
         for name in groups {
             renderedGroupPolicies[name] = profile.groups[name]
@@ -5877,48 +5908,54 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     func collectionView(_ collectionView: NSCollectionView,
                         numberOfItemsInSection section: Int) -> Int {
         guard collectionView === policyCollectionView else { return 0 }
-        if section == 0 { return filteredProxyNames.count + 1 }
-        if section == 1 { return profile.groupOrder.count + 1 }
+        let proxyNames = renderedProxyOrder ?? filteredProxyNames
+        let groupNames = renderedGroupOrder ?? profile.groupOrder
+        if section == 0 { return proxyNames.count + 1 }
+        if section == 1 { return groupNames.count + 1 }
         return 0
     }
 
     func collectionView(_ collectionView: NSCollectionView,
                         itemForRepresentedObjectAt indexPath: IndexPath) -> NSCollectionViewItem {
+        let proxyNames = renderedProxyOrder ?? filteredProxyNames
+        let groupNames = renderedGroupOrder ?? profile.groupOrder
         if collectionView === policyCollectionView, indexPath.section == 0 {
-            if indexPath.item == filteredProxyNames.count {
+            if indexPath.item == proxyNames.count {
                 let item = collectionView.makeItem(withIdentifier: AddProxyCollectionItem.identifier,
                                                    for: indexPath) as! AddProxyCollectionItem
                 item.configure { [weak self] in self?.addProxy() }
                 return item
             }
-            if filteredProxyNames.indices.contains(indexPath.item),
-               let policy = profile.proxies[filteredProxyNames[indexPath.item]] {
-                let name = filteredProxyNames[indexPath.item]
-                let item = collectionView.makeItem(withIdentifier: ProxyCardCollectionItem.identifier,
-                                               for: indexPath) as! ProxyCardCollectionItem
-                item.configure(policy: policy, latency: nodeLatencies[name] ?? .untested,
-                           active: selectedMode == .proxy && selectedPolicy == name,
-                           onEdit: { [weak self] in self?.editProxy(named: name) })
-                return item
+            if proxyNames.indices.contains(indexPath.item) {
+                let name = proxyNames[indexPath.item]
+                if let policy = profile.proxies[name] ?? renderedProxyPolicies[name] {
+                    let item = collectionView.makeItem(withIdentifier: ProxyCardCollectionItem.identifier,
+                                                   for: indexPath) as! ProxyCardCollectionItem
+                    item.configure(policy: policy, latency: nodeLatencies[name] ?? .untested,
+                               active: selectedMode == .proxy && selectedPolicy == name,
+                               onEdit: { [weak self] in self?.editProxy(named: name) })
+                    return item
+                }
             }
         }
         if collectionView === policyCollectionView, indexPath.section == 1 {
-            if indexPath.item == profile.groupOrder.count {
+            if indexPath.item == groupNames.count {
                 let item = collectionView.makeItem(withIdentifier: AddGroupCollectionItem.identifier,
                                                    for: indexPath) as! AddGroupCollectionItem
                 item.configure { [weak self] in self?.addPolicyGroup() }
                 return item
             }
-            if profile.groupOrder.indices.contains(indexPath.item),
-               let group = profile.groups[profile.groupOrder[indexPath.item]] {
-                let name = profile.groupOrder[indexPath.item]
-                let item = collectionView.makeItem(withIdentifier: GroupCardCollectionItem.identifier,
-                                               for: indexPath) as! GroupCardCollectionItem
-                item.configure(group: group, selected: groupSelections[name],
-                               onEdit: { [weak self] in self?.editPolicyGroup(named: name) }) { [weak self] member in
-                    self?.setGroupSelection(group: name, member: member)
+            if groupNames.indices.contains(indexPath.item) {
+                let name = groupNames[indexPath.item]
+                if let group = profile.groups[name] ?? renderedGroupPolicies[name] {
+                    let item = collectionView.makeItem(withIdentifier: GroupCardCollectionItem.identifier,
+                                                   for: indexPath) as! GroupCardCollectionItem
+                    item.configure(group: group, selected: groupSelections[name] ?? renderedGroupSelections[name],
+                                   onEdit: { [weak self] in self?.editPolicyGroup(named: name) }) { [weak self] member in
+                        self?.setGroupSelection(group: name, member: member)
+                    }
+                    return item
                 }
-                return item
             }
         }
         // A group-section refresh may precede the asynchronous node search
@@ -5949,18 +5986,20 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     func collectionView(_ collectionView: NSCollectionView,
                         shouldSelectItemsAt indexPaths: Set<IndexPath>) -> Set<IndexPath> {
-        Set(indexPaths.filter {
-            $0.section == 0 && filteredProxyNames.indices.contains($0.item)
-                && profile.proxies[filteredProxyNames[$0.item]] != nil
+        let proxyNames = renderedProxyOrder ?? filteredProxyNames
+        return Set(indexPaths.filter {
+            $0.section == 0 && proxyNames.indices.contains($0.item)
+                && profile.proxies[proxyNames[$0.item]] != nil
         })
     }
 
     func collectionView(_ collectionView: NSCollectionView,
                         didSelectItemsAt indexPaths: Set<IndexPath>) {
+        let proxyNames = renderedProxyOrder ?? filteredProxyNames
         guard collectionView === policyCollectionView, let indexPath = indexPaths.first, indexPath.section == 0,
-              filteredProxyNames.indices.contains(indexPath.item),
-              profile.proxies[filteredProxyNames[indexPath.item]] != nil else { return }
-        useProxy(named: filteredProxyNames[indexPath.item])
+              proxyNames.indices.contains(indexPath.item),
+              profile.proxies[proxyNames[indexPath.item]] != nil else { return }
+        useProxy(named: proxyNames[indexPath.item])
         collectionView.deselectItems(at: indexPaths)
     }
 

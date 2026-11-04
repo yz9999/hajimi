@@ -89,7 +89,7 @@ enum DNSProxyFallbackTransportPolicy {
             return flag(node.parameters["tls"], default: defaultTLS) == true
         case "anytls", "hysteria", "hysteria2", "tuic", "trusttunnel":
             return flag(node.parameters["tls"], default: true) == true
-        case "mieru": return true
+        case "mieru", "snell", "wireguard": return true
         case "sudoku":
             let aead = (node.parameters["aead-method"] ?? node.parameters["cipher"] ?? "chacha20-poly1305").lowercased()
             return ["chacha20-poly1305", "aes-128-gcm"].contains(aead)

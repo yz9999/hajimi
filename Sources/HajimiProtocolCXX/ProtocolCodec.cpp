@@ -312,6 +312,18 @@ hajimi_codec_result headerEnd(const uint8_t *p, size_t n, size_t limit,
     const size_t length = n < limit ? n : limit;
     size_t offset = 0, lineLength = 0, lines = 0;
     while (offset < length) {
+        // 64-bit SWAR Printable-ASCII Fast-Path (Alan Mycroft parallel range test):
+        // Checks 8 bytes at once for all bytes in [0x20, 0x7e] with zero false positives/negatives.
+        while (length - offset >= 8 && lineLength + 8 <= HAJIMI_CODEC_MAX_HTTP_LINE) {
+            uint64_t w = 0;
+            std::memcpy(&w, p + offset, sizeof(w));
+            const uint64_t nonPrintable =
+                (w | (w - 0x2020202020202020ULL) | (w + 0x0101010101010101ULL)) & 0x8080808080808080ULL;
+            if (nonPrintable != 0) { break; }
+            offset += 8;
+            lineLength += 8;
+        }
+        if (offset >= length) { break; }
         const uint8_t c = p[offset];
         if (c == '\r') {
             if (offset + 1 == length) { break; }
@@ -1533,9 +1545,21 @@ extern "C" void hajimi_smart_stats_observe(hajimi_smart_node_stats *stats,
             stats->ewma_rtt = clamped_rtt;
             stats->ewm_var = 0.0;
         } else {
-            // Welford-West exponentially weighted online mean & variance recurrence
-            constexpr double alpha = 0.25;
+            // Innovation-Adaptive Kalman-Welford exponentially weighted online mean & variance:
+            // Boosts gain alpha in [0.25, 0.45] when normalized innovation |delta|/sigma > 3.0
+            // to track abrupt network regime changes while filtering stationary jitter.
+            double alpha = 0.25;
             const double delta = clamped_rtt - stats->ewma_rtt;
+            if (stats->sample_count >= 2) {
+                const double sigma_floor = std::fmax(std::sqrt(std::fmax(0.0, stats->ewm_var)),
+                                                     0.05 * stats->ewma_rtt);
+                if (sigma_floor > 1e-6) {
+                    const double z = std::fabs(delta) / sigma_floor;
+                    if (z > 3.0) {
+                        alpha = std::fmin(0.45, 0.25 + 0.05 * std::fmin(z - 3.0, 4.0));
+                    }
+                }
+            }
             stats->ewma_rtt += alpha * delta;
             stats->ewm_var = (1.0 - alpha) * (stats->ewm_var + alpha * delta * delta);
         }

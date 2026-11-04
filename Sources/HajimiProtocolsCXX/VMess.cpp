@@ -158,7 +158,11 @@ public:
     VMessStream(const Node &node,const Target &target,std::shared_ptr<Stream> source,std::shared_ptr<TransportFactory> factory=nullptr)
         :source_(std::move(source)),factory_(std::move(factory)),reader_(std::make_shared<Reader>(source_)),writer_(std::make_shared<OrderedWriter>(source_)),
          udp_(target.udp),coalesceHeader_(!target.udp && factory_ && static_cast<bool>(factory_->after)) {
-        auto uuid=uuidBytes(node.option("uuid",node.option("username")));
+        std::string rawUuid = node.option("uuid", node.option("username"));
+        if (rawUuid.find('=') != std::string::npos && !node.option("username").empty()) {
+            rawUuid = node.option("username");
+        }
+        auto uuid=uuidBytes(rawUuid);
         auto randomMaterial=crypto::randomBytes(34);
         requestIV_.assign(randomMaterial.begin(),randomMaterial.begin()+16);
         requestKey_.assign(randomMaterial.begin()+16,randomMaterial.begin()+32);
@@ -211,13 +215,7 @@ public:
             }
             for(size_t offset=0;offset<data.size();){
                 size_t count=std::min(chunkSize,data.size()-offset);
-                Buffer sealed;
-                if(offset==0 && count==data.size()){
-                    sealed=crypto::seal(crypto::AEAD::AES128GCM,requestKey_,bodyNonce(writeCounter_,requestIV_),data);
-                }else{
-                    Buffer plain(data.begin()+offset,data.begin()+offset+count);
-                    sealed=crypto::seal(crypto::AEAD::AES128GCM,requestKey_,bodyNonce(writeCounter_,requestIV_),plain);
-                }
+                Buffer sealed=crypto::sealSlice(crypto::AEAD::AES128GCM,requestKey_,bodyNonce(writeCounter_,requestIV_),data.data()+offset,count);
                 append16(output,uint16_t(sealed.size()));output.insert(output.end(),sealed.begin(),sealed.end());++writeCounter_;offset+=count;
             }
             writer_->write(std::move(output),std::move(completion));

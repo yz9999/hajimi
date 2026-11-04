@@ -172,10 +172,10 @@ public final class ProbeScheduler {
         let ticket = Ticket(id: id, scheduler: self)
         let timeout = Self.budget(timeout, fallback: 5, maximum: 300)
         let queueWait = Self.budget(queueWait, fallback: 20, maximum: 60)
+        lock.lock()
         let now = DispatchTime.now()
         let entry = Entry(id: id, submitted: now, queueWait: queueWait, timeout: timeout,
                           callbackQueue: callbackQueue, start: start, failure: failure)
-        lock.lock()
         var effects = advanceLocked(now: now)
         if active >= maximumActive && pending.count >= maximumQueued {
             rejected &+= 1
@@ -242,15 +242,15 @@ public final class ProbeScheduler {
     }
 
     private func complete(_ id: UUID) -> Bool {
-        let now = DispatchTime.now()
         lock.lock()
+        let now = DispatchTime.now()
         var effects = advanceLocked(now: now)
         let won: Bool
         if let entry = entries.removeValue(forKey: id), let lease = entry.lease {
             active -= 1; completed &+= 1; won = true
             if let cancellation = entry.cancellation { effects.cleanups.append((lease.queue, cancellation)) }
         } else { won = false }
-        effects.append(advanceLocked(now: now))
+        effects.append(advanceLocked(now: .now()))
         lock.unlock()
         perform(effects)
         return won
@@ -303,7 +303,10 @@ public final class ProbeScheduler {
             let lane = DispatchQueue(label: "app.hajimi.probe.\(id.uuidString)", target: workerQueue)
             entry.lease = Lease(id: id, queue: lane, deadline: entry.expiration, scheduler: self)
             active += 1
-            latestQueueWaitMilliseconds = Double(now.uptimeNanoseconds - entry.submitted.uptimeNanoseconds) / 1_000_000
+            let waitNanoseconds = now.uptimeNanoseconds > entry.submitted.uptimeNanoseconds
+                ? (now.uptimeNanoseconds - entry.submitted.uptimeNanoseconds)
+                : 0
+            latestQueueWaitMilliseconds = Double(waitNanoseconds) / 1_000_000
             effects.starts.append(entry)
         }
         let deadline = entries.values.map(\.expiration).min { $0.uptimeNanoseconds < $1.uptimeNanoseconds }

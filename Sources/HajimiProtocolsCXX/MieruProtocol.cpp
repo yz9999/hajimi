@@ -1,5 +1,6 @@
 // Mieru Outbound Protocol (Official v3 Wire Specification: TCP & UDP Underlays)
 #include "MieruProtocol.hpp"
+#include "ProtocolStream.hpp"
 #include "ProtocolCommon.hpp"
 #include <algorithm>
 #include <chrono>
@@ -311,12 +312,17 @@ Buffer decodeMieruLowEntropyPayload(const ParsedMieruMetadata &parsed, const Buf
         unsigned shift = unsigned((i * rotStep) & 63u);
         uint64_t mask = rotLeft ? rotl64(mask0, shift) : rotr64(mask0, shift);
         uint64_t chunk = readBE64(encodedPlusTag.data() + i * 8);
+#if defined(__BMI2__) && (defined(__x86_64__) || defined(_M_X64))
+        uint64_t extracted = _pext_u64(chunk, mask);
+#else
         uint64_t extracted = 0;
-        for (int bit = 63; bit >= 0; --bit) {
-            if ((mask >> bit) & 1ULL) {
-                extracted = (extracted << 1) | ((chunk >> bit) & 1ULL);
-            }
+        uint64_t remMask = mask;
+        while (remMask != 0) {
+            const int bit = 63 - __builtin_clzll(remMask);
+            extracted = (extracted << 1) | ((chunk >> bit) & 1ULL);
+            remMask &= ~(1ULL << bit);
         }
+#endif
         size_t take = std::min(C, N - out.size());
         for (int b = int(take) - 1; b >= 0; --b) {
             out.push_back(uint8_t((extracted >> (b * 8)) & 0xff));
@@ -358,6 +364,7 @@ public:
     MieruTCPStream(std::shared_ptr<Stream> raw, std::vector<Buffer> candidateKeys,
                    Buffer txNonce, uint32_t sessionID, uint32_t initialTxSeq)
         : raw_(std::move(raw)), reader_(std::make_shared<Reader>(raw_)),
+          writer_(std::make_shared<OrderedWriter>(raw_)),
           candidateKeys_(std::move(candidateKeys)), txKey_(candidateKeys_.front()),
           rxKey_(candidateKeys_.front()), txNonce_(std::move(txNonce)),
           sessionID_(sessionID), txSeq_(initialTxSeq) {}
@@ -374,22 +381,17 @@ public:
                 Buffer meta = buildMieruDataMetadata(kMieruDataClientToServer, sessionID_,
                                                      txSeq_++, rxHighestSeq_, 4096,
                                                      0, uint16_t(chunkLen), 0);
-                Buffer sealedMeta = crypto::seal(crypto::AEAD::XChaCha20Poly1305, txKey_, txNonce_, meta);
+                Buffer sealedMeta = crypto::sealSlice(crypto::AEAD::XChaCha20Poly1305, txKey_, txNonce_, meta.data(), meta.size());
                 incrementNonceBE(txNonce_);
                 wire.insert(wire.end(), sealedMeta.begin(), sealedMeta.end());
 
-                Buffer sealedPayload;
-                if (offset == 0 && chunkLen == data.size()) {
-                    sealedPayload = crypto::seal(crypto::AEAD::XChaCha20Poly1305, txKey_, txNonce_, data);
-                } else {
-                    Buffer plain(data.begin() + offset, data.begin() + offset + chunkLen);
-                    sealedPayload = crypto::seal(crypto::AEAD::XChaCha20Poly1305, txKey_, txNonce_, plain);
-                }
+                Buffer sealedPayload = crypto::sealSlice(crypto::AEAD::XChaCha20Poly1305, txKey_, txNonce_,
+                                                         data.data() + offset, chunkLen);
                 incrementNonceBE(txNonce_);
                 wire.insert(wire.end(), sealedPayload.begin(), sealedPayload.end());
                 offset += chunkLen;
             }
-            raw_->write(std::move(wire), std::move(completion));
+            writer_->write(std::move(wire), std::move(completion));
         } catch (const std::exception &e) {
             completion(e.what());
         }
@@ -421,13 +423,14 @@ public:
     void close() override {
         if (closed_) return;
         closed_ = true;
-        if (raw_) {
+        if (writer_) {
             try {
                 Buffer closeMeta = buildMieruSessionMetadata(kMieruCloseSessionReq, sessionID_, txSeq_++, 0, 0, 0);
-                Buffer sealedMeta = crypto::seal(crypto::AEAD::XChaCha20Poly1305, txKey_, txNonce_, closeMeta);
+                Buffer sealedMeta = crypto::sealSlice(crypto::AEAD::XChaCha20Poly1305, txKey_, txNonce_, closeMeta.data(), closeMeta.size());
                 incrementNonceBE(txNonce_);
-                raw_->write(std::move(sealedMeta), [](Error) {});
+                writer_->write(std::move(sealedMeta), [](Error) {});
             } catch (...) {}
+            writer_->close();
         }
         reader_->close();
     }
@@ -477,12 +480,15 @@ private:
                 }
                 try {
                     if (parsed.payloadLen > 0) {
-                        Buffer cipherPayload(tail.begin() + parsed.prefixLen,
-                                             tail.begin() + parsed.prefixLen + parsed.payloadLen + 16);
+                        Buffer plain;
                         if (parsed.protoType == kMieruDataServerToClientLE) {
+                            Buffer cipherPayload(tail.begin() + parsed.prefixLen,
+                                                 tail.begin() + parsed.prefixLen + parsed.payloadLen + 16);
                             cipherPayload = decodeMieruLowEntropyPayload(parsed, cipherPayload);
+                            plain = self->openPayloadSlice(cipherPayload.data(), cipherPayload.size());
+                        } else {
+                            plain = self->openPayloadSlice(tail.data() + parsed.prefixLen, size_t(parsed.payloadLen) + 16);
                         }
-                        Buffer plain = self->openPayloadBlock(cipherPayload);
                         if (!self->socksReplyConsumed_) {
                             self->handshakePending_.insert(self->handshakePending_.end(), plain.begin(), plain.end());
                         } else {
@@ -555,9 +561,9 @@ private:
         }
     }
 
-    Buffer openPayloadBlock(const Buffer &cipherPayload) {
+    Buffer openPayloadSlice(const uint8_t *cipherPtr, size_t cipherLen) {
         try {
-            Buffer plain = crypto::open(crypto::AEAD::XChaCha20Poly1305, rxKey_, rxNonce_, cipherPayload);
+            Buffer plain = crypto::openSlice(crypto::AEAD::XChaCha20Poly1305, rxKey_, rxNonce_, cipherPtr, cipherLen);
             rxEndianLocked_ = true;
             lastRxNonceBeforeInc_ = rxNonce_;
             if (useLittleEndianRxNonce_) incrementNonceLE(rxNonce_);
@@ -567,7 +573,7 @@ private:
             if (!rxEndianLocked_) {
                 Buffer altNonce = lastRxNonceBeforeInc_;
                 incrementNonceLE(altNonce);
-                Buffer plain = crypto::open(crypto::AEAD::XChaCha20Poly1305, rxKey_, altNonce, cipherPayload);
+                Buffer plain = crypto::openSlice(crypto::AEAD::XChaCha20Poly1305, rxKey_, altNonce, cipherPtr, cipherLen);
                 useLittleEndianRxNonce_ = true;
                 rxEndianLocked_ = true;
                 lastRxNonceBeforeInc_ = altNonce;
@@ -581,6 +587,7 @@ private:
 
     std::shared_ptr<Stream> raw_;
     std::shared_ptr<Reader> reader_;
+    std::shared_ptr<OrderedWriter> writer_;
     std::vector<Buffer> candidateKeys_;
     Buffer txKey_, rxKey_, txNonce_, rxNonce_, lastRxNonceBeforeInc_;
     Buffer handshakePending_;
@@ -600,10 +607,10 @@ private:
 class MieruUDPStream final : public Stream, public std::enable_shared_from_this<MieruUDPStream> {
 public:
     MieruUDPStream(std::shared_ptr<Datagram> raw, std::shared_ptr<TransportFactory> factory,
-                   Target serverTarget, MieruConfig cfg,
+                   Node dialNode, Target serverTarget, MieruConfig cfg,
                    std::vector<Buffer> candidateKeys, uint32_t sessionID, Buffer initialSocksReq)
         : raw_(std::move(raw)), factory_(std::move(factory)),
-          serverTarget_(std::move(serverTarget)), cfg_(std::move(cfg)),
+          dialNode_(std::move(dialNode)), serverTarget_(std::move(serverTarget)), cfg_(std::move(cfg)),
           candidateKeys_(std::move(candidateKeys)), txKey_(candidateKeys_.front()),
           rxKey_(candidateKeys_.front()), sessionID_(sessionID),
           initialSessionID_(sessionID), validSessionIDs_{sessionID},
@@ -885,7 +892,9 @@ private:
         if (closed_ || keepaliveScheduled_ || !sessionOpened_ || !factory_ || !factory_->after) return;
         keepaliveScheduled_ = true;
         auto self = shared_from_this();
-        factory_->after(15.0, [self]() {
+        // 10s keepalive heartbeat keeps CGNAT UDP mappings and mita's PacketUnderlay
+        // alive ahead of the 15s DoH/DoT connection pool idle timeout.
+        factory_->after(10.0, [self]() {
             self->keepaliveScheduled_ = false;
             if (self->closed_ || !self->sessionOpened_ || !self->raw_) return;
             if (self->factory_ && self->factory_->cancelled && self->factory_->cancelled()) {
@@ -893,7 +902,7 @@ private:
                 return;
             }
             uint64_t nowMs = monotonicMillis();
-            if (nowMs >= self->lastTxMs_ + 14000 && self->txUnacked_.empty()) {
+            if (nowMs >= self->lastTxMs_ + 9500 && self->txUnacked_.empty()) {
                 self->sendAckNow();
             }
             self->scheduleKeepaliveTimer();
@@ -921,11 +930,15 @@ private:
                     continue;
                 }
                 ++it->second.retries;
-                // Fail fast (~1.7s) if the peer has gone completely silent across 5+
-                // retransmissions so upper layers (e.g. EncryptedDNS recoverIdle or
-                // Spotify/YouTube stream retry) can immediately open a fresh session
-                // before their 5s-8s request deadline expires.
-                if (it->second.retries > 8 ||
+                // Fast-fail (~850ms, 3 retries) if this write occurred on a previously
+                // idle stream (firstSentAtMs >= lastRxMs_ + 1000) and zero packets have
+                // arrived since, so EncryptedDNSRequest.recoverIdle immediately dials a
+                // fresh session instead of wasting 2.0s-2.6s on a dead NAT mapping.
+                const bool staleIdleSilent =
+                    (it->second.firstSentAtMs >= self->lastRxMs_ + 1000) &&
+                    (nowMs >= self->lastRxMs_ + 1850) &&
+                    (it->second.retries >= 3);
+                if (it->second.retries > 8 || staleIdleSilent ||
                     (it->second.retries >= 5 && nowMs >= self->lastRxMs_ + 1600)) {
                     self->failAll("Mieru UDP retransmission limit exceeded");
                     return;
@@ -972,6 +985,45 @@ private:
         sendOpenSessionPacketForSid(sessionID_);
     }
 
+    void rotateUnderlyingSocketAndSendOpen() {
+        if (closed_ || sessionOpened_ || !factory_ || !factory_->udp) {
+            sessionID_ = allocateFreshSessionID();
+            sendOpenSessionPacketForSid(sessionID_);
+            return;
+        }
+        Node nextNode = dialNode_;
+        if (cfg_.portStart > 0 && cfg_.portEnd >= cfg_.portStart) {
+            Buffer r = crypto::randomBytes(2);
+            uint16_t span = uint16_t(cfg_.portEnd - cfg_.portStart + 1);
+            nextNode.port = uint16_t(cfg_.portStart + (readBE16(r.data()) % span));
+        }
+        Target nextTarget{nextNode.dialHost(), nextNode.port, true, false};
+        auto self = shared_from_this();
+        factory_->udp(nextNode, [self, nextTarget = std::move(nextTarget)](std::shared_ptr<Datagram> freshDgram, Error err) mutable {
+            if (self->closed_ || self->sessionOpened_) {
+                if (freshDgram) freshDgram->close();
+                return;
+            }
+            if (!err.empty() || !freshDgram) {
+                self->sessionID_ = self->allocateFreshSessionID();
+                self->sendOpenSessionPacketForSid(self->sessionID_);
+                return;
+            }
+            if (self->raw_) {
+                self->raw_->close();
+            }
+            self->raw_ = std::move(freshDgram);
+            self->serverTarget_ = std::move(nextTarget);
+            self->raw_->start([self](Target, Buffer packet) {
+                self->onPacket(std::move(packet));
+            }, [self](Error sockErr) {
+                self->failAll(sockErr.empty() ? Error("Mieru UDP socket error") : sockErr);
+            });
+            self->sessionID_ = self->allocateFreshSessionID();
+            self->sendOpenSessionPacketForSid(self->sessionID_);
+        });
+    }
+
     void scheduleOpenRetry(int attempt) {
         if (closed_ || sessionOpened_ || !factory_ || !factory_->after) return;
         if (factory_->cancelled && factory_->cancelled()) {
@@ -1000,13 +1052,22 @@ private:
                 self->currentKeyBucket_ = ((nowSec + 60) / 120) * 120;
                 self->candidateKeys_ = mieruCandidateKeys(self->cfg_.username, self->cfg_.password, nowSec);
                 if (!self->candidateKeys_.empty()) {
-                    self->txKey_ = self->candidateKeys_.front();
+                    // On attempt >= 3, cycle across candidateKeys_ (t, t-120s, t+120s)
+                    // to survive client/server clock skew near a 2-minute bucket boundary.
+                    size_t keyIdx = (attempt >= 3) ? (size_t(attempt - 2) % self->candidateKeys_.size()) : 0;
+                    self->txKey_ = self->candidateKeys_[keyIdx];
                 }
             }
             if (attempt == 1) {
                 // First fast retry (250ms): re-send original sessionID_ in case the
                 // initial uplink UDP datagram was dropped.
                 self->sendOpenSessionPacketForSid(self->initialSessionID_);
+            } else if (attempt == 2 || attempt == 4) {
+                // If 2+ packets on the current UDP 5-tuple yielded zero response (650ms / 2.1s),
+                // rotate the underlying UDP socket (binding a fresh ephemeral source port and
+                // re-sampling port-range) to escape ISP UDP 5-tuple QoS blackholes or a wedged
+                // mita PacketUnderlay entry on the server.
+                self->rotateUnderlyingSocketAndSendOpen();
             } else {
                 // Subsequent retries: allocate a fresh sessionID so that if an earlier
                 // openSessionReq reached the server and its downlink openSessionResp was
@@ -1295,6 +1356,7 @@ private:
 
     std::shared_ptr<Datagram> raw_;
     std::shared_ptr<TransportFactory> factory_;
+    Node dialNode_;
     Target serverTarget_;
     MieruConfig cfg_;
     std::vector<Buffer> candidateKeys_;
@@ -1508,7 +1570,7 @@ void connectMieru(const Node &node, const Target &target,
             return;
         }
         Target serverTarget{dialNode.dialHost(), dialNode.port, true, false};
-        factory->udp(dialNode, [factory, serverTarget = std::move(serverTarget),
+        factory->udp(dialNode, [factory, dialNode, serverTarget = std::move(serverTarget),
                                 cfg = std::move(cfg), sessionID, openReq = std::move(openReq),
                                 completion = std::move(completion)]
                      (std::shared_ptr<Datagram> dgram, Error dialErr) mutable {
@@ -1519,7 +1581,7 @@ void connectMieru(const Node &node, const Target &target,
             try {
                 auto candKeys = mieruCandidateKeys(cfg.username, cfg.password, unixSeconds());
                 auto udpStream = std::make_shared<MieruUDPStream>(
-                    std::move(dgram), factory, std::move(serverTarget), std::move(cfg),
+                    std::move(dgram), factory, std::move(dialNode), std::move(serverTarget), std::move(cfg),
                     std::move(candKeys), sessionID, std::move(openReq));
                 udpStream->start(std::move(completion));
             } catch (const std::exception &e) {
@@ -1744,6 +1806,48 @@ bool mieruProtocolSelfTest() {
                      [&](std::shared_ptr<Stream> s, Error err) { if (err.empty()) recoveredStream = std::move(s); });
         if (!recoveredStream) return false;
         recoveredStream->close();
+
+        // 3. Handshake 5-tuple blackhole recovery via rotateUnderlyingSocketAndSendOpen on attempt == 2
+        struct SilentDatagram final : public Datagram {
+            bool closed = false;
+            void send(Target, Buffer, WriteCallback completion) override {
+                if (completion) completion({});
+            }
+            void start(PacketCallback, WriteCallback) override {}
+            void close() override { closed = true; }
+        };
+        auto rotateFactory = std::make_shared<TransportFactory>();
+        size_t rotateDialCount = 0;
+        std::shared_ptr<SilentDatagram> firstBlackholeDgram;
+        std::vector<std::function<void()>> scheduledTimers;
+        rotateFactory->udp = [&](const Node &, DatagramCallback cb) {
+            ++rotateDialCount;
+            if (rotateDialCount == 1) {
+                firstBlackholeDgram = std::make_shared<SilentDatagram>();
+                cb(firstBlackholeDgram, {});
+            } else {
+                auto dg = std::make_shared<LoopbackMieruDatagram>();
+                dg->serverKey = serverKey;
+                cb(dg, {});
+            }
+        };
+        rotateFactory->post = [](std::function<void()> work) { work(); };
+        rotateFactory->after = [&](double, std::function<void()> work) {
+            scheduledTimers.push_back(std::move(work));
+        };
+
+        std::shared_ptr<Stream> rotatedStream;
+        connectMieru(mieruNode, Target{"1.1.1.1", 443, false, false}, rotateFactory,
+                     [&](std::shared_ptr<Stream> s, Error err) { if (err.empty()) rotatedStream = std::move(s); });
+        // Fire attempt 1 (250ms on socket #1, still silent) and attempt 2 (400ms -> rotates to socket #2)
+        for (size_t idx = 0; idx < scheduledTimers.size() && !rotatedStream && idx < 4; ++idx) {
+            auto fn = scheduledTimers[idx];
+            fn();
+        }
+        if (!rotatedStream || rotateDialCount < 2 || !firstBlackholeDgram || !firstBlackholeDgram->closed) {
+            return false;
+        }
+        rotatedStream->close();
 
         return true;
     } catch (...) {

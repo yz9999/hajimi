@@ -231,6 +231,7 @@ void connectProtocol(const Node &node, const Target &target, std::shared_ptr<Tra
     else if (node.type == "hysteria" || node.type == "hysteria2" || node.type == "tuic") connectQUICProtocol(node, target, std::move(factory), std::move(completion));
     else if (node.type == "snell") connectSnell(node, target, std::move(factory), std::move(completion));
     else if (node.type == "ssh") connectSSH(node, target, std::move(factory), std::move(completion));
+    else if (node.type == "wireguard") connectWireGuard(node, target, std::move(factory), std::move(completion));
     else connectBasicProtocol(node, target, std::move(factory), std::move(completion));
 }
 void makeProtocolDatagram(const Node &node, std::shared_ptr<TransportFactory> factory, DatagramCallback completion) {
@@ -244,6 +245,7 @@ void makeProtocolDatagram(const Node &node, std::shared_ptr<TransportFactory> fa
     else if (node.type == "trusttunnel") makeTrustTunnelDatagram(node, std::move(factory), std::move(completion));
     else if (node.type == "hysteria" || node.type == "hysteria2" || node.type == "tuic") makeQUICDatagram(node, std::move(factory), std::move(completion));
     else if (node.type == "snell") makeSnellDatagram(node, std::move(factory), std::move(completion));
+    else if (node.type == "wireguard") makeWireGuardDatagram(node, std::move(factory), std::move(completion));
     else makeBasicDatagram(node, std::move(factory), std::move(completion));
 }
 } // namespace hajimi

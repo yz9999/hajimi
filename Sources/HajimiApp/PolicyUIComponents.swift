@@ -384,7 +384,7 @@ final class TCPNodeLatencyProbe {
                             guard !finished else { return }
                             switch udpResult {
                             case .success:
-                                let elapsed = DispatchTime.now().uptimeNanoseconds - started
+                                let nowNs = DispatchTime.now().uptimeNanoseconds; let elapsed = nowNs > started ? (nowNs - started) : 0
                                 finish(.success(max(1, Int(Double(elapsed) / 1_000_000))))
                             case .failure(let error):
                                 finish(.failure(error))
@@ -398,7 +398,7 @@ final class TCPNodeLatencyProbe {
                         guard !finished else { return }
                         switch result {
                         case .success:
-                            let elapsed = DispatchTime.now().uptimeNanoseconds - started
+                            let nowNs = DispatchTime.now().uptimeNanoseconds; let elapsed = nowNs > started ? (nowNs - started) : 0
                             finish(.success(max(1, Int(Double(elapsed) / 1_000_000))))
                         case .failure(let error): finish(.failure(error))
                         }
@@ -1261,7 +1261,7 @@ final class ProxyEditorSheetController: NSWindowController {
         case "http", "https", "socks5", "socks5-tls": required = "可选：username、password"
         case "ss": required = "必需：cipher、password"
         case "ssr": required = "必需：cipher、password、protocol、obfs"
-        case "snell": required = "必需：psk；常用：version=4"
+        case "snell": required = "必需：psk；常用：version=4…6"
         case "vmess", "vless": required = "必需：uuid"
         case "trojan", "anytls", "hysteria2": required = "必需：password"
         case "hysteria": required = "必需：auth-str、up、down"

@@ -275,7 +275,7 @@ private final class Hysteria1Client: NativeQUICProxyClient {
         do {
             let alpn = protocolValues(policy.parameters["alpn"])
             let value = try NativeQUICSession(
-                host: host, port: port, alpn: alpn.isEmpty ? ["hysteria"] : alpn,
+                host: host, port: port, alpn: alpn.isEmpty ? ["hysteria", "h3"] : alpn,
                 serverName: quicServerName(policy),
                 skipCertificateVerification: quicSkipVerify(policy),
                 interface: quicInterface(host), queue: queue)
@@ -1598,7 +1598,8 @@ private func nonempty(_ value: String?) -> String? {
 }
 
 private func hysteria1Auth(_ policy: ProxyPolicy) -> String? {
-    nonempty(policy.parameters["auth-str"]) ?? nonempty(policy.parameters["auth"]) ??
+    nonempty(policy.parameters["auth-str"]) ?? nonempty(policy.parameters["auth-string"]) ??
+        nonempty(policy.parameters["auth_str"]) ?? nonempty(policy.parameters["auth"]) ??
         nonempty(policy.parameters["password"])
 }
 

@@ -170,6 +170,7 @@ extern "C" void hajimi_bdp_observe(hajimi_bdp_estimator *est,
     if (!est || !std::isfinite(rtt_seconds) || rtt_seconds <= 0.0 || !std::isfinite(timestamp_seconds)) return;
     const double clamped_rtt = std::clamp(rtt_seconds, 0.0002, 30.0);
     const double rate = static_cast<double>(delivered_bytes) / clamped_rtt;
+    est->last_rtt = clamped_rtt;
 
     if (!est->initialized) {
         est->min_rtt = clamped_rtt;
@@ -177,6 +178,7 @@ extern "C" void hajimi_bdp_observe(hajimi_bdp_estimator *est,
         est->bw_samples[0] = {rate, timestamp_seconds};
         est->bw_samples[1] = {rate, timestamp_seconds};
         est->bw_samples[2] = {rate, timestamp_seconds};
+        est->standing_queue_rounds = 0;
         est->initialized = 1;
         return;
     }
@@ -195,9 +197,19 @@ extern "C" void hajimi_bdp_observe(hajimi_bdp_estimator *est,
     if (clamped_rtt <= est->min_rtt || (timestamp_seconds - est->min_rtt_timestamp) > est->window_seconds) {
         est->min_rtt = clamped_rtt;
         est->min_rtt_timestamp = timestamp_seconds;
+        est->standing_queue_rounds = 0;
     } else {
         // Gentle exponential drift toward current RTT so path changes are tracked smoothly
         est->min_rtt = std::min(clamped_rtt, est->min_rtt * 0.995 + clamped_rtt * 0.005);
+        // Nichols-Jacobson CoDel (RFC 8289) standing-queue sojourn detection:
+        // If current RTT exceeds RTprop by > 25% + 5ms target sojourn delay, increment standing queue counter.
+        if (clamped_rtt > est->min_rtt * 1.25 + 0.005) {
+            if (est->standing_queue_rounds < 16u) {
+                est->standing_queue_rounds += 1u;
+            }
+        } else {
+            est->standing_queue_rounds = 0;
+        }
     }
 
     // Kathleen Nichols 3-slot Windowed Max-Filter for bottleneck delivery rate (BtlBw)
@@ -245,8 +257,14 @@ extern "C" size_t hajimi_bdp_recommended_window(const hajimi_bdp_estimator *est,
     if (!est || !est->initialized || est->min_rtt <= 0.0 || est->bw_samples[0].value <= 0.0) {
         return floor_win;
     }
-    // Kleinrock operating point BDP = BtlBw * RTprop with 2.0x BBR steady-state pacing gain
-    double bdp_bytes = 2.0 * est->bw_samples[0].value * est->min_rtt;
+    // Kleinrock operating point BDP = BtlBw * RTprop with 2.0x BBR steady-state pacing gain,
+    // modulated by CoDel/BBRv3 Drain gain when persistent standing queue (>= 3 rounds) is detected.
+    double pacing_gain = 2.0;
+    if (est->standing_queue_rounds >= 3u) {
+        const double excess_rounds = static_cast<double>(std::min<uint32_t>(est->standing_queue_rounds - 2u, 6u));
+        pacing_gain = std::max(1.15, 2.0 / (1.0 + 0.12 * excess_rounds));
+    }
+    double bdp_bytes = pacing_gain * est->bw_samples[0].value * est->min_rtt;
     // BBRv3 (draft-ietf-ccwg-bbr-04): respect 0.85 * inflight_hi headroom and inflight_lo
     if (est->inflight_hi > 0) {
         const double headroom_cap = 0.85 * static_cast<double>(est->inflight_hi);
@@ -507,6 +525,16 @@ static int flowSelfTestBody(void) {
     hajimi_bdp_observe(&bdp, 131072, 0.010, 2.0);
     const size_t rec_win = hajimi_bdp_recommended_window(&bdp, 1460, 16384, 4194304);
     if (hajimi_bdp_max_bandwidth(&bdp) < 13107200.0 || rec_win < 262144 || rec_win > 524288) return 35;
+
+    // Nichols-Jacobson CoDel standing-queue sojourn inflation drain check
+    hajimi_bdp_observe(&bdp, 65536, 0.035, 2.2);
+    hajimi_bdp_observe(&bdp, 65536, 0.038, 2.4);
+    hajimi_bdp_observe(&bdp, 65536, 0.040, 2.6);
+    const size_t drain_win = hajimi_bdp_recommended_window(&bdp, 1460, 16384, 4194304);
+    if (bdp.standing_queue_rounds < 3 || drain_win >= rec_win) return 38;
+    // Recovery once standing queue drains back to min_rtt
+    hajimi_bdp_observe(&bdp, 131072, 0.010, 2.8);
+    if (bdp.standing_queue_rounds != 0 || hajimi_bdp_recommended_window(&bdp, 1460, 16384, 4194304) != rec_win) return 39;
 
     // BBRv3 loss-headroom & RACK-TLP verification
     hajimi_bdp_observe_loss(&bdp, 200000, 10000, 90000); // 10% loss > 2% threshold

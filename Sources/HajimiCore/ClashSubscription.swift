@@ -660,15 +660,15 @@ public enum ClashSubscription {
             copyTransport()
             guard parameters["password"] != nil else { return .failure("Trojan 缺少 password") }
         case "hysteria", "hysteria1":
-            copy("auth-str", to: "auth-string"); copy("auth_str", to: "auth-string")
-            copy("up"); copy("down"); copy("sni"); copy("obfs")
+            copy("auth-str"); copy("auth_str", to: "auth-str"); copy("auth-string", to: "auth-str")
+            copy("up"); copy("down"); copy("sni"); copy("obfs"); copyALPN()
             copyBool("skip-cert-verify")
         case "hysteria2", "hy2":
             copy("password"); copy("obfs"); copy("obfs-password")
-            copy("sni"); copyBool("skip-cert-verify")
+            copy("sni"); copyALPN(); copyBool("skip-cert-verify")
         case "tuic":
             copy("uuid"); copy("password"); copy("token")
-            copy("congestion-controller"); copy("sni"); copyBool("skip-cert-verify")
+            copy("congestion-controller"); copy("sni"); copyALPN(); copyBool("skip-cert-verify")
         case "snell":
             copy("psk"); copy("version")
             if let obfs = entry["obfs-opts"]?["mode"]?.string, !obfs.isEmpty {
@@ -714,9 +714,40 @@ public enum ClashSubscription {
                 return .failure("TrustTunnel 缺少 username 或 password")
             }
         case "ssh":
-            copy("username"); copy("password"); copy("private-key")
-        case "socks5":
-            copy("username"); copy("password"); copyBool("tls")
+            copy("username")
+            if parameters["username"] == nil { copy("user", to: "username") }
+            copy("password"); copy("private-key"); copy("private-key-passphrase")
+            copy("host-key")
+            if parameters["host-key"] == nil, let hkArray = entry["host-key"]?.array, !hkArray.isEmpty {
+                let items = hkArray.compactMap(\.string).filter { !$0.isEmpty }
+                if !items.isEmpty { parameters["host-key"] = items.joined(separator: "|") }
+            }
+            copy("host-key-algorithms")
+            if parameters["host-key-algorithms"] == nil,
+               let algArray = entry["host-key-algorithms"]?.array, !algArray.isEmpty {
+                let items = algArray.compactMap(\.string).filter { !$0.isEmpty }
+                if !items.isEmpty { parameters["host-key-algorithms"] = items.joined(separator: ",") }
+            }
+            copyBool("skip-cert-verify")
+            if parameters["host-key"] == nil && parameters["skip-cert-verify"] == nil {
+                parameters["skip-cert-verify"] = "true"
+            }
+        case "socks5", "socks5-tls":
+            copy("username"); copy("password")
+            if type == "socks5-tls" { parameters["tls"] = "true" } else { copyBool("tls") }
+            copy("sni")
+            if parameters["sni"] == nil { copy("servername", to: "sni") }
+            copy("servername"); copyALPN()
+            copyBool("skip-cert-verify"); copyBool("skip-common-name-verify")
+            copy("client-fingerprint"); copy("fingerprint")
+            copyBool("udp"); copyBool("udp-relay")
+            copy("underlying-proxy"); copy("dialer-proxy")
+            if parameters["underlying-proxy"] != nil || parameters["dialer-proxy"] != nil {
+                return .success(ProxyPolicy(name: name, kind: .external, host: server, port: port,
+                                            username: entry["username"]?.string,
+                                            password: entry["password"]?.string,
+                                            adapterType: "socks5", parameters: parameters))
+            }
             return .success(ProxyPolicy(name: name, kind: .socks5, host: server, port: port,
                                         username: entry["username"]?.string,
                                         password: entry["password"]?.string,
@@ -724,13 +755,45 @@ public enum ClashSubscription {
         case "http", "https":
             copy("username"); copy("password")
             if type == "https" { parameters["tls"] = "true" } else { copyBool("tls") }
+            copy("sni")
+            if parameters["sni"] == nil { copy("servername", to: "sni") }
+            copy("servername"); copyALPN()
+            copyBool("skip-cert-verify"); copyBool("skip-common-name-verify")
+            copy("client-fingerprint"); copy("fingerprint")
+            copy("underlying-proxy"); copy("dialer-proxy")
+            if parameters["underlying-proxy"] != nil || parameters["dialer-proxy"] != nil {
+                return .success(ProxyPolicy(name: name, kind: .external, host: server, port: port,
+                                            username: entry["username"]?.string,
+                                            password: entry["password"]?.string,
+                                            adapterType: "http", parameters: parameters))
+            }
             return .success(ProxyPolicy(name: name, kind: .http, host: server, port: port,
                                         username: entry["username"]?.string,
                                         password: entry["password"]?.string,
                                         adapterType: "http", parameters: parameters))
+        case "wireguard":
+            copy("private-key")
+            copy("ip"); copy("self-ip", to: "ip")
+            copy("ipv6"); copy("self-ip-v6", to: "ipv6")
+            copy("public-key")
+            copy("pre-shared-key"); copy("preshared-key", to: "pre-shared-key")
+            copy("mtu"); copy("reserved"); copy("allowed-ips")
+            copyBool("udp")
+            if parameters["udp"] == nil { parameters["udp"] = "true" }
+            guard parameters["private-key"] != nil,
+                  parameters["ip"] != nil,
+                  parameters["public-key"] != nil else {
+                return .failure("WireGuard 缺少 private-key、ip 或 public-key")
+            }
         default:
             return .failure("暂不支持的协议类型 \(type)")
         }
+        copy("underlying-proxy")
+        copy("dialer-proxy")
+        copyBool("tfo")
+        copyBool("fast-open", to: "tfo")
+        copy("ip-version")
+        copy("interface-name")
         let normalizedType: String
         switch type {
         case "shadowsocks": normalizedType = "ss"

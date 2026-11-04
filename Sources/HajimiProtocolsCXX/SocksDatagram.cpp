@@ -1,4 +1,5 @@
 #include "BasicProtocols.hpp"
+#include <cstdio>
 #include <deque>
 #include <stdexcept>
 
@@ -58,7 +59,17 @@ class SocksDatagrams final:public Datagram,public std::enable_shared_from_this<S
             if(self->closed_){if(control)control->close();return;}
             if(!error.empty() || !control){self->fail(error.empty()?"SOCKS5 UDP association failed":error);return;}
             if(!bound.port){control->close();self->fail("SOCKS5 server returned an invalid UDP relay");return;}
-            if(bound.host=="0.0.0.0" || bound.host=="::")bound.host=self->node_.host;
+            auto isPrivateOrLoopbackV4 = [](const std::string &h) -> bool {
+                unsigned a = 0, b = 0, c = 0, d = 0;
+                char tail = 0;
+                if (std::sscanf(h.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4) return false;
+                if (a > 255 || b > 255 || c > 255 || d > 255) return false;
+                return a == 0 || a == 10 || a == 127 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168);
+            };
+            if (bound.host == "0.0.0.0" || bound.host == "::" || bound.host == "::1" ||
+                (isPrivateOrLoopbackV4(bound.host) && !isPrivateOrLoopbackV4(self->node_.dialHost()) && self->node_.dialHost() != "localhost" && self->node_.dialHost() != "::1")) {
+                bound.host = self->node_.host;
+            }
             self->control_=std::move(control);self->relay_=bound;self->monitorControl();
             Node relay=self->node_;relay.type="direct";relay.host=bound.host;relay.port=bound.port;
             // A numeric bootstrap belongs to the control server, not to a

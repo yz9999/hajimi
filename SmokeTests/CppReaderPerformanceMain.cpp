@@ -13,15 +13,17 @@ std::atomic<bool> countAllocations{false};
 std::atomic<size_t> allocations{0};
 }
 
-void *operator new(std::size_t size) {
+__attribute__((noinline)) void *operator new(std::size_t size) {
     if (countAllocations.load(std::memory_order_relaxed))
         allocations.fetch_add(1, std::memory_order_relaxed);
     if (void *value = std::malloc(size ? size : 1)) return value;
     throw std::bad_alloc();
 }
-void *operator new[](std::size_t size) { return ::operator new(size); }
-void operator delete(void *value) noexcept { std::free(value); }
-void operator delete[](void *value) noexcept { std::free(value); }
+__attribute__((noinline)) void *operator new[](std::size_t size) { return ::operator new(size); }
+__attribute__((noinline)) void operator delete(void *value) noexcept { std::free(value); }
+__attribute__((noinline)) void operator delete[](void *value) noexcept { std::free(value); }
+__attribute__((noinline)) void operator delete(void *value, std::size_t) noexcept { ::operator delete(value); }
+__attribute__((noinline)) void operator delete[](void *value, std::size_t) noexcept { ::operator delete[](value); }
 
 namespace {
 class FreshChunkStream final : public hajimi::Stream {

@@ -22,7 +22,14 @@ MODULE_FILES = {
     "DNSMessageInspection.swift", "DNSQueryCache.swift",
     "DNSAdaptiveUpstreamSelector.swift", "DNSQueryExecutionContext.swift",
     "DNSQueryCoordinator.swift", "DNSQueryContracts.swift",
+    "DNSProtocolRulePolicy.swift",
 }
+SPLIT_CORE_DNS_FILES = (
+    "EncryptedDNSRoutedTLSAttempt.swift",
+    "EncryptedDNSFrontierEndpoints.swift",
+    "EncryptedDNSSelfTest.swift",
+    "DNSProtocolRouterAdapter.swift",
+)
 _INPUTS: dict[Path, str] = {}
 
 
@@ -51,8 +58,12 @@ def declaration_match(text: str, marker: str) -> re.Match[str] | None:
     elif body.startswith("package "):
         body = body[len("package "):]
         prefix = r"package "
-    elif body.startswith(("private ", "fileprivate ")):
-        prefix = ""
+    elif body.startswith("private "):
+        body = body[len("private "):]
+        prefix = r"(?:private |fileprivate |package |)"
+    elif body.startswith("fileprivate "):
+        body = body[len("fileprivate "):]
+        prefix = r"(?:fileprivate |private |package |)"
     else:
         prefix = r"(?:package )?"
     matches = list(re.finditer(r"^" + re.escape(indent) + prefix
@@ -68,12 +79,14 @@ def declaration_input(filename: str, marker: str) -> tuple[Path, str, re.Match[s
     match = declaration_match(text, marker)
     if match is not None:
         return path, text, match
-    contracts = source_path("DNSQueryContracts.swift")
-    if path != contracts:
-        text = source_text("DNSQueryContracts.swift")
-        match = declaration_match(text, marker)
-        if match is not None:
-            return contracts, text, match
+    fallback_files = ["DNSQueryContracts.swift", "DNSProtocolRulePolicy.swift", *SPLIT_CORE_DNS_FILES]
+    for candidate_name in fallback_files:
+        candidate_path = source_path(candidate_name)
+        if path != candidate_path and candidate_path.exists():
+            text = source_text(candidate_name)
+            match = declaration_match(text, marker)
+            if match is not None:
+                return candidate_path, text, match
     raise RuntimeError(f"Missing current production declaration: {filename}: {marker}")
 
 

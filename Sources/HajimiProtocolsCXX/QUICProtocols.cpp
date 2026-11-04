@@ -18,8 +18,9 @@ using Fields = std::vector<std::pair<std::string, std::string>>;
 uint16_t be16(const uint8_t *p) { return (uint16_t(p[0]) << 8) | p[1]; }
 uint32_t be32(const uint8_t *p) { return (uint32_t(be16(p)) << 16) | be16(p + 2); }
 std::string auth(const Node &node) {
-    return node.type == "hysteria" ? node.option("auth-str", node.option("auth", node.option("password"))) :
-           node.option("password", node.option("auth", node.option("auth-str")));
+    return node.type == "hysteria"
+        ? node.option("auth-str", node.option("auth-string", node.option("auth_str", node.option("auth", node.option("password")))))
+        : node.option("password", node.option("auth", node.option("auth-str", node.option("auth-string", node.option("auth_str")))));
 }
 std::pair<Buffer, std::string> credentials(const Node &node) {
     auto uuid = node.option("uuid"), password = node.option("password");
@@ -665,7 +666,7 @@ Error validateQUICProtocol(const Node &node, bool) {
                             "http-path", "http-headers", "h2-opts"})
         if (!node.option(key).empty()) return std::string("QUIC does not use carrier option ") + key;
     if (node.flag("ws")) return "QUIC protocols cannot use a WebSocket carrier";
-    for (const auto *key : {"ports", "underlying-proxy", "dialer-proxy", "ech-opts", "ech-config",
+    for (const auto *key : {"ech-opts", "ech-config",
                             "client-fingerprint", "certificate", "private-key", "ca-str", "bbr-profile"})
         if (!node.option(key).empty()) return std::string("C++ QUIC does not support option ") + key;
     for (const auto *key : {"fast-open", "reduce-rtt", "zero-rtt-handshake"})

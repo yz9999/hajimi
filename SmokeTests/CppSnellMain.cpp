@@ -138,13 +138,21 @@ int main() {
     Buffer salt(16); for (size_t i = 0; i < salt.size(); ++i) salt[i] = uint8_t(i);
     // Independently generated with argon2-cffi's reference Argon2id v0x13,
     // time_cost=3, memory_cost=8 KiB, parallelism=1, hash_len=32.
-    assert(hex(snell::deriveKey("testpsk", salt, 1)) == "f85ab318206e5601081d4256eeae70a0104aa45a85dbc25bfed366cc0ee73ac4");
     assert(hex(snell::deriveKey("testpsk", salt, 4)) == "f85ab318206e5601081d4256eeae70a0");
-    for (unsigned version = 1; version <= 4; ++version) {
+    assert(hex(snell::deriveKey("testpsk", salt, 5)) == "f85ab318206e5601081d4256eeae70a0");
+    assert(hex(snell::deriveKey("testpsk", salt, 6)) == "f85ab318206e5601081d4256eeae70a0");
+    assert(hex(snell::deriveKeyWithMode("testpsk", salt, 4, snell::CompatMode::Compat16Pool7)) == "7c774c75cd8acfe26fc8eb3b70c99048");
+    for (unsigned legacyVer : {1u, 2u, 3u}) {
+        Node legacyNode; legacyNode.type = "snell"; legacyNode.host = "fixture.invalid"; legacyNode.port = 443;
+        legacyNode.parameters["psk"] = "testpsk"; legacyNode.parameters["version"] = std::to_string(legacyVer);
+        assert(!validateSnell(legacyNode, false).empty());
+        assert(!validateSnell(legacyNode, true).empty());
+    }
+    for (unsigned version = 4; version <= 6; ++version) {
         snell::Encoder encoder("testpsk", version, salt, 8); snell::Decoder decoder("testpsk", version, salt);
         Buffer plain = bytes("record-vector"); auto frame = encoder.frame(plain); size_t headerSize = decoder.headerSize();
         auto lengths = decoder.header(Buffer(frame.begin() + 16, frame.begin() + 16 + headerSize));
-        assert(lengths.payload == plain.size() && lengths.padding == (version == 4 ? 8 : 0));
+        assert(lengths.payload == plain.size() && lengths.padding == (version >= 4 ? 8 : 0));
         assert(decoder.body(Buffer(frame.begin() + 16 + headerSize, frame.end()), lengths) == plain);
         auto second = encoder.frame(bytes("next")); lengths = decoder.header(Buffer(second.begin(), second.begin() + headerSize));
         assert(decoder.body(Buffer(second.begin() + headerSize, second.end()), lengths) == bytes("next"));
@@ -224,12 +232,12 @@ int main() {
             bool largeRejected = false; datagram->send(v4, Buffer(snell::maximumFrame, 0), [&](Error error) { largeRejected = !error.empty(); });
             loop.drain(); assert(largeRejected); datagram->close(); loop.drain();
         } else assert(!validateSnell(node, true).empty());
-        Node unsupported = node; unsupported.parameters["version"] = "5"; assert(!validateSnell(unsupported, false).empty());
+        Node unsupported = node; unsupported.parameters["version"] = "7"; assert(!validateSnell(unsupported, false).empty());
         unsupported = node; unsupported.parameters["obfs"] = "tls"; assert(!validateSnell(unsupported, false).empty());
         stream.reset(); loop.drain();
     }
     Target target; Buffer payload; bool malformed = false;
     try { snell::udpResponse(Buffer{4, 127, 0}, target, payload); } catch (const std::exception &) { malformed = true; }
     assert(malformed);
-    std::puts("C++ Snell: v1-v4 records, Argon2id vector, stream EOF, UDP boundaries, and negative paths passed");
+    std::puts("C++ Snell: v4-v6 records (v1-v3 removed), Argon2id vector, stream EOF, UDP boundaries, and negative paths passed");
 }

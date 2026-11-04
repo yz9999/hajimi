@@ -680,7 +680,7 @@ public enum ShareLinkSubscription {
         var parameters: [String: String] = [:]
         if let auth = link.query["auth"] ?? link.query["auth-str"] ?? link.query["auth_str"],
            !auth.isEmpty {
-            parameters["auth-string"] = auth
+            parameters["auth-str"] = auth
         }
         // The profile carries bandwidth with its unit; the link states megabits
         // per second and nothing else, so the unit is restored here rather than

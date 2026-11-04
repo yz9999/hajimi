@@ -10,11 +10,11 @@ void VisionTraffic::uplink(const Buffer &data) {
     --packetBudget;
     if (data.size() >= 6 && data[0] == 0x16 && data[1] == 3 && data[5] == 1) tls = true;
 }
-void VisionTraffic::downlink(const Buffer &data) {
-    if (!packetBudget || direct) return;
+void VisionTraffic::downlink(const uint8_t *data, size_t len) {
+    if (!packetBudget || direct || !data || len == 0) return;
     --packetBudget;
     size_t room = 65540 - serverHello.size();
-    serverHello.insert(serverHello.end(), data.begin(), data.begin() + std::min(room, data.size()));
+    serverHello.insert(serverHello.end(), data, data + std::min(room, len));
     auto &b = serverHello;
     if (b.size() < 6 || b[0] != 0x16 || b[1] != 3 || b[2] != 3 || b[5] != 2) return;
     tls = true; tls12 = true;
@@ -39,20 +39,21 @@ VisionCodec::VisionCodec(Buffer uuid, bool canDirect)
     : uuid_(std::move(uuid)), traffic_(std::make_shared<VisionTraffic>()), canDirect_(canDirect) {
     if (uuid_.size() != 16) throw std::runtime_error("Invalid Vision UUID");
 }
-Buffer VisionCodec::frame(const Buffer &content, uint8_t command, bool longPadding) {
-    if (content.size() > 8171) throw std::runtime_error("Vision content too large");
+Buffer VisionCodec::frameSlice(const uint8_t *content, size_t contentLen, uint8_t command, bool longPadding) {
+    if (contentLen > 8171) throw std::runtime_error("Vision content too large");
     auto random = crypto::randomBytes(2);
-    size_t padding = longPadding && content.size() < 900
-        ? read16(random) % 500 + 900 - content.size() : read16(random) % 256;
-    padding = std::min(padding, 8171 - content.size());
+    size_t padding = longPadding && contentLen < 900
+        ? read16(random) % 500 + 900 - contentLen : read16(random) % 256;
+    padding = std::min(padding, 8171 - contentLen);
     Buffer output;
-    output.reserve((firstWrite_ ? 16 : 0) + 5 + content.size() + padding);
+    output.reserve((firstWrite_ ? 16 : 0) + 5 + contentLen + padding);
     if (firstWrite_) { output = uuid_; firstWrite_ = false; }
-    output.push_back(command); append16(output, uint16_t(content.size())); append16(output, uint16_t(padding));
-    output.insert(output.end(), content.begin(), content.end()); output.resize(output.size()+padding);
+    output.push_back(command); append16(output, uint16_t(contentLen)); append16(output, uint16_t(padding));
+    if (contentLen > 0 && content) output.insert(output.end(), content, content + contentLen);
+    output.resize(output.size() + padding);
     return output;
 }
-Buffer VisionCodec::initialPadding() { return frame({}, 0, true); }
+Buffer VisionCodec::initialPadding() { return frameSlice(nullptr, 0, 0, true); }
 static bool completeTLSRecords(const Buffer &data) {
     if (data.empty()) return false;
     size_t offset = 0;
@@ -82,16 +83,17 @@ Buffer VisionCodec::encode(const Buffer &data, bool &switchDirect) {
     bool shouldEnd = tlsBoundary || (!traffic_->tls12 && traffic_->packetBudget <= 1);
     uint8_t finalCommand = shouldDirect ? 2 : shouldEnd ? 1 : 0;
     Buffer output;
-    if (data.empty()) output = frame({}, finalCommand, traffic_->tls);
+    if (data.empty()) output = frameSlice(nullptr, 0, finalCommand, traffic_->tls);
     else if (data.size() <= 8171) {
-        output = frame(data, finalCommand, traffic_->tls);
+        output = frameSlice(data.data(), data.size(), finalCommand, traffic_->tls);
     } else {
         output.reserve(data.size() + ((data.size() + 8170) / 8171) * 512 + 16);
-        for (size_t offset=0; offset<data.size();) {
-            size_t end = std::min(data.size(), offset+8171);
-            Buffer content(data.begin()+offset, data.begin()+end);
-            auto encoded = frame(content, end == data.size() ? finalCommand : 0, traffic_->tls);
-            output.insert(output.end(), encoded.begin(), encoded.end()); offset = end;
+        for (size_t offset = 0; offset < data.size();) {
+            size_t end = std::min(data.size(), offset + 8171);
+            auto encoded = frameSlice(data.data() + offset, end - offset,
+                                      end == data.size() ? finalCommand : 0, traffic_->tls);
+            output.insert(output.end(), encoded.begin(), encoded.end());
+            offset = end;
         }
     }
     if (shouldEnd) paddingWrite_ = false;
@@ -100,7 +102,7 @@ Buffer VisionCodec::encode(const Buffer &data, bool &switchDirect) {
 }
 Buffer VisionCodec::decode(const Buffer &data, bool &switchDirect) {
     switchDirect = false;
-    if (!paddingRead_) { traffic_->downlink(data); return data; }
+    if (!paddingRead_) { traffic_->downlink(data.data(), data.size()); return data; }
     if (data.size() > maximumQueuedBytes - input_.size()) throw std::runtime_error("Vision buffer limit exceeded");
     input_.insert(input_.end(), data.begin(), data.end());
     size_t cursor = 0;
@@ -110,22 +112,25 @@ Buffer VisionCodec::decode(const Buffer &data, bool &switchDirect) {
         cursor = 16; firstRead_ = false;
     }
     Buffer output;
+    output.reserve(input_.size() - cursor);
     while (paddingRead_ && input_.size() - cursor >= 5) {
         uint8_t command = input_[cursor];
         size_t length = read16(input_, cursor + 1), padding = read16(input_, cursor + 3);
         if (command > 2) throw std::runtime_error("Invalid Vision padding frame");
         size_t total = 5 + length + padding;
         if (input_.size() - cursor < total) break;
-        Buffer content(input_.begin() + cursor + 5, input_.begin() + cursor + 5 + length);
-        if (!content.empty()) traffic_->downlink(content);
-        output.insert(output.end(), content.begin(), content.end());
+        const uint8_t *contentPtr = input_.data() + cursor + 5;
+        if (length > 0) {
+            traffic_->downlink(contentPtr, length);
+            output.insert(output.end(), contentPtr, contentPtr + length);
+        }
         cursor += total;
         if (command) {
             paddingRead_ = false; switchDirect = command == 2;
             if (cursor < input_.size()) {
-                Buffer tail(input_.begin() + cursor, input_.end());
-                traffic_->downlink(tail);
-                output.insert(output.end(), tail.begin(), tail.end());
+                const size_t tailLen = input_.size() - cursor;
+                traffic_->downlink(input_.data() + cursor, tailLen);
+                output.insert(output.end(), input_.begin() + cursor, input_.end());
                 cursor = input_.size();
             }
         }

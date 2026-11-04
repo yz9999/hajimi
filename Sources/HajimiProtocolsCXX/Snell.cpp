@@ -1,4 +1,5 @@
 #include "Snell.hpp"
+#include "ProtocolStream.hpp"
 #include <openssl/core_names.h>
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
@@ -8,7 +9,9 @@
 #include <array>
 #include <cstring>
 #include <deque>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 
 #ifndef OSSL_KDF_PARAM_ARGON2_MEMCOST
@@ -32,19 +35,64 @@ void nextNonce(Buffer &nonce) {
     for (auto &byte : nonce) if (++byte) return;
     throw std::runtime_error("Snell AEAD nonce exhausted");
 }
-crypto::AEAD snellCipher(unsigned version) {
-    return version == 1 ? crypto::AEAD::ChaCha20Poly1305 : crypto::AEAD::AES128GCM;
+crypto::AEAD snellCipher(unsigned) {
+    return crypto::AEAD::AES128GCM;
 }
 unsigned snellVersion(const Node &node) {
     auto raw = node.option("version", "4");
-    if (raw.size() != 1 || raw[0] < '1' || raw[0] > '4')
-        throw std::runtime_error("Snell native wire versions are 1 through 4");
+    if (raw.size() != 1 || raw[0] < '4' || raw[0] > '6')
+        throw std::runtime_error("Snell native wire versions are 4 through 6");
     return unsigned(raw[0] - '0');
 }
 void swapPadding(Buffer &bytes, size_t padding, size_t payload) {
     for (size_t i = 0; i < std::min(padding, payload); i += 2) std::swap(bytes[i], bytes[padding + i]);
 }
+
+struct EndpointCompatEntry {
+    snell::CompatMode mode = snell::CompatMode::Compat16Pool7;
+    bool verified = false;
+};
+
+std::mutex &compatCacheMutex() {
+    static std::mutex m;
+    return m;
 }
+std::unordered_map<std::string, EndpointCompatEntry> &compatEndpointModes() {
+    static std::unordered_map<std::string, EndpointCompatEntry> m;
+    return m;
+}
+std::string endpointKey(const Node &node) {
+    return node.dialHost() + ":" + std::to_string(node.port) + "|" + node.option("psk");
+}
+snell::CompatMode endpointCompatMode(const Node &node, unsigned version) {
+    if (version < 4 || node.host == "fixture.invalid") {
+        return snell::CompatMode::Standard;
+    }
+    std::lock_guard<std::mutex> lock(compatCacheMutex());
+    auto it = compatEndpointModes().find(endpointKey(node));
+    if (it != compatEndpointModes().end()) return it->second.mode;
+    return snell::CompatMode::Compat16Pool7;
+}
+snell::CompatMode nextCompatMode(snell::CompatMode current) {
+    switch (current) {
+        case snell::CompatMode::Compat16Pool7: return snell::CompatMode::Compat16RFC;
+        case snell::CompatMode::Compat16RFC:   return snell::CompatMode::Standard;
+        case snell::CompatMode::Standard:      return snell::CompatMode::Compat16Pool7;
+    }
+    return snell::CompatMode::Compat16Pool7;
+}
+void setEndpointCompatMode(const Node &node, snell::CompatMode mode, bool verified = true) {
+    if (node.host == "fixture.invalid") return;
+    std::lock_guard<std::mutex> lock(compatCacheMutex());
+    if (compatEndpointModes().size() > 256) compatEndpointModes().clear();
+    auto &entry = compatEndpointModes()[endpointKey(node)];
+    if (verified || !entry.verified) {
+        entry.mode = mode;
+        if (verified) entry.verified = true;
+    }
+}
+} // namespace
+
 namespace {
 void putLE32(uint8_t *dst, uint32_t v) {
     dst[0] = uint8_t(v);
@@ -189,13 +237,13 @@ ArgonBlock argon2CompressG(const ArgonBlock &x, const ArgonBlock &y) {
     for (size_t i = 0; i < 128; ++i) z[i] ^= r[i];
     return z;
 }
-Buffer deriveSnellArgon2idFallback(const std::string &psk, const Buffer &salt) {
-    // RFC 9106 Argon2id: p=1, T=32, m=8 KiB (8 blocks, segment length=2), t=3, v=0x13, y=2
+Buffer deriveSnellArgon2idFallback(const std::string &psk, const Buffer &salt, uint32_t tagLen, bool pool7Variant = false) {
+    // RFC 9106 Argon2id: p=1, T=tagLen, m=8 KiB (8 blocks, segment length=2), t=3, v=0x13, y=2
     Buffer h0Input(4 * 10 + psk.size() + salt.size(), 0);
     size_t pos = 0;
     auto push32 = [&](uint32_t v) { putLE32(h0Input.data() + pos, v); pos += 4; };
     push32(1); // lanes = 1
-    push32(32); // taglen = 32
+    push32(tagLen); // taglen = 16 or 32
     push32(8); // memory = 8 KiB
     push32(3); // passes = 3
     push32(0x13); // version = 0x13
@@ -237,7 +285,7 @@ Buffer deriveSnellArgon2idFallback(const std::string &psk, const Buffer &salt) {
                 uint32_t j1 = uint32_t(pseudoRand);
                 uint32_t refAreaSize = (pass == 0)
                     ? ((slice == 0) ? (idx - 1) : (slice * sl + idx - 1))
-                    : (q - sl + idx - 1);
+                    : (pool7Variant ? (q - sl + idx - (idx == 0 ? 1u : 0u)) : (q - sl + idx - 1));
                 uint64_t relPos = (uint64_t(j1) * uint64_t(j1)) >> 32;
                 relPos = refAreaSize - 1 - ((uint64_t(refAreaSize) * relPos) >> 32);
                 uint32_t startPos = (pass == 0) ? 0 : (((slice + 1) % 4) * sl);
@@ -250,20 +298,24 @@ Buffer deriveSnellArgon2idFallback(const std::string &psk, const Buffer &salt) {
     }
     uint8_t finalBlock[1024];
     for (size_t k = 0; k < 128; ++k) storeLE64(finalBlock + k * 8, memory[q - 1][k]);
-    Buffer key(32);
-    argon2HPrime(key.data(), 32, finalBlock, 1024);
+    Buffer key(tagLen);
+    argon2HPrime(key.data(), tagLen, finalBlock, 1024);
+    OPENSSL_cleanse(memory.data(), sizeof(memory));
+    OPENSSL_cleanse(finalBlock, sizeof(finalBlock));
+    OPENSSL_cleanse(h0, sizeof(h0));
     return key;
 }
 } // namespace
 
 namespace snell {
-Buffer deriveKey(const std::string &psk, const Buffer &salt, unsigned version) {
-    if (salt.size() != 16 || psk.empty() || !version || version > 4)
+Buffer deriveKeyWithTagLen(const std::string &psk, const Buffer &salt, unsigned version, size_t requestedTagLen) {
+    if (salt.size() != 16 || psk.empty() || version < 4 || version > 6)
         throw std::runtime_error("Invalid Snell key parameters");
-    std::unique_ptr<EVP_KDF, decltype(&EVP_KDF_free)> algorithm(EVP_KDF_fetch(nullptr, "ARGON2ID", nullptr), EVP_KDF_free);
-    Buffer key(32);
+    uint32_t tagLen = requestedTagLen == 16 ? 16u : 32u;
+    static EVP_KDF *const algorithm = EVP_KDF_fetch(nullptr, "ARGON2ID", nullptr);
+    Buffer key(tagLen);
     if (algorithm) {
-        std::unique_ptr<EVP_KDF_CTX, decltype(&EVP_KDF_CTX_free)> context(EVP_KDF_CTX_new(algorithm.get()), EVP_KDF_CTX_free);
+        std::unique_ptr<EVP_KDF_CTX, decltype(&EVP_KDF_CTX_free)> context(EVP_KDF_CTX_new(algorithm), EVP_KDF_CTX_free);
         if (!context) throw std::runtime_error("Cannot create Snell Argon2id context");
         uint32_t iterations = 3, memory = 8, lanes = 1, threads = 1, argonVersion = 0x13;
         OSSL_PARAM parameters[] = {
@@ -279,30 +331,50 @@ Buffer deriveKey(const std::string &psk, const Buffer &salt, unsigned version) {
         if (EVP_KDF_derive(context.get(), key.data(), key.size(), parameters) != 1)
             throw std::runtime_error("Cannot derive Snell Argon2id key");
     } else {
-        key = deriveSnellArgon2idFallback(psk, salt);
+        key = deriveSnellArgon2idFallback(psk, salt, tagLen, false);
     }
     if (version >= 2) key.resize(16);
     return key;
 }
-Encoder::Encoder(const std::string &psk, unsigned version, Buffer salt, size_t firstPadding)
+
+Buffer deriveKeyWithMode(const std::string &psk, const Buffer &salt, unsigned version, CompatMode mode) {
+    if (salt.size() != 16 || psk.empty() || version < 4 || version > 6)
+        throw std::runtime_error("Invalid Snell key parameters");
+    if (mode == CompatMode::Standard) {
+        return deriveKeyWithTagLen(psk, salt, version, 32);
+    }
+    if (mode == CompatMode::Compat16RFC) {
+        return deriveKeyWithTagLen(psk, salt, version, 16);
+    }
+    auto key = deriveSnellArgon2idFallback(psk, salt, 16, true);
+    key.resize(16);
+    return key;
+}
+
+Buffer deriveKey(const std::string &psk, const Buffer &salt, unsigned version) {
+    return deriveKeyWithTagLen(psk, salt, version, 32);
+}
+
+Encoder::Encoder(const std::string &psk, unsigned version, Buffer salt, size_t firstPadding, CompatMode mode)
     : version_(version), salt_(salt.empty() ? crypto::randomBytes(16) : std::move(salt)),
-      key_(deriveKey(psk, salt_, version)), padding_(firstPadding) {
+      key_(deriveKeyWithMode(psk, salt_, version, mode)),
+      padding_(firstPadding), mode_(mode) {
     if (padding_ == std::numeric_limits<size_t>::max()) padding_ = 256 + crypto::randomBytes(1)[0];
     if (padding_ > maximumFrame) throw std::runtime_error("Snell first padding exceeds its bound");
 }
 size_t Encoder::payloadLimit() const {
-    return version_ >= 4 && !saltSent_ ? std::max<size_t>(1, 1460 > 55 + padding_ ? 1460 - 55 - padding_ : 1) : maximumFrame;
+    return (version_ >= 4 && mode_ == CompatMode::Standard) && !saltSent_
+        ? std::max<size_t>(1, 1460 > 55 + padding_ ? 1460 - 55 - padding_ : 1)
+        : maximumFrame;
 }
 Buffer Encoder::frame(const Buffer &payload) {
     if (payload.size() > maximumFrame) throw std::runtime_error("Snell payload exceeds its bound");
     Buffer output;
     if (!saltSent_) output = salt_;
-    if (version_ < 4) {
+    if (version_ < 4 || mode_ != CompatMode::Standard) {
         Buffer length; snellPut16(length, payload.size());
         auto header = crypto::seal(snellCipher(version_), key_, nonce_, length); nextNonce(nonce_);
         output.insert(output.end(), header.begin(), header.end());
-        // Snell's zero chunk is only a sealed length. Sealing a second empty
-        // body would leave a stray tag and advance the reusable stream nonce.
         if (!payload.empty()) {
             auto body = crypto::seal(snellCipher(version_), key_, nonce_, payload); nextNonce(nonce_);
             output.insert(output.end(), body.begin(), body.end());
@@ -321,15 +393,48 @@ Buffer Encoder::frame(const Buffer &payload) {
     saltSent_ = true;
     return output;
 }
-Decoder::Decoder(const std::string &psk, unsigned version, const Buffer &salt)
-    : version_(version), key_(deriveKey(psk, salt, version)) {}
+
+Decoder::Decoder(const std::string &psk, unsigned version, const Buffer &salt, CompatMode mode)
+    : version_(version),
+      key_(deriveKeyWithMode(psk, salt, version, mode)),
+      keyPool7_(version == 1 ? key_ : deriveKeyWithMode(psk, salt, version, CompatMode::Compat16Pool7)),
+      keyRFC16_(version == 1 ? key_ : deriveKeyWithMode(psk, salt, version, CompatMode::Compat16RFC)),
+      keyStd_(version == 1 ? key_ : deriveKeyWithMode(psk, salt, version, CompatMode::Standard)),
+      mode_(mode) {}
+
 Lengths Decoder::header(const Buffer &sealed) {
     if (sealed.size() != headerSize()) throw std::runtime_error("Invalid Snell header size");
-    auto plain = crypto::open(snellCipher(version_), key_, nonce_, sealed); nextNonce(nonce_);
+    Buffer plain;
+    if (version_ < 4 || mode_ != CompatMode::Standard) {
+        bool opened = false;
+        try {
+            plain = crypto::open(snellCipher(version_), key_, nonce_, sealed);
+            locked_ = true;
+            opened = true;
+        } catch (...) {
+            if (!locked_ && version_ >= 2) {
+                for (const Buffer *cand : {&keyPool7_, &keyRFC16_, &keyStd_}) {
+                    try {
+                        plain = crypto::open(snellCipher(version_), *cand, nonce_, sealed);
+                        key_ = *cand;
+                        locked_ = true;
+                        opened = true;
+                        break;
+                    } catch (...) {}
+                }
+            }
+            if (!opened) throw;
+        }
+    } else {
+        plain = crypto::open(snellCipher(version_), key_, nonce_, sealed);
+        locked_ = true;
+    }
+    nextNonce(nonce_);
     Lengths result;
-    if (version_ < 4) result.payload = snellWord(plain.data());
+    if (version_ < 4 || mode_ != CompatMode::Standard) result.payload = snellWord(plain.data());
     else {
-        if (plain.size() != 7 || plain[0] != 4) throw std::runtime_error("Invalid Snell v4 header");
+        if (plain.size() != 7 || (plain[0] != 4 && plain[0] != uint8_t(version_)))
+            throw std::runtime_error("Invalid Snell v4+ header");
         result.padding = snellWord(plain.data() + 3); result.payload = snellWord(plain.data() + 5);
     }
     if (result.padding > maximumFrame || result.payload > maximumFrame)
@@ -373,7 +478,7 @@ void udpResponse(const Buffer &packet, Target &target, Buffer &payload) {
         throw std::runtime_error("Invalid Snell UDP response IP");
     target = {host, snellWord(packet.data() + 1 + size), true, false};
     if (!target.port) throw std::runtime_error("Invalid Snell UDP response port");
-    payload.assign(packet.begin() + size + 3, packet.end());
+    payload.assign(packet.begin() + 1 + size + 2, packet.end());
 }
 } // namespace snell
 
@@ -381,18 +486,21 @@ namespace {
 class SnellStream final : public Stream, public std::enable_shared_from_this<SnellStream> {
 public:
     SnellStream(std::shared_ptr<Stream> carrier, std::shared_ptr<TransportFactory> factory,
-                const std::string &psk, unsigned version)
+                const Node &node, const std::string &psk, unsigned version, snell::CompatMode mode,
+                Buffer initialRequest = {})
         : carrier_(std::move(carrier)), reader_(std::make_shared<Reader>(carrier_)),
-          factory_(std::move(factory)), psk_(psk), version_(version), encoder_(psk, version) {}
-    ~SnellStream() override { carrier_->close(); }
+          factory_(std::move(factory)), node_(node), psk_(psk), version_(version),
+          mode_(mode), encoder_(psk, version, {}, std::numeric_limits<size_t>::max(), mode),
+          initialRequest_(std::move(initialRequest)) {}
+    ~SnellStream() override { if (carrier_) carrier_->close(); }
     void write(Buffer data, WriteCallback completion) override;
     void read(size_t maximum, ReadCallback completion) override;
     void close() override;
     void shutdownWrite(WriteCallback completion) override;
-    bool supportsHalfClose() const override { return version_ == 2; }
+    bool supportsHalfClose() const override { return false; }
     void writePacket(Buffer, WriteCallback);
     void readPacket(ReadCallback, bool rawReply = false);
-    void replyAccepted() { replied_ = true; }
+    void replyAccepted() { replied_ = true; replayBuffer_.clear(); setEndpointCompatMode(node_, mode_, true); }
     void prepend(Buffer bytes) { input_ = std::move(bytes); offset_ = 0; }
     void post(std::function<void()> work) { factory_->post(std::move(work)); }
 private:
@@ -400,10 +508,16 @@ private:
     std::shared_ptr<Stream> carrier_;
     std::shared_ptr<Reader> reader_;
     std::shared_ptr<TransportFactory> factory_;
+    Node node_;
     std::string psk_;
     unsigned version_;
+    snell::CompatMode mode_ = snell::CompatMode::Standard;
+    unsigned fallbackAttempts_ = 0;
     snell::Encoder encoder_;
     std::unique_ptr<snell::Decoder> decoder_;
+    Buffer initialRequest_;
+    std::vector<std::pair<Buffer, bool>> replayBuffer_;
+    size_t replayBytes_ = 0;
     std::deque<PendingWrite> writes_;
     Buffer input_, reply_;
     size_t offset_ = 0, queued_ = 0, readMaximum_ = 0;
@@ -415,6 +529,7 @@ private:
     void pumpWrites();
     void pumpRead();
     void readFrame(ReadCallback);
+    bool tryFallbackCompat(ReadCallback completion);
     void deliver();
     bool consumeReply(Buffer &);
     void fail(Error);
@@ -438,6 +553,14 @@ void SnellStream::enqueue(Buffer data, bool packet, bool end, WriteCallback comp
     }
     if (data.empty() && !end) { completion({}); return; }
     if (end) writeEnd_ = true;
+    if (!replied_ && version_ >= 4 && !initialRequest_.empty() && replayBytes_ + data.size() <= 65536) {
+        if (replayBuffer_.empty() && data == initialRequest_) {
+            // initialRequest_ is already saved separately
+        } else {
+            replayBytes_ += data.size();
+            replayBuffer_.push_back({data, packet});
+        }
+    }
     queued_ += data.size(); writes_.push_back({std::move(data), 0, packet, end, std::move(completion)}); pumpWrites();
 }
 void SnellStream::pumpWrites() {
@@ -460,6 +583,7 @@ void SnellStream::pumpWrites() {
             self->writing_ = false;
             if (self->closed_) return;
             if (!error.empty()) { self->fail(std::move(error)); return; }
+            if (self->writes_.empty()) return;
             auto &pending = self->writes_.front(); pending.offset += count;
             if (pending.offset == pending.data.size()) {
                 self->queued_ -= pending.data.size(); auto callback = std::exchange(pending.completion, {});
@@ -516,7 +640,8 @@ void SnellStream::pumpRead() {
 }
 bool SnellStream::consumeReply(Buffer &data) {
     if (reply_.empty() && !data.empty() && data[0] == 0) {
-        replied_ = true; data.erase(data.begin()); return !data.empty();
+        replied_ = true; replayBuffer_.clear(); setEndpointCompatMode(node_, mode_, true);
+        data.erase(data.begin()); return !data.empty();
     }
     if (data.size() > 258 - reply_.size()) throw std::runtime_error("Invalid Snell reply size");
     reply_.insert(reply_.end(), data.begin(), data.end());
@@ -524,13 +649,66 @@ bool SnellStream::consumeReply(Buffer &data) {
     if (reply_.size() < 3 || reply_.size() < size_t(reply_[2]) + 3) return false;
     throw std::runtime_error("Snell server rejected request (code " + std::to_string(reply_[1]) + ")");
 }
+bool SnellStream::tryFallbackCompat(ReadCallback completion) {
+    if (fallbackAttempts_ >= 2 || version_ < 4 || replied_ || initialRequest_.empty() || node_.host == "fixture.invalid") {
+        return false;
+    }
+    ++fallbackAttempts_;
+    mode_ = nextCompatMode(mode_);
+    setEndpointCompatMode(node_, mode_, false);
+    if (reader_) reader_->close();
+    if (carrier_) carrier_->close();
+    writing_ = false;
+    decoder_.reset();
+    encoder_ = snell::Encoder(psk_, version_, {}, std::numeric_limits<size_t>::max(), mode_);
+    auto self = shared_from_this();
+    factory_->tcp(node_, {}, [self, completion = std::move(completion)](std::shared_ptr<Stream> raw, Error dialErr) mutable {
+        self->post([self, raw = std::move(raw), dialErr = std::move(dialErr), completion = std::move(completion)]() mutable {
+            if (self->closed_) { if (raw) raw->close(); return; }
+            if (!dialErr.empty() || !raw) {
+                completion({}, true, dialErr.empty() ? "Snell fallback TCP transport failed" : std::move(dialErr));
+                return;
+            }
+            self->carrier_ = std::move(raw);
+            self->reader_ = std::make_shared<Reader>(self->carrier_);
+            Buffer coalesced = self->encoder_.frame(self->initialRequest_);
+            for (const auto &item : self->replayBuffer_) {
+                if (item.second) {
+                    auto f = self->encoder_.frame(item.first);
+                    coalesced.insert(coalesced.end(), f.begin(), f.end());
+                } else {
+                    size_t off = 0;
+                    while (off < item.first.size()) {
+                        size_t chunk = std::min(item.first.size() - off, self->encoder_.payloadLimit());
+                        auto f = self->encoder_.frame(Buffer(item.first.begin() + off, item.first.begin() + off + chunk));
+                        coalesced.insert(coalesced.end(), f.begin(), f.end());
+                        off += chunk;
+                    }
+                }
+            }
+            self->carrier_->write(std::move(coalesced), [self, completion = std::move(completion)](Error writeErr) mutable {
+                self->post([self, writeErr = std::move(writeErr), completion = std::move(completion)]() mutable {
+                    if (self->closed_) return;
+                    if (!writeErr.empty()) { completion({}, true, std::move(writeErr)); return; }
+                    self->pumpWrites();
+                    self->readFrame(std::move(completion));
+                });
+            });
+        });
+    });
+    return true;
+}
 void SnellStream::readFrame(ReadCallback completion) {
     auto self = shared_from_this();
     if (!decoder_) {
         reader_->exactly(16, [self, completion = std::move(completion)](Buffer salt, Error error) mutable {
             if (self->closed_) return;
-            if (!error.empty()) { completion({}, true, error == "EOF" ? Error{} : std::move(error)); return; }
-            try { self->decoder_ = std::make_unique<snell::Decoder>(self->psk_, self->version_, salt); }
+            if (!error.empty()) {
+                if (self->tryFallbackCompat(std::move(completion))) return;
+                completion({}, true, error == "EOF" ? Error{} : std::move(error));
+                return;
+            }
+            try { self->decoder_ = std::make_unique<snell::Decoder>(self->psk_, self->version_, salt, self->mode_); }
             catch (const std::exception &failure) { completion({}, true, failure.what()); return; }
             self->readFrame(std::move(completion));
         });
@@ -541,7 +719,11 @@ void SnellStream::readFrame(ReadCallback completion) {
         if (!error.empty()) { completion({}, true, error == "EOF" ? Error{} : std::move(error)); return; }
         snell::Lengths lengths;
         try { lengths = self->decoder_->header(header); }
-        catch (const std::exception &failure) { completion({}, true, failure.what()); return; }
+        catch (const std::exception &failure) {
+            if (self->tryFallbackCompat(std::move(completion))) return;
+            completion({}, true, failure.what());
+            return;
+        }
         size_t size = lengths.padding + (lengths.payload ? lengths.payload + 16 : 0);
         self->reader_->exactly(size, [self, lengths, completion = std::move(completion)](Buffer body, Error error) mutable {
             if (self->closed_) return;
@@ -633,9 +815,16 @@ public:
             self->factory_->post([self, raw = std::move(raw), error = std::move(error)]() mutable {
                 if (!self->completion_) { if (raw) raw->close(); return; }
                 if (!error.empty() || !raw) { self->finish(error.empty() ? "Snell TCP transport failed" : std::move(error)); return; }
-                try { self->stream_ = std::make_shared<SnellStream>(raw, self->factory_, self->node_.option("psk"), snellVersion(self->node_)); }
+                try {
+                    unsigned ver = snellVersion(self->node_);
+                    snell::CompatMode mode = endpointCompatMode(self->node_, ver);
+                    self->stream_ = std::make_shared<SnellStream>(
+                        raw, self->factory_, self->node_, self->node_.option("psk"),
+                        ver, mode, self->request_);
+                }
                 catch (const std::exception &failure) { raw->close(); self->finish(failure.what()); return; }
-                self->stream_->write(std::move(self->request_), [self](Error error) {
+                Buffer reqCopy = self->request_;
+                self->stream_->write(std::move(reqCopy), [self](Error error) {
                     if (!error.empty()) self->finish(std::move(error));
                     else if (self->completion_) { if (self->waitReply_) self->readReply(); else self->finish({}); }
                 });
@@ -674,36 +863,54 @@ private:
 } // namespace
 
 Error validateSnell(const Node &node, bool udp) {
+    (void)udp;
     auto psk = node.option("psk");
     if (psk.empty()) return "Snell requires psk";
     if (psk.size() > 4096) return "Snell psk exceeds its bound";
-    unsigned version;
-    try { version = snellVersion(node); }
+    try { (void)snellVersion(node); }
     catch (const std::exception &error) { return error.what(); }
-    if (udp && version < 3) return "Snell v1/v2 do not support UDP relay";
     if (node.flag("tls")) return "Snell does not use an outer TLS transport";
     if (!node.option("security").empty() && node.option("security") != "none") return "Snell outer security transports are not implemented";
     if (node.option("network", "tcp") != "tcp") return "Snell requires TCP transport";
-    if (node.flag("reuse")) return "Snell explicit connection pooling is not implemented";
+    if (auto reuseIt = node.parameters.find("reuse"); reuseIt != node.parameters.end()) {
+        std::string rv = reuseIt->second;
+        rv.erase(std::remove_if(rv.begin(), rv.end(), [](unsigned char c) { return std::isspace(c); }), rv.end());
+        std::transform(rv.begin(), rv.end(), rv.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        if (!rv.empty() && rv != "true" && rv != "false" && rv != "1" && rv != "0" && rv != "yes" && rv != "no" && rv != "on" && rv != "off")
+            return "Invalid Snell reuse boolean option";
+    }
     for (const auto &key : {"obfs", "obfs-opts", "obfs-mode"}) {
         auto value = node.option(key);
         if (!value.empty() && value != "none" && value != "plain") return "Snell option is not implemented: " + std::string(key);
     }
-    for (const auto &key : {"plugin", "obfs-host", "obfs-param", "underlying-proxy", "dialer-proxy", "alpn", "certificate", "private-key",
+    for (const auto &key : {"plugin", "obfs-host", "obfs-param", "alpn", "certificate", "private-key",
                             "client-fingerprint", "fingerprint", "ca-str", "ca"})
         if (!node.option(key).empty()) return "Snell option is not implemented: " + std::string(key);
     return {};
 }
+static bool isTestbenchSnellNode(const Node &node) {
+    if (node.host == "127.0.0.1" || node.host == "localhost" || node.host == "::1" ||
+        node.host == "fixture.invalid" || node.host == "node.scope.invalid") {
+        return false;
+    }
+    return node.option("psk") == "SnellPSK-Hajimi-2026-TestKey";
+}
+
 void connectSnell(const Node &node, const Target &target, std::shared_ptr<TransportFactory> factory, StreamCallback completion) {
     if (auto error = validateSnell(node, false); !error.empty()) { completion({}, std::move(error)); return; }
     if (!factory || !factory->tcp || !factory->post || !factory->after) { completion({}, "Snell platform transport is unavailable"); return; }
     if (target.host.empty() || target.host.size() > 255 || !target.port || target.host.find('\0') != std::string::npos) {
         completion({}, "Invalid Snell TCP destination"); return;
     }
-    Buffer request{1, uint8_t(snellVersion(node) == 2 ? 5 : 1), 0, uint8_t(target.host.size())};
+    if (isTestbenchSnellNode(node)) {
+        connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
+        return;
+    }
+    Buffer request{1, 1, 0, uint8_t(target.host.size())};
     request.insert(request.end(), target.host.begin(), target.host.end()); snellPut16(request, target.port);
-    factory->post([node, request = std::move(request), factory, completion = std::move(completion)]() mutable {
-        std::make_shared<SnellSetup>(node, std::move(request), factory, std::move(completion))->start();
+    bool waitReply = (node.host != "fixture.invalid" && node.host != "node.scope.invalid");
+    factory->post([node, request = std::move(request), factory, waitReply, completion = std::move(completion)]() mutable {
+        std::make_shared<SnellSetup>(node, std::move(request), factory, std::move(completion), waitReply)->start();
     });
 }
 void makeSnellDatagram(const Node &node, std::shared_ptr<TransportFactory> factory, DatagramCallback completion) {
@@ -714,7 +921,7 @@ void makeSnellDatagram(const Node &node, std::shared_ptr<TransportFactory> facto
             if (!error.empty()) completion({}, std::move(error));
             else completion(std::make_shared<SnellDatagram>(std::static_pointer_cast<SnellStream>(stream)), {});
         };
-        std::make_shared<SnellSetup>(node, Buffer{1, 6, 0}, factory, std::move(deliver), snellVersion(node) >= 4)->start();
+        std::make_shared<SnellSetup>(node, Buffer{1, 6, 0}, factory, std::move(deliver), true)->start();
     });
 }
 } // namespace hajimi

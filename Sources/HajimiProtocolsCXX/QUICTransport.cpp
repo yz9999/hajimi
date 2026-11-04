@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -106,7 +107,40 @@ struct Connection::Impl {
     std::atomic<size_t> stagedWrites{0}, stagedPackets{0}; bool jobsClosed = false;
     std::shared_ptr<ReceiveMailbox> received = std::make_shared<ReceiveMailbox>();
     int socket = -1, wake[2]{-1, -1};
+    std::shared_ptr<Datagram> chainedDatagram;
+    std::deque<Buffer> chainedInbound;
+    uint16_t activePort = 0;
     sockaddr_storage local{}, remote{}; socklen_t localLength = 0, remoteLength = 0;
+    uint16_t selectTargetPort() const {
+        auto raw = node.option("ports", node.option("port-range"));
+        if (raw.empty()) return node.port;
+        std::vector<std::pair<uint16_t, uint16_t>> ranges;
+        size_t pos = 0;
+        while (pos <= raw.size()) {
+            auto comma = raw.find(',', pos);
+            if (comma == std::string::npos) comma = raw.size();
+            auto token = raw.substr(pos, comma - pos);
+            pos = comma + 1;
+            auto dash = token.find('-');
+            try {
+                if (dash == std::string::npos) {
+                    int p = std::stoi(token);
+                    if (p >= 1 && p <= 65535) ranges.push_back({uint16_t(p), uint16_t(p)});
+                } else {
+                    int a = std::stoi(token.substr(0, dash));
+                    int b = std::stoi(token.substr(dash + 1));
+                    if (a >= 1 && b >= a && b <= 65535) ranges.push_back({uint16_t(a), uint16_t(b)});
+                }
+            } catch (...) {}
+        }
+        if (ranges.empty()) return node.port;
+        uint8_t r[4]{};
+        (void)RAND_bytes(r, sizeof(r));
+        const auto &picked = ranges[r[0] % ranges.size()];
+        uint16_t span = uint16_t(picked.second - picked.first + 1);
+        uint16_t offset = span > 1 ? uint16_t(((uint16_t(r[1]) << 8) | r[2]) % span) : 0;
+        return uint16_t(picked.first + offset);
+    }
     ngtcp2_conn *conn = nullptr; SSL_CTX *tlsContext = nullptr; SSL *tls = nullptr;
     ngtcp2_crypto_ossl_ctx *cryptoContext = nullptr; ngtcp2_crypto_conn_ref reference{};
     std::unordered_map<int64_t, State> streams;
@@ -204,6 +238,7 @@ Connection::Impl::~Impl() {
     if (cryptoContext) ngtcp2_crypto_ossl_ctx_del(cryptoContext);
     if (conn) ngtcp2_conn_del(conn);
     if (tlsContext) SSL_CTX_free(tlsContext);
+    if (chainedDatagram) { chainedDatagram->close(); chainedDatagram.reset(); }
     if (socket >= 0) ::close(socket);
     for (auto fd : wake) if (fd >= 0) ::close(fd);
 }
@@ -265,12 +300,56 @@ void Connection::Impl::post(std::function<void()> callback) {
 
 Error Connection::Impl::setupSocket() {
     if (cancelled()) return "QUIC connection cancelled";
+    activePort = selectTargetPort();
+    if (!node.option("underlying-proxy", node.option("dialer-proxy")).empty() && factory && factory->udp) {
+        sockaddr_in loc4{}, rem4{};
+        loc4.sin_family = AF_INET; loc4.sin_port = htons(10000); loc4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        rem4.sin_family = AF_INET; rem4.sin_port = htons(activePort ? activePort : 443); rem4.sin_addr.s_addr = htonl(0x7f000002);
+        localLength = sizeof(loc4); remoteLength = sizeof(rem4);
+        std::memcpy(&local, &loc4, localLength); std::memcpy(&remote, &rem4, remoteLength);
+        std::mutex waitLock; std::condition_variable waitCV; bool done = false;
+        std::shared_ptr<Datagram> dgram; Error dialErr;
+        factory->udp(node, [&](std::shared_ptr<Datagram> d, Error e) {
+            std::lock_guard<std::mutex> g(waitLock);
+            dgram = std::move(d); dialErr = std::move(e); done = true; waitCV.notify_one();
+        });
+        {
+            std::unique_lock<std::mutex> u(waitLock);
+            waitCV.wait_for(u, std::chrono::seconds(10), [&] { return done || cancelled(); });
+        }
+        if (cancelled()) { if (dgram) dgram->close(); return "QUIC connection cancelled"; }
+        if (!done || !dialErr.empty() || !dgram) {
+            return dialErr.empty() ? Error("QUIC underlying-proxy UDP relay unavailable") : dialErr;
+        }
+        chainedDatagram = dgram;
+        std::weak_ptr<Connection> weakOwner = owner;
+        chainedDatagram->start(
+            [weakOwner](Target, Buffer pkt) {
+                auto connOwner = weakOwner.lock();
+                if (!connOwner || connOwner->isClosed()) return;
+                auto *impl = connOwner->impl_.get();
+                {
+                    std::lock_guard<std::mutex> g(impl->mutex);
+                    if (impl->chainedInbound.size() < 512) impl->chainedInbound.push_back(std::move(pkt));
+                }
+                if (impl->wake[1] >= 0) { uint8_t v = 1; (void)::write(impl->wake[1], &v, 1); }
+            },
+            [weakOwner](Error e) {
+                auto connOwner = weakOwner.lock();
+                if (!connOwner) return;
+                connOwner->impl_->post([weakOwner, e] {
+                    if (auto c = weakOwner.lock()) c->impl_->fail(e.empty() ? "QUIC underlying UDP relay closed" : e);
+                });
+            }
+        );
+        return {};
+    }
     addrinfo hints{}, *addresses = nullptr;
     hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_DGRAM;
     // AI_NUMERICHOST is essential: this call only converts a pinned address,
     // never performs an implicit system/plaintext DNS bootstrap for QUIC.
     hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
-    int resolved = getaddrinfo(node.dialHost().c_str(), std::to_string(node.port).c_str(), &hints, &addresses);
+    int resolved = getaddrinfo(node.dialHost().c_str(), std::to_string(activePort ? activePort : node.port).c_str(), &hints, &addresses);
     if (cancelled()) {
         if (addresses) freeaddrinfo(addresses);
         return "QUIC connection cancelled";
@@ -371,7 +450,14 @@ Error Connection::Impl::setupTLS() {
             if (!X509_VERIFY_PARAM_set1_ip_asc(params, name.c_str())) return "QUIC IP verification setup failed";
         } else if (!SSL_set1_host(tls, name.c_str())) return "QUIC hostname verification setup failed";
     }
-    if (options.alpn.empty()) options.alpn.push_back(node.type == "hysteria" ? "hysteria" : "h3");
+    if (options.alpn.empty()) {
+        if (node.type == "hysteria") {
+            options.alpn.push_back("hysteria");
+            options.alpn.push_back("h3");
+        } else {
+            options.alpn.push_back("h3");
+        }
+    }
     Buffer alpn;
     for (const auto &value : options.alpn) {
         if (value.empty() || value.size() > 255) return "QUIC ALPN value is invalid";
@@ -749,6 +835,31 @@ Buffer Connection::Impl::obfuscate(const uint8_t *data, size_t size, bool outbou
 }
 
 Error Connection::Impl::readPackets() {
+    if (chainedDatagram) {
+        for (size_t iteration = 0; iteration < 64; ++iteration) {
+            if (cancelled()) return "QUIC connection cancelled";
+            Buffer raw;
+            {
+                std::lock_guard<std::mutex> g(mutex);
+                if (chainedInbound.empty()) break;
+                raw = std::move(chainedInbound.front());
+                chainedInbound.pop_front();
+            }
+            auto data = obfuscate(raw.data(), raw.size(), false);
+            if (data.empty()) continue;
+            ngtcp2_path path{{reinterpret_cast<sockaddr *>(&local), localLength},
+                             {reinterpret_cast<sockaddr *>(&remote), remoteLength}, nullptr};
+            ngtcp2_pkt_info info{};
+            int code = ngtcp2_conn_read_pkt(conn, &path, &info, data.data(), data.size(), now());
+            if (code == NGTCP2_ERR_DISCARD_PKT) continue;
+            if (code) {
+                if (!terminal.empty()) return terminal;
+                if (SSL_get_verify_result(tls) != X509_V_OK) return "QUIC TLS certificate verification failed";
+                return code == NGTCP2_ERR_DRAINING ? "QUIC peer closed connection" : "QUIC packet/TLS processing failed";
+            }
+        }
+        return {};
+    }
     uint8_t input[65536];
     for (size_t iteration = 0; iteration < 64; ++iteration) {
         if (cancelled()) return "QUIC connection cancelled";
@@ -780,6 +891,13 @@ Error Connection::Impl::writePackets() {
     auto sendWire = [&]() -> int {
         if (cancelled()) return -1;
         if (pendingWire.empty()) return 1;
+        if (chainedDatagram) {
+            Target dst{node.dialHost(), activePort ? activePort : node.port, true, false};
+            Buffer pkt = std::move(pendingWire);
+            pendingWire.clear();
+            chainedDatagram->send(std::move(dst), std::move(pkt), [](Error) {});
+            return 1;
+        }
         auto length = ::send(socket, pendingWire.data(), pendingWire.size(), 0);
         if (length == static_cast<ssize_t>(pendingWire.size())) {
             consecutiveSendLosses_ = 0;
@@ -930,13 +1048,13 @@ void Connection::Impl::run() {
             error = writePackets(); if (!error.empty()) { fail(error); break; }
             auto expiry = ngtcp2_conn_get_expiry(conn);
             auto wait = expiry > now() ? (expiry - now()) / NGTCP2_MILLISECONDS : 0;
-            pollfd descriptors[2]{{socket, static_cast<short>(POLLIN | (pendingWire.empty() ? 0 : POLLOUT)), 0},
+            pollfd descriptors[2]{{socket, static_cast<short>(socket >= 0 ? (POLLIN | (pendingWire.empty() ? 0 : POLLOUT)) : 0), 0},
                                   {wake[0], POLLIN, 0}};
             int result = ::poll(descriptors, 2, static_cast<int>(std::min<uint64_t>(wait + 1, 100)));
             if (result < 0 && errno != EINTR) { fail("QUIC event polling failed"); break; }
             if (cancelled()) { fail("QUIC connection cancelled"); break; }
             if (descriptors[1].revents & POLLIN) { uint8_t values[256]; while (::read(wake[0], values, sizeof(values)) > 0) {} }
-            if (descriptors[0].revents & (POLLIN | POLLERR)) {
+            if (chainedDatagram || (socket >= 0 && (descriptors[0].revents & (POLLIN | POLLERR)))) {
                 error = readPackets(); if (!error.empty()) { fail(error); break; }
             }
         }

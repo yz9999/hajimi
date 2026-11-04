@@ -1461,7 +1461,10 @@ public final class NativePacketRouter {
                 return DNSResolverLeaseDatagram(transport: DoHRoutedDatagram(resolver: lease.owner,
                     receive: receive, failure: failure), owner: lease)
             }
-            let resolver = DoHResolver(endpoint: endpoint, metadataStreamDialer: dialer)
+            let poolTuning = DNSProtocolRouterAdapter.encryptedDNSPoolTuning(for: plan.route)
+            let resolver = DoHResolver(endpoint: endpoint, metadataStreamDialer: dialer,
+                                       idleTimeout: poolTuning.idleTimeout,
+                                       idleHandoffGrace: poolTuning.idleHandoffGrace)
             let insertion = dohResolvers.insert(resolver, for: key, cost: key.utf8.count + 1_024)
             dohLock.unlock(); configurationLock.unlock()
             guard let insertion else { resolver.cancel(); throw EncryptedDNSQueryFailure.capacity }
@@ -1480,7 +1483,10 @@ public final class NativePacketRouter {
                 return DNSResolverLeaseDatagram(transport: DoTRoutedDatagram(resolver: lease.owner,
                     receive: receive, failure: failure), owner: lease)
             }
-            let resolver = DoTResolver(endpoint: endpoint, metadataStreamDialer: dialer)
+            let poolTuning = DNSProtocolRouterAdapter.encryptedDNSPoolTuning(for: plan.route)
+            let resolver = DoTResolver(endpoint: endpoint, metadataStreamDialer: dialer,
+                                       idleTimeout: poolTuning.idleTimeout,
+                                       idleHandoffGrace: poolTuning.idleHandoffGrace)
             let insertion = dotResolvers.insert(resolver, for: key, cost: key.utf8.count + 1_024)
             dohLock.unlock(); configurationLock.unlock()
             guard let insertion else { resolver.cancel(); throw EncryptedDNSQueryFailure.capacity }
@@ -1747,7 +1753,10 @@ public final class NativePacketRouter {
         if let existing = proxyTCPDNSResolvers.acquire(key) {
             lease = existing; dohLock.unlock(); configurationLock.unlock()
         } else {
-            let resolver = ProxyTCPDNSResolver(server: server, metadataStreamDialer: dialer)
+            let poolTuning = DNSProtocolRouterAdapter.encryptedDNSPoolTuning(for: chosen.route)
+            let resolver = ProxyTCPDNSResolver(server: server, metadataStreamDialer: dialer,
+                                               idleTimeout: poolTuning.idleTimeout,
+                                               idleHandoffGrace: poolTuning.idleHandoffGrace)
             let insertion = proxyTCPDNSResolvers.insert(resolver, for: key, cost: key.utf8.count + 1_024)
             dohLock.unlock(); configurationLock.unlock()
             guard let insertion else { resolver.cancel(); throw EncryptedDNSQueryFailure.capacity }
@@ -2129,7 +2138,8 @@ private final class PolicyDNSDatagram: NativeRoutedDatagram {
                         receive: { [weak self] answer in self?.finishOnQueue(id, answer: answer) },
                         failure: { [weak self] _ in self?.finishOnQueue(id, answer: nil) })
                     self.transactions[id]?.transport = transport
-                    transport.send(data)
+                    let adaptedQuery = DNSProtocolRouterAdapter.adaptOutboundDNSQuery(data, for: plan.route)
+                    transport.send(adaptedQuery)
                 } catch { self.finish(id, answer: nil) }
             }
         }
