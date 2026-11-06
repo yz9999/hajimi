@@ -227,6 +227,15 @@ public:
     void requestPump();
     void post(std::function<void()> work) { factory_->post(std::move(work)); }
     void forceClose(Error reason) { failSession(std::move(reason)); }
+    bool ownedBy(const std::shared_ptr<TransportFactory> &factory) const { return !factory || factory_ == factory; }
+    void reset() {
+        if (factory_ && factory_->post) {
+            auto self = shared_from_this();
+            factory_->post([self] { self->failSession("SSH session pool reset"); });
+        } else {
+            failSession("SSH session pool reset");
+        }
+    }
 
     LIBSSH2_SESSION *nativeSession() const { return session_; }
     size_t outgoingBytes() const { return outgoingBytes_; }
@@ -803,18 +812,32 @@ public:
         return created;
     }
 
-    void resetAll() {
+    void resetForFactory(const std::shared_ptr<TransportFactory> &factory) {
         std::vector<std::shared_ptr<SSHConnectionSession>> active;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            for (auto &kv : pool_) {
-                for (auto &w : kv.second) {
-                    if (auto s = w.lock()) active.push_back(std::move(s));
+            for (auto poolIt = pool_.begin(); poolIt != pool_.end();) {
+                auto &bucket = poolIt->second;
+                for (auto it = bucket.begin(); it != bucket.end();) {
+                    auto session = it->lock();
+                    if (!session || session->isClosed()) {
+                        it = bucket.erase(it);
+                    } else if (session->ownedBy(factory)) {
+                        active.push_back(std::move(session));
+                        it = bucket.erase(it);
+                    } else {
+                        ++it;
+                    }
                 }
+                if (bucket.empty()) poolIt = pool_.erase(poolIt);
+                else ++poolIt;
             }
-            pool_.clear();
         }
-        for (auto &s : active) s->forceClose("SSH session pool reset");
+        for (auto &s : active) s->reset();
+    }
+
+    void resetAll() {
+        resetForFactory(nullptr);
     }
 };
 
@@ -826,6 +849,10 @@ SSHSessionPool &globalSSHSessionPool() {
 
 void resetSSHClients() {
     globalSSHSessionPool().resetAll();
+}
+
+void resetSSHClient(const std::shared_ptr<TransportFactory> &factory) {
+    globalSSHSessionPool().resetForFactory(factory);
 }
 
 Error validateSSH(const Node &node, bool udp) {
