@@ -637,6 +637,7 @@ public enum ClashSubscription {
         case "ssr", "shadowsocksr":
             copy("cipher"); copy("password"); copy("protocol"); copy("obfs")
             copy("protocol-param"); copy("obfs-param")
+            copyBool("udp"); copyBool("udp-relay")
         case "vmess":
             copy("uuid"); copy("alterId", to: "alter-id"); copy("cipher")
             copyBool("tls"); copy("servername")
@@ -717,16 +718,29 @@ public enum ClashSubscription {
             copy("username")
             if parameters["username"] == nil { copy("user", to: "username") }
             copy("password"); copy("private-key"); copy("private-key-passphrase")
-            copy("host-key")
-            if parameters["host-key"] == nil, let hkArray = entry["host-key"]?.array, !hkArray.isEmpty {
-                let items = hkArray.compactMap(\.string).filter { !$0.isEmpty }
+            if let hkArray = entry["host-key"]?.array, !hkArray.isEmpty {
+                let items = hkArray.compactMap { item -> String? in
+                    if case .scalar(let s) = item {
+                        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                        return t.isEmpty ? nil : t
+                    }
+                    return item.string
+                }.filter { !$0.isEmpty }
                 if !items.isEmpty { parameters["host-key"] = items.joined(separator: "|") }
+            } else {
+                copy("host-key")
             }
-            copy("host-key-algorithms")
-            if parameters["host-key-algorithms"] == nil,
-               let algArray = entry["host-key-algorithms"]?.array, !algArray.isEmpty {
-                let items = algArray.compactMap(\.string).filter { !$0.isEmpty }
+            if let algArray = entry["host-key-algorithms"]?.array, !algArray.isEmpty {
+                let items = algArray.compactMap { item -> String? in
+                    if case .scalar(let s) = item {
+                        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                        return t.isEmpty ? nil : t
+                    }
+                    return item.string
+                }.filter { !$0.isEmpty }
                 if !items.isEmpty { parameters["host-key-algorithms"] = items.joined(separator: ",") }
+            } else {
+                copy("host-key-algorithms")
             }
             copyBool("skip-cert-verify")
             if parameters["host-key"] == nil && parameters["skip-cert-verify"] == nil {

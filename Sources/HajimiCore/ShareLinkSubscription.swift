@@ -479,7 +479,7 @@ public enum ShareLinkSubscription {
         let fields = main.components(separatedBy: ":")
         guard fields.count >= 6 else { return .failure("SSR 链接字段不足") }
         let count = fields.count
-        let host = fields[0..<(count - 5)].joined(separator: ":")
+        let host = fields[0..<(count - 5)].joined(separator: ":").trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
         guard let port = UInt16(fields[count - 5]), !host.isEmpty else {
             return .failure("SSR 链接的地址或端口无效")
         }

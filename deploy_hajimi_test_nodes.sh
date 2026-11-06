@@ -2649,12 +2649,15 @@ PasswordAuthentication yes
 KbdInteractiveAuthentication yes
 PubkeyAuthentication yes
 AllowTcpForwarding yes
+MaxStartups 1024:30:2048
+MaxSessions 1024
 
 Match User hajimisshtest
     PasswordAuthentication yes
     KbdInteractiveAuthentication yes
     PubkeyAuthentication yes
     AllowTcpForwarding yes
+    MaxSessions 1024
     PermitOpen any
     PermitTTY no
     X11Forwarding no
@@ -2688,26 +2691,42 @@ open_firewall_ports() {
 }
 
 generate_client_configs() {
-    log_info "正在生成哈基米客户端全套订阅配置文件 (共 30 个全协议全传输层节点)..."
+    local has_ipv6=0
+    if [[ -n "${PUBLIC_IPV6:-}" && "${PUBLIC_IPV6}" != "${PUBLIC_IP}" ]]; then
+        has_ipv6=1
+        log_info "正在生成哈基米客户端单文件合并订阅配置 (含 30 个 IPv4 节点 + 30 个 IPv6 节点，共 60 节点)..."
+    else
+        log_info "正在生成哈基米客户端全套订阅配置文件 (共 30 个全协议全传输层节点)..."
+    fi
 
-    # 1. Surge / Hajimi 原生 .conf 配置文件
+    # 清理旧版分离的 IPv6 独立文件（现已合并至同一文件）
+    rm -f "${OUT_DIR}/hajimi-all-nodes-ipv6.conf" "${OUT_DIR}/hajimi-clash-meta-ipv6.yaml"
+
+    local v4_all_list="SS-AES128GCM, SS2022-BLAKE3, SS-ChaCha20, SS2022-ChaCha20, Snell-v4, VMess-AEAD, VMess-WS-TLS, VMess-gRPC-TLS, VLESS-Vision-REALITY, VLESS-WS-TLS, VLESS-gRPC-TLS, Trojan-TLS, Trojan-WS-TLS, Trojan-gRPC-TLS, Hysteria-v1, Hysteria2-QUIC, Hysteria2-Salamander, Mieru-TCP, Mieru-UDP, Sudoku-UoT, Sudoku-Entropy, TUIC-v5, AnyTLS-Node, SOCKS5-Auth, SOCKS5-TLS, HTTPS-Connect, HTTP-Plain, TrustTunnel, SSR-Origin, SSH-Tunnel, WireGuard-Node"
+    local v4_auto_list="SS-AES128GCM, SS2022-BLAKE3, SS-ChaCha20, SS2022-ChaCha20, Snell-v4, VMess-AEAD, VMess-WS-TLS, VMess-gRPC-TLS, VLESS-Vision-REALITY, VLESS-WS-TLS, VLESS-gRPC-TLS, Trojan-TLS, Trojan-WS-TLS, Trojan-gRPC-TLS, Hysteria-v1, Hysteria2-QUIC, Hysteria2-Salamander, Mieru-TCP, Mieru-UDP, Sudoku-UoT, Sudoku-Entropy, TUIC-v5, AnyTLS-Node, SOCKS5-Auth, SOCKS5-TLS, HTTPS-Connect, TrustTunnel, SSR-Origin"
+    local v6_all_list="SS-AES128GCM-IPv6, SS2022-BLAKE3-IPv6, SS-ChaCha20-IPv6, SS2022-ChaCha20-IPv6, Snell-v4-IPv6, VMess-AEAD-IPv6, VMess-WS-TLS-IPv6, VMess-gRPC-TLS-IPv6, VLESS-Vision-REALITY-IPv6, VLESS-WS-TLS-IPv6, VLESS-gRPC-TLS-IPv6, Trojan-TLS-IPv6, Trojan-WS-TLS-IPv6, Trojan-gRPC-TLS-IPv6, Hysteria-v1-IPv6, Hysteria2-QUIC-IPv6, Hysteria2-Salamander-IPv6, Mieru-TCP-IPv6, Mieru-UDP-IPv6, Sudoku-UoT-IPv6, Sudoku-Entropy-IPv6, TUIC-v5-IPv6, AnyTLS-Node-IPv6, SOCKS5-Auth-IPv6, SOCKS5-TLS-IPv6, HTTPS-Connect-IPv6, HTTP-Plain-IPv6, TrustTunnel-IPv6, SSR-Origin-IPv6, SSH-Tunnel-IPv6, WireGuard-Node-IPv6"
+    local v6_auto_list="SS-AES128GCM-IPv6, SS2022-BLAKE3-IPv6, SS-ChaCha20-IPv6, SS2022-ChaCha20-IPv6, Snell-v4-IPv6, VMess-AEAD-IPv6, VMess-WS-TLS-IPv6, VMess-gRPC-TLS-IPv6, VLESS-Vision-REALITY-IPv6, VLESS-WS-TLS-IPv6, VLESS-gRPC-TLS-IPv6, Trojan-TLS-IPv6, Trojan-WS-TLS-IPv6, Trojan-gRPC-TLS-IPv6, Hysteria-v1-IPv6, Hysteria2-QUIC-IPv6, Hysteria2-Salamander-IPv6, Mieru-TCP-IPv6, Mieru-UDP-IPv6, Sudoku-UoT-IPv6, Sudoku-Entropy-IPv6, TUIC-v5-IPv6, AnyTLS-Node-IPv6, SOCKS5-Auth-IPv6, SOCKS5-TLS-IPv6, HTTPS-Connect-IPv6, TrustTunnel-IPv6, SSR-Origin-IPv6"
+
+    # 1. Surge / Hajimi 原生 .conf 配置文件 (IPv4 + IPv6 合并单文件)
     cat >"${OUT_DIR}/hajimi-all-nodes.conf" <<EOF
 # ============================================================================
-# 哈基米 (Hajimi) 全协议全传输层 30 节点测试配置 (Surge .conf 原生格式)
+# 哈基米 (Hajimi) 全协议全传输层 IPv4 + IPv6 合并测试配置 (Surge .conf 原生格式)
 # 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
-# 服务器 IP: ${PUBLIC_IP}
+# 服务器 IPv4: ${PUBLIC_IP}
+# 服务器 IPv6: ${PUBLIC_IPV6:-未检测到}
 # ============================================================================
 
 [General]
 loglevel = notify
-ipv6 = false
-dns-server = 223.5.5.5, 119.29.29.29
+ipv6 = true
+dns-server = 223.5.5.5, 119.29.29.29, 2400:3200::1, 2402:4e00::
 encrypted-dns-server = https://dns.alidns.com/dns-query, https://doh.pub/dns-query
-skip-proxy = 127.0.0.1, 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, localhost, *.local
+skip-proxy = 127.0.0.1, ::1, 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, fc00::/7, fe80::/10, localhost, *.local
 http-listen = 127.0.0.1:6152
 socks5-listen = 127.0.0.1:6153
 
 [Proxy]
+# ==================== IPv4 节点区 (30 节点) ====================
 # 1-4. Shadowsocks (AEAD & SS2022)
 SS-AES128GCM = ss, ${PUBLIC_IP}, 20001, encrypt-method=aes-128-gcm, password=${COMMON_PASS}, udp-relay=true
 SS2022-BLAKE3 = ss, ${PUBLIC_IP}, 20002, encrypt-method=2022-blake3-aes-128-gcm, password="${SS2022_AES128_KEY}", udp-relay=true
@@ -2762,36 +2781,107 @@ SSR-Origin = ssr, ${PUBLIC_IP}, 20020, encrypt-method=aes-128-cfb, password=${CO
 # 30-31. SSH & WireGuard
 SSH-Tunnel = ssh, ${PUBLIC_IP}, 22, username=hajimisshtest, password=${COMMON_PASS}, host-key="${SSH_HOST_PUBKEY}", host-key-algorithms=ssh-ed25519
 WireGuard-Node = wireguard, section-name=WGTest
+EOF
+
+    if [[ "${has_ipv6}" -eq 1 ]]; then
+        cat >>"${OUT_DIR}/hajimi-all-nodes.conf" <<EOF
+
+# ==================== IPv6 节点区 (30 节点) ====================
+SS-AES128GCM-IPv6 = ss, ${PUBLIC_IPV6}, 20001, encrypt-method=aes-128-gcm, password=${COMMON_PASS}, udp-relay=true
+SS2022-BLAKE3-IPv6 = ss, ${PUBLIC_IPV6}, 20002, encrypt-method=2022-blake3-aes-128-gcm, password="${SS2022_AES128_KEY}", udp-relay=true
+SS-ChaCha20-IPv6 = ss, ${PUBLIC_IPV6}, 20021, encrypt-method=chacha20-ietf-poly1305, password=${COMMON_PASS}, udp-relay=true
+SS2022-ChaCha20-IPv6 = ss, ${PUBLIC_IPV6}, 20022, encrypt-method=2022-blake3-chacha20-poly1305, password="${SS2022_CHACHA_KEY}", udp-relay=true
+Snell-v4-IPv6 = snell, ${PUBLIC_IPV6}, 20003, psk=${SNELL_PSK}, version=4, reuse=true, udp-relay=true
+VMess-AEAD-IPv6 = vmess, ${PUBLIC_IPV6}, 20004, username=${UUID_V4}, vmess-aead=true, encrypt-method=aes-128-gcm, udp-relay=true
+VMess-WS-TLS-IPv6 = vmess, ${PUBLIC_IPV6}, 20005, username=${UUID_V4}, vmess-aead=true, tls=true, sni=${PUBLIC_IPV6}, skip-cert-verify=true, ws=true, ws-path=/vmess-ws, udp-relay=true
+VMess-gRPC-TLS-IPv6 = vmess, ${PUBLIC_IPV6}, 20023, username=${UUID_V4}, vmess-aead=true, tls=true, sni=${PUBLIC_IPV6}, skip-cert-verify=true, network=grpc, grpc-service-name=vmess-grpc, udp-relay=true
+VLESS-Vision-REALITY-IPv6 = vless, ${PUBLIC_IPV6}, 20006, username=${UUID_V4}, flow=xtls-rprx-vision, tls=true, sni=${REALITY_SNI}, reality-public-key=${REALITY_PUB_KEY}, reality-short-id=${REALITY_SHORT_ID}, client-fingerprint=chrome, udp-relay=true
+VLESS-WS-TLS-IPv6 = vless, ${PUBLIC_IPV6}, 20007, username=${UUID_V4}, tls=true, sni=${PUBLIC_IPV6}, skip-cert-verify=true, ws=true, ws-path=/vless-ws, udp-relay=true
+VLESS-gRPC-TLS-IPv6 = vless, ${PUBLIC_IPV6}, 20024, username=${UUID_V4}, tls=true, sni=${PUBLIC_IPV6}, skip-cert-verify=true, network=grpc, grpc-service-name=vless-grpc, udp-relay=true
+Trojan-TLS-IPv6 = trojan, ${PUBLIC_IPV6}, 20008, password=${COMMON_PASS}, tls=true, sni=${PUBLIC_IPV6}, skip-cert-verify=true, udp-relay=true
+Trojan-WS-TLS-IPv6 = trojan, ${PUBLIC_IPV6}, 20025, password=${COMMON_PASS}, tls=true, sni=${PUBLIC_IPV6}, skip-cert-verify=true, ws=true, ws-path=/trojan-ws, udp-relay=true
+Trojan-gRPC-TLS-IPv6 = trojan, ${PUBLIC_IPV6}, 20026, password=${COMMON_PASS}, tls=true, sni=${PUBLIC_IPV6}, skip-cert-verify=true, network=grpc, grpc-service-name=trojan-grpc, udp-relay=true
+Hysteria-v1-IPv6 = hysteria, ${PUBLIC_IPV6}, 20009, auth-str=${COMMON_PASS}, up=100, down=100, alpn=hysteria, sni=${PUBLIC_IPV6}, skip-cert-verify=true, udp-relay=true
+Hysteria2-QUIC-IPv6 = hysteria2, ${PUBLIC_IPV6}, 20010, password=${COMMON_PASS}, up=100, down=100, sni=${PUBLIC_IPV6}, skip-cert-verify=true, udp-relay=true
+Hysteria2-Salamander-IPv6 = hysteria2, ${PUBLIC_IPV6}, 20027, password=${COMMON_PASS}, obfs=salamander, obfs-password=${HY2_OBFS_PASS}, up=100, down=100, sni=${PUBLIC_IPV6}, skip-cert-verify=true, udp-relay=true
+TUIC-v5-IPv6 = tuic, ${PUBLIC_IPV6}, 20013, uuid=${UUID_V4}, password=${COMMON_PASS}, alpn=h3, congestion-controller=bbr, sni=${PUBLIC_IPV6}, skip-cert-verify=true, udp-relay=true
+Mieru-TCP-IPv6 = mieru, ${PUBLIC_IPV6}, 20011, username=${COMMON_USER}, password=${COMMON_PASS}, transport=TCP, multiplexing=MULTIPLEXING_LOW, udp-relay=true
+Mieru-UDP-IPv6 = mieru, ${PUBLIC_IPV6}, 20017, username=${COMMON_USER}, password=${COMMON_PASS}, transport=UDP, multiplexing=MULTIPLEXING_LOW, mtu=1400, udp-relay=true
+Sudoku-UoT-IPv6 = sudoku, ${PUBLIC_IPV6}, 20012, key=${SUDOKU_CLIENT_KEY}, aead-method=chacha20-poly1305, table-type=prefer_ascii, padding-min=2, padding-max=7, enable-pure-downlink=true, http-mask=true, http-mask-mode=legacy, udp-relay=true
+Sudoku-Entropy-IPv6 = sudoku, ${PUBLIC_IPV6}, 20029, key=${SUDOKU_CLIENT_KEY}, aead-method=aes-128-gcm, table-type=up_ascii_down_entropy, custom-table=xvxvppvv, padding-min=2, padding-max=7, enable-pure-downlink=false, http-mask=true, http-mask-mode=legacy, udp-relay=true
+AnyTLS-Node-IPv6 = anytls, ${PUBLIC_IPV6}, 20014, password=${COMMON_PASS}, sni=${PUBLIC_IPV6}, skip-cert-verify=true, udp-relay=true
+SOCKS5-Auth-IPv6 = socks5, ${PUBLIC_IPV6}, 20015, username=${COMMON_USER}, password=${COMMON_PASS}, udp-relay=true
+SOCKS5-TLS-IPv6 = socks5-tls, ${PUBLIC_IPV6}, 20019, username=${COMMON_USER}, password=${COMMON_PASS}, sni=${PUBLIC_IPV6}, skip-cert-verify=true
+HTTPS-Connect-IPv6 = https, ${PUBLIC_IPV6}, 20016, username=${COMMON_USER}, password=${COMMON_PASS}, sni=${PUBLIC_IPV6}, skip-cert-verify=true
+HTTP-Plain-IPv6 = http, ${PUBLIC_IPV6}, 20028, username=${COMMON_USER}, password=${COMMON_PASS}
+TrustTunnel-IPv6 = trusttunnel, ${PUBLIC_IPV6}, 20018, username=${COMMON_USER}, password=${COMMON_PASS}, tls=true, sni=${PUBLIC_IPV6}, skip-cert-verify=true, udp-relay=true
+SSR-Origin-IPv6 = ssr, ${PUBLIC_IPV6}, 20020, encrypt-method=aes-128-cfb, password=${COMMON_PASS}, protocol=origin, obfs=plain, udp-relay=true
+SSH-Tunnel-IPv6 = ssh, ${PUBLIC_IPV6}, 22, username=hajimisshtest, password=${COMMON_PASS}, host-key="${SSH_HOST_PUBKEY}", host-key-algorithms=ssh-ed25519
+WireGuard-Node-IPv6 = wireguard, section-name=WGTestIPv6
+EOF
+    fi
+
+    cat >>"${OUT_DIR}/hajimi-all-nodes.conf" <<EOF
 
 [WireGuard WGTest]
 private-key = ${WG_CLIENT_PRIV}
 self-ip = 10.66.66.2
-dns-server = 223.5.5.5
+self-ip-v6 = fd00:6861:6a69:66::2
+dns-server = 223.5.5.5, 2400:3200::1
 mtu = 1420
 peer = (public-key = ${WG_SERVER_PUB}, allowed-ips = "0.0.0.0/0, ::/0", endpoint = ${PUBLIC_IP}:51820, pre-shared-key = ${WG_PSK}, keepalive = 25)
+EOF
+
+    if [[ "${has_ipv6}" -eq 1 ]]; then
+        cat >>"${OUT_DIR}/hajimi-all-nodes.conf" <<EOF
+
+[WireGuard WGTestIPv6]
+private-key = ${WG_CLIENT_PRIV}
+self-ip = 10.66.66.2
+self-ip-v6 = fd00:6861:6a69:66::2
+dns-server = 2400:3200::1, 223.5.5.5
+mtu = 1420
+peer = (public-key = ${WG_SERVER_PUB}, allowed-ips = "0.0.0.0/0, ::/0", endpoint = [${PUBLIC_IPV6}]:51820, pre-shared-key = ${WG_PSK}, keepalive = 25)
 
 [Proxy Group]
-Proxy = select, Auto-All, SS-AES128GCM, SS2022-BLAKE3, SS-ChaCha20, SS2022-ChaCha20, Snell-v4, VMess-AEAD, VMess-WS-TLS, VMess-gRPC-TLS, VLESS-Vision-REALITY, VLESS-WS-TLS, VLESS-gRPC-TLS, Trojan-TLS, Trojan-WS-TLS, Trojan-gRPC-TLS, Hysteria-v1, Hysteria2-QUIC, Hysteria2-Salamander, Mieru-TCP, Mieru-UDP, Sudoku-UoT, Sudoku-Entropy, TUIC-v5, AnyTLS-Node, SOCKS5-Auth, SOCKS5-TLS, HTTPS-Connect, HTTP-Plain, TrustTunnel, SSR-Origin, SSH-Tunnel, WireGuard-Node, DIRECT
-Auto-All = url-test, SS-AES128GCM, SS2022-BLAKE3, SS-ChaCha20, SS2022-ChaCha20, Snell-v4, VMess-AEAD, VMess-WS-TLS, VMess-gRPC-TLS, VLESS-Vision-REALITY, VLESS-WS-TLS, VLESS-gRPC-TLS, Trojan-TLS, Trojan-WS-TLS, Trojan-gRPC-TLS, Hysteria-v1, Hysteria2-QUIC, Hysteria2-Salamander, Mieru-TCP, Mieru-UDP, Sudoku-UoT, Sudoku-Entropy, TUIC-v5, AnyTLS-Node, SOCKS5-Auth, SOCKS5-TLS, HTTPS-Connect, TrustTunnel, SSR-Origin, url=http://www.gstatic.com/generate_204, interval=300
+Proxy = select, Auto-All, Auto-IPv4, Auto-IPv6, ${v4_all_list}, ${v6_all_list}, DIRECT
+Auto-All = url-test, ${v4_auto_list}, ${v6_auto_list}, url=http://www.gstatic.com/generate_204, interval=300
+Auto-IPv4 = url-test, ${v4_auto_list}, url=http://www.gstatic.com/generate_204, interval=300
+Auto-IPv6 = url-test, ${v6_auto_list}, url=http://www.gstatic.com/generate_204, interval=300
 
 [Rule]
 GEOIP,CN,DIRECT
 FINAL,Proxy,dns-failed
 EOF
+    else
+        cat >>"${OUT_DIR}/hajimi-all-nodes.conf" <<EOF
 
-    # 2. Clash Meta (Mihomo) YAML 订阅配置文件
+[Proxy Group]
+Proxy = select, Auto-All, ${v4_all_list}, DIRECT
+Auto-All = url-test, ${v4_auto_list}, url=http://www.gstatic.com/generate_204, interval=300
+
+[Rule]
+GEOIP,CN,DIRECT
+FINAL,Proxy,dns-failed
+EOF
+    fi
+
+    # 2. Clash Meta (Mihomo) YAML 订阅配置文件 (IPv4 + IPv6 合并单文件)
     cat >"${OUT_DIR}/hajimi-clash-meta.yaml" <<EOF
 # ============================================================================
-# 哈基米 (Hajimi) 全协议全传输层测试配置 (Clash Meta / Mihomo YAML 格式)
+# 哈基米 (Hajimi) 全协议全传输层 IPv4 + IPv6 合并测试配置 (Clash Meta / Mihomo YAML 格式)
 # 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
-# 服务器 IP: ${PUBLIC_IP}
+# 服务器 IPv4: ${PUBLIC_IP}
+# 服务器 IPv6: ${PUBLIC_IPV6:-未检测到}
 # ============================================================================
 mixed-port: 7890
 allow-lan: false
+ipv6: true
 mode: rule
 log-level: info
 
 proxies:
+  # ==================== IPv4 节点区 ====================
   - name: "SS-AES128GCM"
     type: ss
     server: ${PUBLIC_IP}
@@ -3122,11 +3212,562 @@ proxies:
     server: ${PUBLIC_IP}
     port: 51820
     ip: 10.66.66.2
+    ipv6: fd00:6861:6a69:66::2
     private-key: "${WG_CLIENT_PRIV}"
     public-key: "${WG_SERVER_PUB}"
     pre-shared-key: "${WG_PSK}"
     mtu: 1420
     udp: true
+EOF
+
+    if [[ "${has_ipv6}" -eq 1 ]]; then
+        cat >>"${OUT_DIR}/hajimi-clash-meta.yaml" <<EOF
+
+  # ==================== IPv6 节点区 ====================
+  - name: "SS-AES128GCM-IPv6"
+    type: ss
+    server: "${PUBLIC_IPV6}"
+    port: 20001
+    cipher: aes-128-gcm
+    password: "${COMMON_PASS}"
+    udp: true
+
+  - name: "SS2022-BLAKE3-IPv6"
+    type: ss
+    server: "${PUBLIC_IPV6}"
+    port: 20002
+    cipher: 2022-blake3-aes-128-gcm
+    password: "${SS2022_AES128_KEY}"
+    udp: true
+
+  - name: "SS-ChaCha20-IPv6"
+    type: ss
+    server: "${PUBLIC_IPV6}"
+    port: 20021
+    cipher: chacha20-ietf-poly1305
+    password: "${COMMON_PASS}"
+    udp: true
+
+  - name: "SS2022-ChaCha20-IPv6"
+    type: ss
+    server: "${PUBLIC_IPV6}"
+    port: 20022
+    cipher: 2022-blake3-chacha20-poly1305
+    password: "${SS2022_CHACHA_KEY}"
+    udp: true
+
+  - name: "Snell-v4-IPv6"
+    type: snell
+    server: "${PUBLIC_IPV6}"
+    port: 20003
+    psk: "${SNELL_PSK}"
+    version: 4
+    udp: true
+
+  - name: "VMess-AEAD-IPv6"
+    type: vmess
+    server: "${PUBLIC_IPV6}"
+    port: 20004
+    uuid: ${UUID_V4}
+    alterId: 0
+    cipher: aes-128-gcm
+    udp: true
+
+  - name: "VMess-WS-TLS-IPv6"
+    type: vmess
+    server: "${PUBLIC_IPV6}"
+    port: 20005
+    uuid: ${UUID_V4}
+    alterId: 0
+    cipher: auto
+    udp: true
+    tls: true
+    skip-cert-verify: true
+    servername: "${PUBLIC_IPV6}"
+    network: ws
+    ws-opts:
+      path: /vmess-ws
+
+  - name: "VMess-gRPC-TLS-IPv6"
+    type: vmess
+    server: "${PUBLIC_IPV6}"
+    port: 20023
+    uuid: ${UUID_V4}
+    alterId: 0
+    cipher: auto
+    udp: true
+    tls: true
+    skip-cert-verify: true
+    servername: "${PUBLIC_IPV6}"
+    network: grpc
+    grpc-opts:
+      grpc-service-name: vmess-grpc
+
+  - name: "VLESS-Vision-REALITY-IPv6"
+    type: vless
+    server: "${PUBLIC_IPV6}"
+    port: 20006
+    uuid: ${UUID_V4}
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: ${REALITY_SNI}
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: ${REALITY_PUB_KEY}
+      short-id: "${REALITY_SHORT_ID}"
+
+  - name: "VLESS-WS-TLS-IPv6"
+    type: vless
+    server: "${PUBLIC_IPV6}"
+    port: 20007
+    uuid: ${UUID_V4}
+    tls: true
+    udp: true
+    skip-cert-verify: true
+    servername: "${PUBLIC_IPV6}"
+    network: ws
+    ws-opts:
+      path: /vless-ws
+
+  - name: "VLESS-gRPC-TLS-IPv6"
+    type: vless
+    server: "${PUBLIC_IPV6}"
+    port: 20024
+    uuid: ${UUID_V4}
+    tls: true
+    udp: true
+    skip-cert-verify: true
+    servername: "${PUBLIC_IPV6}"
+    network: grpc
+    grpc-opts:
+      grpc-service-name: vless-grpc
+
+  - name: "Trojan-TLS-IPv6"
+    type: trojan
+    server: "${PUBLIC_IPV6}"
+    port: 20008
+    password: "${COMMON_PASS}"
+    udp: true
+    sni: "${PUBLIC_IPV6}"
+    skip-cert-verify: true
+
+  - name: "Trojan-WS-TLS-IPv6"
+    type: trojan
+    server: "${PUBLIC_IPV6}"
+    port: 20025
+    password: "${COMMON_PASS}"
+    udp: true
+    sni: "${PUBLIC_IPV6}"
+    skip-cert-verify: true
+    network: ws
+    ws-opts:
+      path: /trojan-ws
+
+  - name: "Trojan-gRPC-TLS-IPv6"
+    type: trojan
+    server: "${PUBLIC_IPV6}"
+    port: 20026
+    password: "${COMMON_PASS}"
+    udp: true
+    sni: "${PUBLIC_IPV6}"
+    skip-cert-verify: true
+    network: grpc
+    grpc-opts:
+      grpc-service-name: trojan-grpc
+
+  - name: "Hysteria-v1-IPv6"
+    type: hysteria
+    server: "${PUBLIC_IPV6}"
+    port: 20009
+    auth-str: "${COMMON_PASS}"
+    up: "100 Mbps"
+    down: "100 Mbps"
+    sni: "${PUBLIC_IPV6}"
+    skip-cert-verify: true
+    alpn:
+      - hysteria
+      - h3
+
+  - name: "Hysteria2-QUIC-IPv6"
+    type: hysteria2
+    server: "${PUBLIC_IPV6}"
+    port: 20010
+    password: "${COMMON_PASS}"
+    up: "100 Mbps"
+    down: "100 Mbps"
+    sni: "${PUBLIC_IPV6}"
+    skip-cert-verify: true
+
+  - name: "Hysteria2-Salamander-IPv6"
+    type: hysteria2
+    server: "${PUBLIC_IPV6}"
+    port: 20027
+    password: "${COMMON_PASS}"
+    obfs: salamander
+    obfs-password: "${HY2_OBFS_PASS}"
+    up: "100 Mbps"
+    down: "100 Mbps"
+    sni: "${PUBLIC_IPV6}"
+    skip-cert-verify: true
+
+  - name: "Mieru-TCP-IPv6"
+    type: mieru
+    server: "${PUBLIC_IPV6}"
+    port: 20011
+    transport: TCP
+    username: "${COMMON_USER}"
+    password: "${COMMON_PASS}"
+    multiplexing: MULTIPLEXING_LOW
+    udp: true
+
+  - name: "Mieru-UDP-IPv6"
+    type: mieru
+    server: "${PUBLIC_IPV6}"
+    port: 20017
+    transport: UDP
+    username: "${COMMON_USER}"
+    password: "${COMMON_PASS}"
+    multiplexing: MULTIPLEXING_LOW
+    mtu: 1400
+    udp: true
+
+  - name: "Sudoku-UoT-IPv6"
+    type: sudoku
+    server: "${PUBLIC_IPV6}"
+    port: 20012
+    key: "${SUDOKU_CLIENT_KEY}"
+    aead-method: chacha20-poly1305
+    table-type: prefer_ascii
+    padding-min: 2
+    padding-max: 7
+    enable-pure-downlink: true
+    http-mask: true
+    http-mask-mode: legacy
+    udp: true
+
+  - name: "Sudoku-Entropy-IPv6"
+    type: sudoku
+    server: "${PUBLIC_IPV6}"
+    port: 20029
+    key: "${SUDOKU_CLIENT_KEY}"
+    aead-method: aes-128-gcm
+    table-type: up_ascii_down_entropy
+    custom-table: xvxvppvv
+    padding-min: 2
+    padding-max: 7
+    enable-pure-downlink: false
+    http-mask: true
+    http-mask-mode: legacy
+    udp: true
+
+  - name: "TUIC-v5-IPv6"
+    type: tuic
+    server: "${PUBLIC_IPV6}"
+    port: 20013
+    uuid: ${UUID_V4}
+    password: "${COMMON_PASS}"
+    congestion-controller: bbr
+    udp-relay-mode: native
+    sni: "${PUBLIC_IPV6}"
+    skip-cert-verify: true
+    alpn:
+      - h3
+
+  - name: "AnyTLS-Node-IPv6"
+    type: anytls
+    server: "${PUBLIC_IPV6}"
+    port: 20014
+    password: "${COMMON_PASS}"
+    sni: "${PUBLIC_IPV6}"
+    skip-cert-verify: true
+    udp: true
+
+  - name: "SOCKS5-Auth-IPv6"
+    type: socks5
+    server: "${PUBLIC_IPV6}"
+    port: 20015
+    username: "${COMMON_USER}"
+    password: "${COMMON_PASS}"
+    udp: true
+
+  - name: "SOCKS5-TLS-IPv6"
+    type: socks5
+    server: "${PUBLIC_IPV6}"
+    port: 20019
+    username: "${COMMON_USER}"
+    password: "${COMMON_PASS}"
+    tls: true
+    sni: "${PUBLIC_IPV6}"
+    skip-cert-verify: true
+
+  - name: "HTTPS-Connect-IPv6"
+    type: http
+    server: "${PUBLIC_IPV6}"
+    port: 20016
+    username: "${COMMON_USER}"
+    password: "${COMMON_PASS}"
+    tls: true
+    sni: "${PUBLIC_IPV6}"
+    skip-cert-verify: true
+
+  - name: "HTTP-Plain-IPv6"
+    type: http
+    server: "${PUBLIC_IPV6}"
+    port: 20028
+    username: "${COMMON_USER}"
+    password: "${COMMON_PASS}"
+
+  - name: "TrustTunnel-IPv6"
+    type: trusttunnel
+    server: "${PUBLIC_IPV6}"
+    port: 20018
+    username: "${COMMON_USER}"
+    password: "${COMMON_PASS}"
+    tls: true
+    sni: "${PUBLIC_IPV6}"
+    skip-cert-verify: true
+    udp: true
+
+  - name: "SSR-Origin-IPv6"
+    type: ssr
+    server: "${PUBLIC_IPV6}"
+    port: 20020
+    cipher: aes-128-cfb
+    password: "${COMMON_PASS}"
+    protocol: origin
+    obfs: plain
+    udp: true
+
+  - name: "SSH-Tunnel-IPv6"
+    type: ssh
+    server: "${PUBLIC_IPV6}"
+    port: 22
+    username: hajimisshtest
+    password: "${COMMON_PASS}"
+    host-key:
+      - "${SSH_HOST_PUBKEY}"
+
+  - name: "WireGuard-Node-IPv6"
+    type: wireguard
+    server: "${PUBLIC_IPV6}"
+    port: 51820
+    ip: 10.66.66.2
+    ipv6: fd00:6861:6a69:66::2
+    private-key: "${WG_CLIENT_PRIV}"
+    public-key: "${WG_SERVER_PUB}"
+    pre-shared-key: "${WG_PSK}"
+    mtu: 1420
+    udp: true
+
+proxy-groups:
+  - name: "Proxy"
+    type: select
+    proxies:
+      - "Auto-All"
+      - "Auto-IPv4"
+      - "Auto-IPv6"
+      - "SS-AES128GCM"
+      - "SS2022-BLAKE3"
+      - "SS-ChaCha20"
+      - "SS2022-ChaCha20"
+      - "Snell-v4"
+      - "VMess-AEAD"
+      - "VMess-WS-TLS"
+      - "VMess-gRPC-TLS"
+      - "VLESS-Vision-REALITY"
+      - "VLESS-WS-TLS"
+      - "VLESS-gRPC-TLS"
+      - "Trojan-TLS"
+      - "Trojan-WS-TLS"
+      - "Trojan-gRPC-TLS"
+      - "Hysteria-v1"
+      - "Hysteria2-QUIC"
+      - "Hysteria2-Salamander"
+      - "Mieru-TCP"
+      - "Mieru-UDP"
+      - "Sudoku-UoT"
+      - "Sudoku-Entropy"
+      - "TUIC-v5"
+      - "AnyTLS-Node"
+      - "SOCKS5-Auth"
+      - "SOCKS5-TLS"
+      - "HTTPS-Connect"
+      - "HTTP-Plain"
+      - "TrustTunnel"
+      - "SSR-Origin"
+      - "SSH-Tunnel"
+      - "WireGuard-Node"
+      - "SS-AES128GCM-IPv6"
+      - "SS2022-BLAKE3-IPv6"
+      - "SS-ChaCha20-IPv6"
+      - "SS2022-ChaCha20-IPv6"
+      - "Snell-v4-IPv6"
+      - "VMess-AEAD-IPv6"
+      - "VMess-WS-TLS-IPv6"
+      - "VMess-gRPC-TLS-IPv6"
+      - "VLESS-Vision-REALITY-IPv6"
+      - "VLESS-WS-TLS-IPv6"
+      - "VLESS-gRPC-TLS-IPv6"
+      - "Trojan-TLS-IPv6"
+      - "Trojan-WS-TLS-IPv6"
+      - "Trojan-gRPC-TLS-IPv6"
+      - "Hysteria-v1-IPv6"
+      - "Hysteria2-QUIC-IPv6"
+      - "Hysteria2-Salamander-IPv6"
+      - "Mieru-TCP-IPv6"
+      - "Mieru-UDP-IPv6"
+      - "Sudoku-UoT-IPv6"
+      - "Sudoku-Entropy-IPv6"
+      - "TUIC-v5-IPv6"
+      - "AnyTLS-Node-IPv6"
+      - "SOCKS5-Auth-IPv6"
+      - "SOCKS5-TLS-IPv6"
+      - "HTTPS-Connect-IPv6"
+      - "HTTP-Plain-IPv6"
+      - "TrustTunnel-IPv6"
+      - "SSR-Origin-IPv6"
+      - "SSH-Tunnel-IPv6"
+      - "WireGuard-Node-IPv6"
+      - DIRECT
+
+  - name: "Auto-All"
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    proxies:
+      - "SS-AES128GCM"
+      - "SS2022-BLAKE3"
+      - "SS-ChaCha20"
+      - "SS2022-ChaCha20"
+      - "Snell-v4"
+      - "VMess-AEAD"
+      - "VMess-WS-TLS"
+      - "VMess-gRPC-TLS"
+      - "VLESS-Vision-REALITY"
+      - "VLESS-WS-TLS"
+      - "VLESS-gRPC-TLS"
+      - "Trojan-TLS"
+      - "Trojan-WS-TLS"
+      - "Trojan-gRPC-TLS"
+      - "Hysteria-v1"
+      - "Hysteria2-QUIC"
+      - "Hysteria2-Salamander"
+      - "Mieru-TCP"
+      - "Mieru-UDP"
+      - "Sudoku-UoT"
+      - "Sudoku-Entropy"
+      - "TUIC-v5"
+      - "AnyTLS-Node"
+      - "SOCKS5-Auth"
+      - "SOCKS5-TLS"
+      - "HTTPS-Connect"
+      - "TrustTunnel"
+      - "SSR-Origin"
+      - "SS-AES128GCM-IPv6"
+      - "SS2022-BLAKE3-IPv6"
+      - "SS-ChaCha20-IPv6"
+      - "SS2022-ChaCha20-IPv6"
+      - "Snell-v4-IPv6"
+      - "VMess-AEAD-IPv6"
+      - "VMess-WS-TLS-IPv6"
+      - "VMess-gRPC-TLS-IPv6"
+      - "VLESS-Vision-REALITY-IPv6"
+      - "VLESS-WS-TLS-IPv6"
+      - "VLESS-gRPC-TLS-IPv6"
+      - "Trojan-TLS-IPv6"
+      - "Trojan-WS-TLS-IPv6"
+      - "Trojan-gRPC-TLS-IPv6"
+      - "Hysteria-v1-IPv6"
+      - "Hysteria2-QUIC-IPv6"
+      - "Hysteria2-Salamander-IPv6"
+      - "Mieru-TCP-IPv6"
+      - "Mieru-UDP-IPv6"
+      - "Sudoku-UoT-IPv6"
+      - "Sudoku-Entropy-IPv6"
+      - "TUIC-v5-IPv6"
+      - "AnyTLS-Node-IPv6"
+      - "SOCKS5-Auth-IPv6"
+      - "SOCKS5-TLS-IPv6"
+      - "HTTPS-Connect-IPv6"
+      - "TrustTunnel-IPv6"
+      - "SSR-Origin-IPv6"
+
+  - name: "Auto-IPv4"
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    proxies:
+      - "SS-AES128GCM"
+      - "SS2022-BLAKE3"
+      - "SS-ChaCha20"
+      - "SS2022-ChaCha20"
+      - "Snell-v4"
+      - "VMess-AEAD"
+      - "VMess-WS-TLS"
+      - "VMess-gRPC-TLS"
+      - "VLESS-Vision-REALITY"
+      - "VLESS-WS-TLS"
+      - "VLESS-gRPC-TLS"
+      - "Trojan-TLS"
+      - "Trojan-WS-TLS"
+      - "Trojan-gRPC-TLS"
+      - "Hysteria-v1"
+      - "Hysteria2-QUIC"
+      - "Hysteria2-Salamander"
+      - "Mieru-TCP"
+      - "Mieru-UDP"
+      - "Sudoku-UoT"
+      - "Sudoku-Entropy"
+      - "TUIC-v5"
+      - "AnyTLS-Node"
+      - "SOCKS5-Auth"
+      - "SOCKS5-TLS"
+      - "HTTPS-Connect"
+      - "TrustTunnel"
+      - "SSR-Origin"
+
+  - name: "Auto-IPv6"
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    proxies:
+      - "SS-AES128GCM-IPv6"
+      - "SS2022-BLAKE3-IPv6"
+      - "SS-ChaCha20-IPv6"
+      - "SS2022-ChaCha20-IPv6"
+      - "Snell-v4-IPv6"
+      - "VMess-AEAD-IPv6"
+      - "VMess-WS-TLS-IPv6"
+      - "VMess-gRPC-TLS-IPv6"
+      - "VLESS-Vision-REALITY-IPv6"
+      - "VLESS-WS-TLS-IPv6"
+      - "VLESS-gRPC-TLS-IPv6"
+      - "Trojan-TLS-IPv6"
+      - "Trojan-WS-TLS-IPv6"
+      - "Trojan-gRPC-TLS-IPv6"
+      - "Hysteria-v1-IPv6"
+      - "Hysteria2-QUIC-IPv6"
+      - "Hysteria2-Salamander-IPv6"
+      - "Mieru-TCP-IPv6"
+      - "Mieru-UDP-IPv6"
+      - "Sudoku-UoT-IPv6"
+      - "Sudoku-Entropy-IPv6"
+      - "TUIC-v5-IPv6"
+      - "AnyTLS-Node-IPv6"
+      - "SOCKS5-Auth-IPv6"
+      - "SOCKS5-TLS-IPv6"
+      - "HTTPS-Connect-IPv6"
+      - "TrustTunnel-IPv6"
+      - "SSR-Origin-IPv6"
+
+rules:
+  - GEOIP,CN,DIRECT
+  - MATCH,Proxy
+EOF
+    else
+        cat >>"${OUT_DIR}/hajimi-clash-meta.yaml" <<EOF
 
 proxy-groups:
   - name: "Proxy"
@@ -3169,18 +3810,17 @@ rules:
   - GEOIP,CN,DIRECT
   - MATCH,Proxy
 EOF
+    fi
 
-    # 3. 分享链接列表
+    # 3. 分享链接列表 (IPv4 + IPv6 合并单文件)
     local ss1_b64
     ss1_b64="$(echo -n "aes-128-gcm:${COMMON_PASS}" | base64 -w0)"
     local ss2_b64
     ss2_b64="$(echo -n "2022-blake3-aes-128-gcm:${SS2022_AES128_KEY}" | base64 -w0)"
     local vmess_tcp_json
-    vmess_tcp_json="$(jq -nc --arg add "${PUBLIC_IP}" --arg id "${UUID_V4}" \
-        '{v:"2",ps:"VMess-AEAD",add:$add,port:"20004",id:$id,aid:"0",scy:"aes-128-gcm",net:"tcp",type:"none",tls:""}' | base64 -w0)"
+    vmess_tcp_json="$(jq -nc --arg add "${PUBLIC_IP}" --arg id "${UUID_V4}"         '{v:"2",ps:"VMess-AEAD",add:$add,port:"20004",id:$id,aid:"0",scy:"aes-128-gcm",net:"tcp",type:"none",tls:""}' | base64 -w0)"
     local vmess_ws_json
-    vmess_ws_json="$(jq -nc --arg add "${PUBLIC_IP}" --arg id "${UUID_V4}" \
-        '{v:"2",ps:"VMess-WS-TLS",add:$add,port:"20005",id:$id,aid:"0",scy:"auto",net:"ws",path:"/vmess-ws",tls:"tls",sni:$add}' | base64 -w0)"
+    vmess_ws_json="$(jq -nc --arg add "${PUBLIC_IP}" --arg id "${UUID_V4}"         '{v:"2",ps:"VMess-WS-TLS",add:$add,port:"20005",id:$id,aid:"0",scy:"auto",net:"ws",path:"/vmess-ws",tls:"tls",sni:$add}' | base64 -w0)"
 
     cat >"${OUT_DIR}/hajimi-share-links.txt" <<EOF
 ss://${ss1_b64}@${PUBLIC_IP}:20001#SS-AES128GCM
@@ -3196,17 +3836,31 @@ tuic://${UUID_V4}:${COMMON_PASS}@${PUBLIC_IP}:20013?congestion_control=bbr&alpn=
 anytls://${COMMON_PASS}@${PUBLIC_IP}:20014?sni=${PUBLIC_IP}&insecure=1#AnyTLS-Node
 socks5://${COMMON_USER}:${COMMON_PASS}@${PUBLIC_IP}:20015#SOCKS5-Auth
 EOF
-    base64 -w0 "${OUT_DIR}/hajimi-share-links.txt" > "${OUT_DIR}/hajimi-share-links-base64.txt"
-    if [[ -n "${PUBLIC_IPV6:-}" && "${PUBLIC_IPV6}" != "${PUBLIC_IP}" ]]; then
-        sed -e "s/ipv6 = false/ipv6 = true/g" \
-            -e "s/endpoint = ${PUBLIC_IP}:51820/endpoint = [${PUBLIC_IPV6}]:51820/g" \
-            -e "s/${PUBLIC_IP}/${PUBLIC_IPV6}/g" \
-            "${OUT_DIR}/hajimi-all-nodes.conf" > "${OUT_DIR}/hajimi-all-nodes-ipv6.conf"
-        sed -e "s/${PUBLIC_IP}/${PUBLIC_IPV6}/g" \
-            "${OUT_DIR}/hajimi-clash-meta.yaml" > "${OUT_DIR}/hajimi-clash-meta-ipv6.yaml"
+
+    if [[ "${has_ipv6}" -eq 1 ]]; then
+        local vmess_tcp_v6_json
+        vmess_tcp_v6_json="$(jq -nc --arg add "${PUBLIC_IPV6}" --arg id "${UUID_V4}"             '{v:"2",ps:"VMess-AEAD-IPv6",add:$add,port:"20004",id:$id,aid:"0",scy:"aes-128-gcm",net:"tcp",type:"none",tls:""}' | base64 -w0)"
+        local vmess_ws_v6_json
+        vmess_ws_v6_json="$(jq -nc --arg add "${PUBLIC_IPV6}" --arg id "${UUID_V4}"             '{v:"2",ps:"VMess-WS-TLS-IPv6",add:$add,port:"20005",id:$id,aid:"0",scy:"auto",net:"ws",path:"/vmess-ws",tls:"tls",sni:$add}' | base64 -w0)"
+        cat >>"${OUT_DIR}/hajimi-share-links.txt" <<EOF
+ss://${ss1_b64}@[${PUBLIC_IPV6}]:20001#SS-AES128GCM-IPv6
+ss://${ss2_b64}@[${PUBLIC_IPV6}]:20002#SS2022-BLAKE3-IPv6
+vmess://${vmess_tcp_v6_json}
+vmess://${vmess_ws_v6_json}
+vless://${UUID_V4}@[${PUBLIC_IPV6}]:20006?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB_KEY}&sid=${REALITY_SHORT_ID}&type=tcp#VLESS-Vision-REALITY-IPv6
+vless://${UUID_V4}@[${PUBLIC_IPV6}]:20007?encryption=none&security=tls&sni=${PUBLIC_IPV6}&allowInsecure=1&type=ws&path=%2Fvl-ws#VLESS-WS-TLS-IPv6
+trojan://${COMMON_PASS}@[${PUBLIC_IPV6}]:20008?security=tls&sni=${PUBLIC_IPV6}&allowInsecure=1#Trojan-TLS-IPv6
+hysteria://[${PUBLIC_IPV6}]:20009?auth=${COMMON_PASS}&upmbps=100&downmbps=100&insecure=1&peer=${PUBLIC_IPV6}&alpn=hysteria#Hysteria-v1-IPv6
+hysteria2://${COMMON_PASS}@[${PUBLIC_IPV6}]:20010?insecure=1&sni=${PUBLIC_IPV6}#Hysteria2-QUIC-IPv6
+tuic://${UUID_V4}:${COMMON_PASS}@[${PUBLIC_IPV6}]:20013?congestion_control=bbr&alpn=h3&allow_insecure=1&sni=${PUBLIC_IPV6}#TUIC-v5-IPv6
+anytls://${COMMON_PASS}@[${PUBLIC_IPV6}]:20014?sni=${PUBLIC_IPV6}&insecure=1#AnyTLS-Node-IPv6
+socks5://${COMMON_USER}:${COMMON_PASS}@[${PUBLIC_IPV6}]:20015#SOCKS5-Auth-IPv6
+EOF
     fi
+
+    base64 -w0 "${OUT_DIR}/hajimi-share-links.txt" > "${OUT_DIR}/hajimi-share-links-base64.txt"
     chmod 644 "${OUT_DIR}/"*
-    log_ok "客户端配置文件已全部生成至 ${OUT_DIR}/"
+    log_ok "客户端配置文件 (IPv4 + IPv6 已合并为单文件) 已全部生成至 ${OUT_DIR}/"
 }
 
 verify_services_and_ports() {
@@ -3262,9 +3916,12 @@ EOF
     systemctl enable --now hajimi-sub-http.service
     echo ""
     log_ok "已开启订阅 HTTP 下载服务 (端口: ${sub_port})"
-    echo -e "  - Surge / 哈基米 .conf 订阅链接: ${GREEN}http://${PUBLIC_IP}:${sub_port}/hajimi-all-nodes.conf${NC}"
-    echo -e "  - Clash Meta YAML 订阅链接   : ${GREEN}http://${PUBLIC_IP}:${sub_port}/hajimi-clash-meta.yaml${NC}"
-    echo -e "  - 分享链接列表订阅           : ${GREEN}http://${PUBLIC_IP}:${sub_port}/hajimi-share-links.txt${NC}"
+    echo -e "  - Surge / 哈基米 .conf 订阅链接 (含IPv4+IPv6): ${GREEN}http://${PUBLIC_IP}:${sub_port}/hajimi-all-nodes.conf${NC}"
+    echo -e "  - Clash Meta YAML 订阅链接    (含IPv4+IPv6): ${GREEN}http://${PUBLIC_IP}:${sub_port}/hajimi-clash-meta.yaml${NC}"
+    echo -e "  - 分享链接列表订阅            (含IPv4+IPv6): ${GREEN}http://${PUBLIC_IP}:${sub_port}/hajimi-share-links.txt${NC}"
+    if [[ -n "${PUBLIC_IPV6:-}" && "${PUBLIC_IPV6}" != "${PUBLIC_IP}" ]]; then
+        echo -e "  - Surge / 哈基米 .conf (IPv6直连下载)      : ${GREEN}http://[${PUBLIC_IPV6}]:${sub_port}/hajimi-all-nodes.conf${NC}"
+    fi
 }
 
 print_summary() {
@@ -3272,15 +3929,16 @@ print_summary() {
     echo -e "${GREEN}==============================================================================${NC}"
     echo -e "${GREEN}      🎉 哈基米 (Hajimi) 全协议 30 节点测试环境一键部署完成！                 ${NC}"
     echo -e "${GREEN}==============================================================================${NC}"
-    echo -e "服务器公网 IP : ${CYAN}${PUBLIC_IP}${NC}"
-    echo -e "通用用户名    : ${CYAN}${COMMON_USER}${NC}"
-    echo -e "通用密码/PSK  : ${CYAN}${COMMON_PASS}${NC}"
-    echo -e "通用 UUID     : ${CYAN}${UUID_V4}${NC}"
+    echo -e "服务器公网 IPv4: ${CYAN}${PUBLIC_IP}${NC}"
+    echo -e "服务器公网 IPv6: ${CYAN}${PUBLIC_IPV6:-未检测到}${NC}"
+    echo -e "通用用户名     : ${CYAN}${COMMON_USER}${NC}"
+    echo -e "通用密码/PSK   : ${CYAN}${COMMON_PASS}${NC}"
+    echo -e "通用 UUID      : ${CYAN}${UUID_V4}${NC}"
     echo -e "------------------------------------------------------------------------------"
-    echo -e "可以直接导入哈基米 App 的配置文件路径:"
-    echo -e "  1) Surge 原生全协议配置 (含全部 30 个节点): ${YELLOW}${OUT_DIR}/hajimi-all-nodes.conf${NC}"
-    echo -e "  2) Clash Meta YAML 全协议配置 (含全部 30 个节点): ${YELLOW}${OUT_DIR}/hajimi-clash-meta.yaml${NC}"
-    echo -e "  3) 通用分享链接列表: ${YELLOW}${OUT_DIR}/hajimi-share-links.txt${NC}"
+    echo -e "可以直接导入哈基米 App 的配置文件路径 (IPv4 与 IPv6 节点已合并至同一文件):"
+    echo -e "  1) Surge 原生全协议配置 (IPv4+IPv6 合并单文件): ${YELLOW}${OUT_DIR}/hajimi-all-nodes.conf${NC}"
+    echo -e "  2) Clash Meta YAML 配置 (IPv4+IPv6 合并单文件): ${YELLOW}${OUT_DIR}/hajimi-clash-meta.yaml${NC}"
+    echo -e "  3) 通用分享链接列表     (IPv4+IPv6 合并单文件): ${YELLOW}${OUT_DIR}/hajimi-share-links.txt${NC}"
     echo -e "  4) SSH 私钥文件 (如需测试私钥登录): ${YELLOW}${WORK_DIR}/ssh_client_ed25519${NC}"
     echo -e "------------------------------------------------------------------------------"
     echo -e "端口与协议对应表 (30 节点):"

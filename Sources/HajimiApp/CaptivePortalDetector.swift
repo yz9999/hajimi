@@ -65,7 +65,7 @@ final class CaptivePortalDetector {
         }
 
         connection.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
+            guard self != nil else { return }
             switch state {
             case .ready:
                 let request = "GET \(Self.probePath) HTTP/1.1\r\nHost: \(Self.probeHost)\r\nUser-Agent: CaptiveNetworkSupport-400.0.1 wispr\r\nConnection: close\r\n\r\n"

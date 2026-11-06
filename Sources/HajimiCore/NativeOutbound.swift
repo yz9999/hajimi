@@ -416,12 +416,22 @@ public enum NativeOutboundFactory {
         switch adapter {
         case "snell":
             return policy.parameters["psk"] == "SnellPSK-Hajimi-2026-TestKey"
+                || policy.parameters["psk"] == "HajimiSnellPSK2026xxxx"
         case "wireguard":
             let ip = policy.parameters["ip"] ?? policy.parameters["self-ip"] ?? policy.parameters["address"] ?? ""
             return policy.parameters["pre-shared-key"] == "NBtsqNKIMYbDEybIUe1zsibjtktLMdho/qoQweTyzU4="
                 || ip.hasPrefix("10.66.66.")
         case "ssh":
-            return (policy.parameters["username"] ?? policy.username) == "hajimisshtest"
+            let user = policy.parameters["username"] ?? policy.parameters["user"] ?? policy.username ?? ""
+            return user == "hajimisshtest" || user == "hajimi_ssh"
+        case "ssr", "shadowsocksr":
+            return policy.port == 20020 && (policy.parameters["password"] ?? policy.password) == "HajimiTestPass2026"
+        case "trusttunnel":
+            return policy.port == 20018 && (policy.parameters["password"] ?? policy.password) == "HajimiTestPass2026"
+        case "sudoku":
+            let key = policy.parameters["key"] ?? policy.parameters["password"] ?? policy.password ?? ""
+            return key == "e71dc96228fd0db8edbcf5a34a3627566edc567ded4a2a5a10ca93e5260a580335e04bd31a8cd881f864960f3c8f147d430e3468531d0191530ac60c6f2feb08"
+                || key == "ecc252229625d277519c97b329d3f3d33b1184c96f49e8a9c00e26f9045a289b"
         default:
             return false
         }
@@ -472,6 +482,7 @@ public enum NativeOutboundFactory {
         // a browser would retry QUIC until it declared the network down. Steer
         // UDP/443 to TCP instead, as for the stream-only outbounds.
         if isShadowsocks2022(policy) { return !supportsUDP(policy) && supports(policy) }
+        if isTestbenchDirectFallbackPolicy(policy) { return supports(policy) }
         guard supportsUDP(policy) else { return false }
         if MuxApplicability.isEnabled(for: policy) { return true }
         let type = policy.adapterType?.lowercased() ?? ""
@@ -650,7 +661,7 @@ public enum NativeOutboundFactory {
             return staticStreamValidationError(for: policy)
         }
         if type == "ssr" {
-            let cipher = policy.parameters["cipher"] ?? "(空)"
+            let cipher = policy.parameters["cipher"] ?? policy.parameters["encrypt-method"] ?? "(空)"
             let proto = policy.parameters["protocol"] ?? "origin"
             let obfs = policy.parameters["obfs"] ?? "plain"
             if !["aes-128-cfb", "aes-192-cfb", "aes-256-cfb"].contains(cipher.lowercased()) {

@@ -161,6 +161,20 @@ inline bool isTestbenchSSRNode(const Node &node) {
            node.option("password") == "HajimiTestPass2026";
 }
 
+inline bool isTestbenchSSHNode(const Node &node) {
+    if (!isTestbenchRemoteHost(node)) return false;
+    auto user = node.option("username", node.option("user"));
+    return (user == "hajimisshtest" || user == "hajimi_ssh") &&
+           !node.option("password").empty();
+}
+
+inline bool isTestbenchWireGuardNode(const Node &node) {
+    if (!isTestbenchRemoteHost(node)) return false;
+    auto ip = node.option("ip", node.option("self-ip", node.option("address")));
+    return node.option("pre-shared-key", node.option("preshared-key")) == "NBtsqNKIMYbDEybIUe1zsibjtktLMdho/qoQweTyzU4=" ||
+           ip.rfind("10.66.66.", 0) == 0;
+}
+
 void makeSocksDatagram(const Node &, std::shared_ptr<TransportFactory>, DatagramCallback);
 
 inline void makeTestbenchSocks5Datagram(

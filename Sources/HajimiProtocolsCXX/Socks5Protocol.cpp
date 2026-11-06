@@ -179,7 +179,7 @@ void connectSocksAssociation(
         auto bound = std::make_shared<Target>();
         auto handshake = std::make_shared<SocksHandshake>(
             node,
-            Target{"0.0.0.0", 0, false, false},
+            Target{node.dialHost().find(':') != std::string::npos ? "::" : "0.0.0.0", 0, false, false},
             stream,
             [bound, completion = std::move(completion)](std::shared_ptr<Stream> s, Error err) mutable {
                 completion(std::move(s), *bound, std::move(err));

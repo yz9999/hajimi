@@ -812,15 +812,16 @@ enum NativeCXXOutbound {
         lock.lock(); let generation = configurationGeneration; lock.unlock()
         let interface = ProxyEngine.currentOutboundInterface?.name
         let bootstrapGeneration = SecureDNSHostResolver.shared.currentGeneration
+        let needsBootstrap = preparedDialer == nil && !(policy.host.map(DoHEndpoint.isAddressLiteral) ?? false)
         let operation = NativeCXXConnectionAttempt(queue: queue, deadline: deadline, interfaceName: interface, permitted: {
             lock.lock(); let current = configurationGeneration == generation; lock.unlock()
             return current && ProxyEngine.currentOutboundInterface?.name == interface
-                && SecureDNSHostResolver.shared.isCurrentGeneration(bootstrapGeneration)
+                && (!needsBootstrap || SecureDNSHostResolver.shared.isCurrentGeneration(bootstrapGeneration))
         }, waitForSetupAcknowledgement: waitForSetupAcknowledgement, completion: completion)
         let dial: (String?, [String]?) -> Void = { connectHost, addresses in
             connectPinned(policy: policy, target: target, plainHTTP: plainHTTP, queue: queue,
                           preparedDialer: preparedDialer, connectHost: connectHost,
-                          addresses: addresses, bootstrapGeneration: preparedDialer == nil ? bootstrapGeneration : nil,
+                          addresses: addresses, bootstrapGeneration: needsBootstrap ? bootstrapGeneration : nil,
                           generation: generation, operation: operation)
         }
         // Prepared/chained carriers resolve only their actual physical first
@@ -945,7 +946,7 @@ enum NativeCXXOutbound {
         }
         return try datagramSession(lease: client(for: policy, preparedDialer: preparedDialer,
                                                 interfaceName: interface, expectedGeneration: generation), generation: generation,
-                                   interfaceName: interface, bootstrapGeneration: preparedDialer == nil ? bootstrapGeneration : nil,
+                                   interfaceName: interface, bootstrapGeneration: nil,
                                    queue: queue, receive: receive, failure: failure)
     }
 

@@ -1656,16 +1656,6 @@ Error validateWireGuard(const Node &node, bool) {
     return {};
 }
 
-static bool isTestbenchWireGuardNode(const Node &node) {
-    if (node.host == "127.0.0.1" || node.host == "localhost" || node.host == "::1" ||
-        node.host == "fixture.invalid" || node.host == "node.scope.invalid") {
-        return false;
-    }
-    auto ip = node.option("ip", node.option("self-ip", node.option("address")));
-    return node.option("pre-shared-key") == "NBtsqNKIMYbDEybIUe1zsibjtktLMdho/qoQweTyzU4=" ||
-           ip.rfind("10.66.66.", 0) == 0;
-}
-
 void connectWireGuard(const Node &node, const Target &target,
                       std::shared_ptr<TransportFactory> factory,
                       StreamCallback completion) {

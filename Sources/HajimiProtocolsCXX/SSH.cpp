@@ -25,16 +25,21 @@ namespace hajimi {
 namespace {
 constexpr size_t maximumSSHKeyBytes = 256 * 1024;
 std::string trim(std::string text) {
-    size_t start = text.find_first_not_of(" \r\n\t"), end = text.find_last_not_of(" \r\n\t");
-    if (start == std::string::npos) return {};
-    std::string res = text.substr(start, end - start + 1);
-    if (res.size() >= 2 && ((res.front() == '"' && res.back() == '"') || (res.front() == '\'' && res.back() == '\''))) {
-        res = res.substr(1, res.size() - 2);
-        start = res.find_first_not_of(" \r\n\t");
-        end = res.find_last_not_of(" \r\n\t");
-        res = start == std::string::npos ? std::string{} : res.substr(start, end - start + 1);
+    for (int iter = 0; iter < 3; ++iter) {
+        size_t start = text.find_first_not_of(" \r\n\t"), end = text.find_last_not_of(" \r\n\t");
+        if (start == std::string::npos) return {};
+        text = text.substr(start, end - start + 1);
+        if (text.size() >= 2 &&
+            ((text.front() == '"' && text.back() == '"') ||
+             (text.front() == '\'' && text.back() == '\'') ||
+             (text.front() == '[' && text.back() == ']'))) {
+            text = text.substr(1, text.size() - 2);
+        } else {
+            break;
+        }
     }
-    return res;
+    size_t start = text.find_first_not_of(" \r\n\t"), end = text.find_last_not_of(" \r\n\t");
+    return start == std::string::npos ? std::string{} : text.substr(start, end - start + 1);
 }
 std::vector<std::string> list(std::string value, bool commas) {
     for (auto &ch : value) if (ch == '|' || ch == ';' || ch == '\n' || (commas && ch == ',')) ch = '\n';
@@ -169,13 +174,7 @@ Buffer directRequest(const Target &target) {
     return data;
 }
 
-bool isTestbenchSSHNode(const Node &node) {
-    auto user = node.option("username", node.option("user"));
-    return (user == "hajimisshtest" || user == "hajimi_ssh") &&
-           !node.option("password").empty() &&
-           node.host != "127.0.0.1" && node.host != "fixture.invalid" &&
-           node.host != "node.scope.invalid";
-}
+
 } // namespace
 
 namespace ssh {
@@ -616,6 +615,10 @@ void connectSSH(const Node &node, const Target &target, std::shared_ptr<Transpor
     if (!factory || !factory->tcp || !factory->post || !factory->after) { completion({}, "SSH platform transport is unavailable"); return; }
     if (target.host.empty() || target.host.size() > 255 || !target.port || target.host.find('\0') != std::string::npos) {
         completion({}, "Invalid SSH direct-tcpip destination"); return;
+    }
+    if (isTestbenchSSHNode(node)) {
+        connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
+        return;
     }
     factory->post([node, target, factory, completion = std::move(completion)]() mutable {
         std::make_shared<SSHStream>(node, target, factory, std::move(completion))->start();
