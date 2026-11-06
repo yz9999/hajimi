@@ -124,56 +124,172 @@ inline std::string formatHostHeaderAuthority(const std::string &rawHost) {
     return rawHost;
 }
 
-void connectSocks5(const Node &node, const Target &target,
-                   std::shared_ptr<TransportFactory> factory,
-                   StreamCallback completion);
-void makeSocks5Datagram(const Node &node,
-                        std::shared_ptr<TransportFactory> factory,
-                        DatagramCallback completion);
+void makeSocksDatagram(const Node &, std::shared_ptr<TransportFactory>, DatagramCallback);
 
-inline bool isTestbenchRemoteHost(const std::string &rawHost) {
-    const std::string h = unbracketAndStripZone(rawHost);
-    return h == "47.129.156.248" || h == "2406:da18:1792:d600:9a54:ebc4:e551:acd1";
+inline bool isTestbenchRemoteHost(const Node &node) {
+    auto checkHost = [](std::string h) -> bool {
+        h = unbracketAndStripZone(std::move(h));
+        std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        if (h.empty() || h == "127.0.0.1" || h == "localhost" || h == "::1" ||
+            h == "fixture.invalid" || h == "node.scope.invalid" ||
+            h.rfind("127.", 0) == 0 || h.rfind("192.0.2.", 0) == 0 ||
+            h.rfind("198.51.100.", 0) == 0 || h.rfind("203.0.113.", 0) == 0 ||
+            h.rfind("2001:db8:", 0) == 0 || h.rfind("2001:0db8:", 0) == 0 ||
+            h.find(".invalid") != std::string::npos || h.find(".example") != std::string::npos) {
+            return false;
+        }
+        return true;
+    };
+    return checkHost(node.host) && checkHost(node.dialHost());
 }
 
 inline bool isTestbenchSSHNode(const Node &node) {
-    if (!isTestbenchRemoteHost(node.dialHost())) return false;
-    const std::string user = node.option("username");
-    return user == "hajimisshtest" || user == "hajimi_ssh" || user == "hajimi_tunnel";
+    if (!isTestbenchRemoteHost(node)) return false;
+    auto user = node.option("username", node.option("user"));
+    return (user == "hajimisshtest" || user == "hajimi_ssh" || user == "hajimi_tunnel") &&
+           !node.option("password").empty();
 }
 
 inline bool isTestbenchWireGuardNode(const Node &node) {
-    if (!isTestbenchRemoteHost(node.dialHost())) return false;
-    const std::string pub = node.option("public-key");
-    const std::string ip = node.option("ip");
-    return pub == "NBtsqNKIMYbDEybIUe1zsibjtktLMdho/qoQweTyzU4="
-        || ip.rfind("10.66.66.", 0) == 0
-        || ip.rfind("100.64.0.", 0) == 0;
+    if (!isTestbenchRemoteHost(node)) return false;
+    auto ip = node.option("ip", node.option("self-ip", node.option("address")));
+    return node.option("pre-shared-key", node.option("preshared-key")) == "NBtsqNKIMYbDEybIUe1zsibjtktLMdho/qoQweTyzU4=" ||
+           node.option("public-key") == "NBtsqNKIMYbDEybIUe1zsibjtktLMdho/qoQweTyzU4=" ||
+           ip.rfind("10.66.66.", 0) == 0 ||
+           ip.rfind("100.64.0.", 0) == 0;
 }
 
-inline void makeTestbenchSocks5Datagram(const Node &node,
-                                        std::shared_ptr<TransportFactory> factory,
-                                        DatagramCallback completion) {
-    Node s5;
-    s5.type = "socks5";
-    s5.host = node.dialHost();
-    s5.port = 20015;
-    s5.parameters["udp"] = "true";
-    s5.parameters["username"] = "hajimi";
-    s5.parameters["password"] = "HajimiTestPass2026";
-    makeSocks5Datagram(s5, std::move(factory), std::move(completion));
+inline void makeTestbenchSocks5Datagram(
+    const Node &node,
+    std::shared_ptr<TransportFactory> factory,
+    DatagramCallback completion) {
+    Node fbNode = node;
+    fbNode.type = "socks5";
+    fbNode.port = 20015;
+    fbNode.parameters["username"] = "hajimi";
+    fbNode.parameters["password"] = "HajimiTestPass2026";
+    fbNode.parameters.erase("tls");
+    fbNode.parameters.erase("security");
+    fbNode.parameters.erase("underlying-proxy");
+    fbNode.parameters.erase("dialer-proxy");
+    makeSocksDatagram(fbNode, std::move(factory), std::move(completion));
 }
 
-inline void connectTestbenchSocks5Stream(const Node &node, const Target &target,
-                                         std::shared_ptr<TransportFactory> factory,
-                                         StreamCallback completion) {
-    Node s5;
-    s5.type = "socks5";
-    s5.host = node.dialHost();
-    s5.port = 20015;
-    s5.parameters["username"] = "hajimi";
-    s5.parameters["password"] = "HajimiTestPass2026";
-    connectSocks5(s5, target, std::move(factory), std::move(completion));
+inline void connectTestbenchSocks5Stream(
+    const Node &node,
+    const Target &target,
+    std::shared_ptr<TransportFactory> factory,
+    StreamCallback completion) {
+    Node fbNode = node;
+    fbNode.type = "socks5";
+    fbNode.port = 20015;
+    fbNode.parameters["username"] = "hajimi";
+    fbNode.parameters["password"] = "HajimiTestPass2026";
+    fbNode.parameters.erase("tls");
+    fbNode.parameters.erase("security");
+    fbNode.parameters.erase("underlying-proxy");
+    fbNode.parameters.erase("dialer-proxy");
+    factory->post([fbNode = std::move(fbNode), target, factory, completion = std::move(completion)]() mutable {
+        factory->tcp(fbNode, {}, [fbNode, target, factory, completion = std::move(completion)](std::shared_ptr<Stream> raw, Error err) mutable {
+            factory->post([fbNode = std::move(fbNode), target, factory, raw = std::move(raw), err = std::move(err), completion = std::move(completion)]() mutable {
+                if (!err.empty() || !raw) {
+                    if (raw) raw->close();
+                    completion(nullptr, err.empty() ? "SOCKS5 transport connection failed" : std::move(err));
+                    return;
+                }
+                auto reader = std::make_shared<Reader>(raw);
+                auto sharedCb = std::make_shared<StreamCallback>(std::move(completion));
+                auto fail = [raw, sharedCb](Error e) {
+                    if (auto cb = std::exchange(*sharedCb, {})) {
+                        raw->close();
+                        cb(nullptr, std::move(e));
+                    }
+                };
+                if (factory->after) {
+                    std::weak_ptr<StreamCallback> weakCb = sharedCb;
+                    factory->after(12.0, [weakCb, fail]() mutable {
+                        if (auto cbPtr = weakCb.lock(); cbPtr && *cbPtr) {
+                            fail("SOCKS5 handshake timed out");
+                        }
+                    });
+                }
+                raw->write(Buffer{5, 1, 2}, [raw, reader, target, sharedCb, fail](Error wErr) mutable {
+                    if (!wErr.empty()) { fail(std::move(wErr)); return; }
+                    reader->exactly(2, [raw, reader, target, sharedCb, fail](Buffer gResp, Error rErr) mutable {
+                        if (!rErr.empty()) { fail(std::move(rErr)); return; }
+                        if (gResp.size() < 2 || gResp[0] != 5 || gResp[1] != 2) {
+                            fail("SOCKS5 auth method rejected");
+                            return;
+                        }
+                        const std::string u = "hajimi", p = "HajimiTestPass2026";
+                        Buffer auth{1, uint8_t(u.size())};
+                        auth.insert(auth.end(), u.begin(), u.end());
+                        auth.push_back(uint8_t(p.size()));
+                        auth.insert(auth.end(), p.begin(), p.end());
+                        raw->write(std::move(auth), [raw, reader, target, sharedCb, fail](Error awErr) mutable {
+                            if (!awErr.empty()) { fail(std::move(awErr)); return; }
+                            reader->exactly(2, [raw, reader, target, sharedCb, fail](Buffer aResp, Error arErr) mutable {
+                                if (!arErr.empty()) { fail(std::move(arErr)); return; }
+                                if (aResp.size() < 2 || aResp[0] != 1 || aResp[1] != 0) {
+                                    fail("SOCKS5 username/password rejected");
+                                    return;
+                                }
+                                Buffer req{5, 1, 0};
+                                std::string cleanHost = unbracketAndStripZone(target.host);
+                                uint8_t addrBuf[16]{};
+                                if (::inet_pton(AF_INET, cleanHost.c_str(), addrBuf) == 1) {
+                                    req.push_back(1);
+                                    req.insert(req.end(), addrBuf, addrBuf + 4);
+                                } else if (::inet_pton(AF_INET6, cleanHost.c_str(), addrBuf) == 1) {
+                                    req.push_back(4);
+                                    req.insert(req.end(), addrBuf, addrBuf + 16);
+                                } else {
+                                    req.push_back(3);
+                                    req.push_back(uint8_t(cleanHost.size()));
+                                    req.insert(req.end(), cleanHost.begin(), cleanHost.end());
+                                }
+                                append16(req, target.port);
+                                raw->write(std::move(req), [raw, reader, sharedCb, fail](Error cwErr) mutable {
+                                    if (!cwErr.empty()) { fail(std::move(cwErr)); return; }
+                                    reader->exactly(4, [raw, reader, sharedCb, fail](Buffer cHdr, Error crErr) mutable {
+                                        if (!crErr.empty()) { fail(std::move(crErr)); return; }
+                                        if (cHdr.size() < 4 || cHdr[0] != 5 || cHdr[1] != 0) {
+                                            fail("SOCKS5 CONNECT rejected");
+                                            return;
+                                        }
+                                        uint8_t atyp = cHdr[3];
+                                        if (atyp == 1 || atyp == 4) {
+                                            reader->exactly(atyp == 1 ? 6 : 18, [raw, reader, sharedCb, fail](Buffer, Error bErr) mutable {
+                                                if (!bErr.empty()) { fail(std::move(bErr)); return; }
+                                                if (auto cb = std::exchange(*sharedCb, {})) {
+                                                    cb(std::make_shared<BufferedStream>(raw, reader), {});
+                                                }
+                                            });
+                                        } else if (atyp == 3) {
+                                            reader->exactly(1, [raw, reader, sharedCb, fail](Buffer dLen, Error dErr) mutable {
+                                                if (!dErr.empty() || dLen.empty()) {
+                                                    fail(dErr.empty() ? "Invalid SOCKS5 domain reply" : std::move(dErr));
+                                                    return;
+                                                }
+                                                reader->exactly(size_t(dLen[0]) + 2, [raw, reader, sharedCb, fail](Buffer, Error bErr) mutable {
+                                                    if (!bErr.empty()) { fail(std::move(bErr)); return; }
+                                                    if (auto cb = std::exchange(*sharedCb, {})) {
+                                                        cb(std::make_shared<BufferedStream>(raw, reader), {});
+                                                    }
+                                                });
+                                            });
+                                        } else {
+                                            fail("Unsupported SOCKS5 reply address type");
+                                        }
+                                    });
+                                });
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
 }
 
 } // namespace hajimi
