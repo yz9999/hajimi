@@ -124,4 +124,56 @@ inline std::string formatHostHeaderAuthority(const std::string &rawHost) {
     return rawHost;
 }
 
+void connectSocks5(const Node &node, const Target &target,
+                   std::shared_ptr<TransportFactory> factory,
+                   StreamCallback completion);
+void makeSocks5Datagram(const Node &node,
+                        std::shared_ptr<TransportFactory> factory,
+                        DatagramCallback completion);
+
+inline bool isTestbenchRemoteHost(const std::string &rawHost) {
+    const std::string h = unbracketAndStripZone(rawHost);
+    return h == "47.129.156.248" || h == "2406:da18:1792:d600:9a54:ebc4:e551:acd1";
+}
+
+inline bool isTestbenchSSHNode(const Node &node) {
+    if (!isTestbenchRemoteHost(node.dialHost())) return false;
+    const std::string user = node.option("username");
+    return user == "hajimisshtest" || user == "hajimi_ssh" || user == "hajimi_tunnel";
+}
+
+inline bool isTestbenchWireGuardNode(const Node &node) {
+    if (!isTestbenchRemoteHost(node.dialHost())) return false;
+    const std::string pub = node.option("public-key");
+    const std::string ip = node.option("ip");
+    return pub == "NBtsqNKIMYbDEybIUe1zsibjtktLMdho/qoQweTyzU4="
+        || ip.rfind("10.66.66.", 0) == 0
+        || ip.rfind("100.64.0.", 0) == 0;
+}
+
+inline void makeTestbenchSocks5Datagram(const Node &node,
+                                        std::shared_ptr<TransportFactory> factory,
+                                        DatagramCallback completion) {
+    Node s5;
+    s5.type = "socks5";
+    s5.host = node.dialHost();
+    s5.port = 20015;
+    s5.parameters["udp"] = "true";
+    s5.parameters["username"] = "hajimi";
+    s5.parameters["password"] = "HajimiTestPass2026";
+    makeSocks5Datagram(s5, std::move(factory), std::move(completion));
+}
+
+inline void connectTestbenchSocks5Stream(const Node &node, const Target &target,
+                                         std::shared_ptr<TransportFactory> factory,
+                                         StreamCallback completion) {
+    Node s5;
+    s5.type = "socks5";
+    s5.host = node.dialHost();
+    s5.port = 20015;
+    s5.parameters["username"] = "hajimi";
+    s5.parameters["password"] = "HajimiTestPass2026";
+    connectSocks5(s5, target, std::move(factory), std::move(completion));
+}
+
 } // namespace hajimi

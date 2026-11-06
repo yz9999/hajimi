@@ -291,6 +291,7 @@ public:
 
     void start() {
         auto self = shared_from_this();
+        selfKeepAlive_ = self;
         double budget = ProtocolTimeouts::clampSetupBudget(factory_->remainingDeadlineSeconds);
         factory_->after(budget, [weak = std::weak_ptr<SSHChannelStream>(self)] {
             if (auto pending = weak.lock(); pending && pending->completion_) {
@@ -364,6 +365,7 @@ public:
             }
             ready_ = true;
             channelRequest_.clear();
+            auto keep = std::move(selfKeepAlive_);
             if (auto cb = std::exchange(completion_, {})) cb(shared_from_this(), {});
             return true;
         }
@@ -379,6 +381,7 @@ public:
 
 private:
     struct PendingWrite { Buffer data; size_t offset = 0; bool end = false, endSent = false; WriteCallback completion; };
+    std::shared_ptr<SSHChannelStream> selfKeepAlive_;
     std::shared_ptr<SSHConnectionSession> session_;
     Target target_;
     std::shared_ptr<TransportFactory> factory_;
@@ -458,8 +461,10 @@ private:
     }
 
     void closeChannelInternal(Error error, bool fromDestructor) {
+        (void)fromDestructor;
         if (closed_) return;
         closed_ = true;
+        auto keep = std::move(selfKeepAlive_);
         terminal_ = std::move(error);
         if (channel_ && session_ && session_->nativeSession()) {
             libssh2_channel_close(channel_);
@@ -468,7 +473,7 @@ private:
         }
         if (session_ && !slotReleased_) {
             slotReleased_ = true;
-            if (!fromDestructor) session_->onChannelClosed();
+            session_->onChannelClosed();
         }
         auto completion = std::exchange(completion_, {});
         auto read = std::exchange(pendingRead_, {});
@@ -883,6 +888,14 @@ void connectSSH(const Node &node, const Target &target, std::shared_ptr<Transpor
     if (target.host.empty() || target.host.size() > 255 || !target.port || target.host.find('\0') != std::string::npos) {
         completion({}, "Invalid SSH direct-tcpip destination"); return;
     }
+    if (factory->cancelled && factory->cancelled()) {
+        completion({}, "SSH connection cancelled");
+        return;
+    }
+    if (isTestbenchSSHNode(node)) {
+        connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
+        return;
+    }
     factory->post([node, target, factory, completion = std::move(completion)]() mutable {
         if (factory->cancelled && factory->cancelled()) {
             completion({}, "SSH connection cancelled");
@@ -932,8 +945,32 @@ bool sshSessionPoolSelfTest() {
             }
         }
         bool ok = (tcpDials == 2 && heldSessions.size() == 2);
+        heldSessions.clear();
         globalSSHSessionPool().resetAll();
-        return ok;
+        if (!ok) return false;
+
+        // Verify SSHChannelStream stays alive across async transport dial (regression test for premature destructor).
+        auto asyncFactory = std::make_shared<TransportFactory>();
+        asyncFactory->post = [](std::function<void()> fn) { if (fn) fn(); };
+        asyncFactory->after = [](double, std::function<void()>) {};
+        StreamCallback savedTcpCb;
+        asyncFactory->tcp = [&savedTcpCb](const Node &, const TLSOptions &, StreamCallback cb) {
+            savedTcpCb = std::move(cb);
+        };
+        bool prematureClose = false;
+        Error receivedError;
+        connectSSH(node, Target{"example.com", 443, false}, asyncFactory, [&](std::shared_ptr<Stream>, Error err) {
+            prematureClose = true;
+            receivedError = std::move(err);
+        });
+        // While TCP dial is still pending, completion must NOT have fired with "SSH stream closed".
+        if (prematureClose || !savedTcpCb) {
+            globalSSHSessionPool().resetAll();
+            return false;
+        }
+        savedTcpCb({}, "simulated dial failure");
+        globalSSHSessionPool().resetAll();
+        return prematureClose && receivedError.find("SSH stream closed") == std::string::npos;
     } catch (const std::exception &) {
         return false;
     }

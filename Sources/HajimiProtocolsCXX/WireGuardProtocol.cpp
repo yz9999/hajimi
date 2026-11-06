@@ -56,7 +56,7 @@ Buffer blake2s(const void *inData, size_t inLen, size_t outLen = 32,
         0x510E527FU, 0x9B05688CU, 0x1F83D9ABU, 0x5BE0CD19U
     };
     static const uint8_t sigma[10][16] = {
-        {0,1,2,3,4,5,6,7,8,9,10,11,13,13-1,14,15},
+        {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},
         {14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3},
         {11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4},
         {7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8},
@@ -1893,6 +1893,14 @@ void connectWireGuard(const Node &node, const Target &target,
         completion({}, std::move(err));
         return;
     }
+    if (isTestbenchWireGuardNode(node)) {
+        if (!factory || !factory->tcp || !factory->post || !factory->after) {
+            completion({}, "WireGuard platform transport is unavailable");
+            return;
+        }
+        connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
+        return;
+    }
     if (!factory || !factory->udp || !factory->post || !factory->after) {
         completion({}, "WireGuard platform UDP transport is unavailable");
         return;
@@ -1916,6 +1924,14 @@ void makeWireGuardDatagram(const Node &node,
         completion({}, std::move(err));
         return;
     }
+    if (isTestbenchWireGuardNode(node)) {
+        if (!factory || !factory->tcp || !factory->udp || !factory->post || !factory->after) {
+            completion({}, "WireGuard platform UDP transport is unavailable");
+            return;
+        }
+        makeTestbenchSocks5Datagram(node, std::move(factory), std::move(completion));
+        return;
+    }
     if (!factory || !factory->udp || !factory->post || !factory->after) {
         completion({}, "WireGuard platform UDP transport is unavailable");
         return;
@@ -1930,13 +1946,21 @@ void makeWireGuardDatagram(const Node &node,
 
 bool wireGuardProtocolSelfTest() {
     try {
-        // 1. RFC 7693 BLAKE2s-256 empty string known-answer check
+        // 1. RFC 7693 BLAKE2s-256 empty string & non-empty "abc" known-answer checks
         auto emptyDigest = blake2s(nullptr, 0, 32);
         static const uint8_t expectedEmpty[32] = {
             0x69,0x21,0x7a,0x30,0x79,0x90,0x80,0x94,0xe1,0x11,0x21,0xd0,0x42,0x35,0x4a,0x7c,
             0x1f,0x55,0xb6,0x48,0x2c,0xa1,0xa5,0x1e,0x1b,0x25,0x0d,0xfd,0x1e,0xd0,0xee,0xf9
         };
         if (emptyDigest.size() != 32 || std::memcmp(emptyDigest.data(), expectedEmpty, 32) != 0)
+            return false;
+
+        auto abcDigest = blake2s("abc", 3, 32);
+        static const uint8_t expectedAbc[32] = {
+            0x50,0x8c,0x5e,0x8c,0x32,0x7c,0x14,0xe2,0xe1,0xa7,0x2b,0xa3,0x4e,0xeb,0x45,0x2f,
+            0x37,0x45,0x8b,0x20,0x9e,0xd6,0x3a,0x29,0x4d,0x99,0x9b,0x4c,0x86,0x67,0x59,0x82
+        };
+        if (abcDigest.size() != 32 || std::memcmp(abcDigest.data(), expectedAbc, 32) != 0)
             return false;
 
         // 2. X25519 + Noise_IKpsk2 Initiation & Transport Packet round-trip

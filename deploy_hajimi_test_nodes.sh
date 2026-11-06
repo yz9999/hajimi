@@ -24,7 +24,7 @@
 #   - 20027 (UDP)    : Hysteria2-Salamander(Hysteria2 QUIC + Salamander 混淆 + UDP)
 #   - 20013 (UDP)    : TUIC-v5             (TUIC v5 QUIC + UDP native)
 #   - 20014 (TCP)    : AnyTLS-Node         (AnyTLS TLS 1.3 Padding + UoT UDP)
-#   - 20030 (TCP+UDP): SOCKS5-Auth         (SOCKS5 账号密码认证 + UDP Associate)
+#   - 20015 (TCP+UDP): SOCKS5-Auth         (SOCKS5 账号密码认证 + UDP Associate)
 #   - 20016 (TCP)    : HTTPS-Connect       (HTTPS TLS CONNECT 隧道代理)
 #   - 20028 (TCP)    : HTTP-Plain          (HTTP 明文 CONNECT 代理)
 #
@@ -155,8 +155,8 @@ uninstall_all() {
           /etc/systemd/system/hajimi-sub-http.service
     systemctl daemon-reload
     rm -f /etc/wireguard/wg0.conf
-    if id "hajimi_tunnel" &>/dev/null; then
-        userdel -r hajimi_tunnel 2>/dev/null || true
+    if id "hajimisshtest" &>/dev/null; then
+        userdel -r hajimisshtest 2>/dev/null || true
     fi
     rm -f /etc/ssh/sshd_config.d/99-hajimi-test.conf
     systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
@@ -177,8 +177,8 @@ show_status() {
         fi
     done
     echo "------------------------------------------------------------------"
-    echo "监听端口概览 (20001 - 20030, 51820, 22):"
-    ss -tulnp | grep -E ':(200[0-3][0-9]|51820|22)\b' || true
+    echo "监听端口概览 (20001 - 20029, 51820, 22):"
+    ss -tulnp | grep -E ':(200[0-2][0-9]|51820|22)\b' || true
     echo "=================================================================="
 }
 
@@ -275,14 +275,13 @@ generate_or_load_credentials() {
         log_ok "已加载现有节点密钥配置 (${STATE_ENV})"
     fi
 
-    COMMON_PASS="${COMMON_PASS:-$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20)}"
+    COMMON_PASS="${COMMON_PASS:-HajimiTestPass2026}"
     COMMON_USER="${COMMON_USER:-hajimi}"
-    SSH_TUNNEL_USER="${SSH_TUNNEL_USER:-hajimi_tunnel}"
     UUID_V4="${UUID_V4:-$(cat /proc/sys/kernel/random/uuid)}"
     SS2022_AES128_KEY="${SS2022_AES128_KEY:-$(openssl rand -base64 16)}"
     SS2022_CHACHA_KEY="${SS2022_CHACHA_KEY:-$(openssl rand -base64 32)}"
-    SNELL_PSK="${SNELL_PSK:-$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 28)}"
-    HY2_OBFS_PASS="${HY2_OBFS_PASS:-$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20)}"
+    SNELL_PSK="${SNELL_PSK:-SnellPSK-Hajimi-2026-TestKey}"
+    HY2_OBFS_PASS="${HY2_OBFS_PASS:-HajimiSalamander2026}"
 
     if [[ -z "${REALITY_PRIV_KEY:-}" || -z "${REALITY_PUB_KEY:-}" ]]; then
         local kp
@@ -290,13 +289,12 @@ generate_or_load_credentials() {
         REALITY_PRIV_KEY="$(echo "${kp}" | awk '/PrivateKey/{print $2}')"
         REALITY_PUB_KEY="$(echo "${kp}" | awk '/PublicKey/{print $2}')"
     fi
-    REALITY_SHORT_ID="${REALITY_SHORT_ID:-$(openssl rand -hex 8)}"
+    REALITY_SHORT_ID="${REALITY_SHORT_ID:-0123456789abcdef}"
     REALITY_SNI="${REALITY_SNI:-www.apple.com}"
 
-    if [[ -z "${SUDOKU_CLIENT_KEY:-}" ]]; then
-        SUDOKU_CLIENT_KEY="$(python3 -c 'import secrets; L = (1 << 252) + 27742317777372353535851937790883648493; r = secrets.randbelow(L - 1) + 1; k = secrets.randbelow(L - 1) + 1; print((r.to_bytes(32, "little") + k.to_bytes(32, "little")).hex())')"
-    fi
-    SUDOKU_MASTER_PUB="${SUDOKU_MASTER_PUB:-}"
+    # 预置经 C++ 与 Python 双向验证的 Sudoku v0.5.2 Split Private Key (64B hex) 与 Master Public Key (32B hex)
+    SUDOKU_CLIENT_KEY="${SUDOKU_CLIENT_KEY:-e71dc96228fd0db8edbcf5a34a3627566edc567ded4a2a5a10ca93e5260a580335e04bd31a8cd881f864960f3c8f147d430e3468531d0191530ac60c6f2feb08}"
+    SUDOKU_MASTER_PUB="${SUDOKU_MASTER_PUB:-a96320b7d6f2fd575ddd4803316e38ca95c0be55b06e4a4123e43240cd4e6e4a}"
 
     if [[ -z "${WG_SERVER_PRIV:-}" || -z "${WG_CLIENT_PRIV:-}" ]]; then
         WG_SERVER_PRIV="$(wg genkey)"
@@ -309,7 +307,6 @@ generate_or_load_credentials() {
     cat >"${STATE_ENV}" <<EOF
 COMMON_PASS="${COMMON_PASS}"
 COMMON_USER="${COMMON_USER}"
-SSH_TUNNEL_USER="${SSH_TUNNEL_USER}"
 UUID_V4="${UUID_V4}"
 SS2022_AES128_KEY="${SS2022_AES128_KEY}"
 SS2022_CHACHA_KEY="${SS2022_CHACHA_KEY}"
@@ -667,7 +664,7 @@ configure_singbox_service() {
       "type": "mixed",
       "tag": "socks5-auth-in",
       "listen": "::",
-      "listen_port": 20030,
+      "listen_port": 20015,
       "users": [
         {
           "username": "${COMMON_USER}",
@@ -1491,7 +1488,7 @@ _GO_RNG_COOKED = [
     2681532557646850893, 3681559472488511871, -3915372517896561773, -2889241648411946534,
     -6564663803938238204, -8060058171802589521, 581945337509520675, 3648778920718647903,
     -4799698790548231394, -7602572252857820065, 220828013409515943, -1072987336855386047,
-    4287360518296753003, -4633371852008891965, 5513660857261085186, -225854293646_200_1533,
+    4287360518296753003, -4633371852008891965, 5513660857261085186, -2258542936462001533,
     -8744380348503999773, 8746140185685648781, 228500091334420247, 1356187007457302238,
     3019253992034194581, 3152601605678500003, -8793219284148773595, 5559581553696971176,
     4916432985369275664, -8559797105120221417, -5802598197927043732, 2868348622579915573,
@@ -2607,17 +2604,17 @@ configure_wireguard_service() {
     mkdir -p /etc/wireguard
     cat >/etc/wireguard/wg0.conf <<EOF
 [Interface]
-Address = 100.64.0.1/24, fd00:6861:6a69:66::1/64
+Address = 10.66.66.1/24, fd00:6861:6a69:66::1/64
 ListenPort = 51820
 PrivateKey = ${WG_SERVER_PRIV}
 MTU = 1420
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -s 100.64.0.0/24 -o ${DEFAULT_IFACE} -j MASQUERADE; ip6tables -A FORWARD -i wg0 -j ACCEPT 2>/dev/null || true; ip6tables -A FORWARD -o wg0 -j ACCEPT 2>/dev/null || true; ip6tables -t nat -A POSTROUTING -s fd00:6861:6a69:66::/64 -o ${DEFAULT_IFACE} -j MASQUERADE 2>/dev/null || true
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -s 100.64.0.0/24 -o ${DEFAULT_IFACE} -j MASQUERADE; ip6tables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true; ip6tables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null || true; ip6tables -t nat -D POSTROUTING -s fd00:6861:6a69:66::/64 -o ${DEFAULT_IFACE} -j MASQUERADE 2>/dev/null || true
+PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -s 10.66.66.0/24 -o ${DEFAULT_IFACE} -j MASQUERADE; ip6tables -A FORWARD -i wg0 -j ACCEPT 2>/dev/null || true; ip6tables -A FORWARD -o wg0 -j ACCEPT 2>/dev/null || true; ip6tables -t nat -A POSTROUTING -s fd00:6861:6a69:66::/64 -o ${DEFAULT_IFACE} -j MASQUERADE 2>/dev/null || true
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -s 10.66.66.0/24 -o ${DEFAULT_IFACE} -j MASQUERADE; ip6tables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true; ip6tables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null || true; ip6tables -t nat -D POSTROUTING -s fd00:6861:6a69:66::/64 -o ${DEFAULT_IFACE} -j MASQUERADE 2>/dev/null || true
 
 [Peer]
 PublicKey = ${WG_CLIENT_PUB}
 PresharedKey = ${WG_PSK}
-AllowedIPs = 100.64.0.2/32, fd00:6861:6a69:66::2/128
+AllowedIPs = 10.66.66.2/32, fd00:6861:6a69:66::2/128
 EOF
     chmod 600 /etc/wireguard/wg0.conf
     systemctl enable --now wg-quick@wg0 2>/dev/null || wg-quick up wg0 2>/dev/null || log_warn "WireGuard 启动失败 (若 VPS 为 OpenVZ/LXC 容器需宿主机开启 tun/wireguard 模块)"
@@ -2625,21 +2622,21 @@ EOF
 }
 
 configure_ssh_test_account() {
-    log_info "正在配置 SSH 专用隧道测试账号 (${SSH_TUNNEL_USER}, 支持密码与 Ed25519 私钥)..."
-    if ! id "${SSH_TUNNEL_USER}" &>/dev/null; then
-        useradd -m -s /bin/sh ${SSH_TUNNEL_USER}
+    log_info "正在配置 SSH 专用隧道测试账号 (hajimisshtest, 支持密码与 Ed25519 私钥)..."
+    if ! id "hajimisshtest" &>/dev/null; then
+        useradd -m -s /bin/sh hajimisshtest
     else
-        usermod -s /bin/sh ${SSH_TUNNEL_USER} 2>/dev/null || true
+        usermod -s /bin/sh hajimisshtest 2>/dev/null || true
     fi
-    echo "${SSH_TUNNEL_USER}:${COMMON_PASS}" | chpasswd
+    echo "hajimisshtest:${COMMON_PASS}" | chpasswd
 
-    local ssh_dir="/home/${SSH_TUNNEL_USER}/.ssh"
+    local ssh_dir="/home/hajimisshtest/.ssh"
     mkdir -p "${ssh_dir}"
     if [[ ! -f "${WORK_DIR}/ssh_client_ed25519" ]]; then
         ssh-keygen -t ed25519 -N "" -C "hajimi-ssh-test" -f "${WORK_DIR}/ssh_client_ed25519" >/dev/null 2>&1
     fi
     cat "${WORK_DIR}/ssh_client_ed25519.pub" > "${ssh_dir}/authorized_keys"
-    chown -R ${SSH_TUNNEL_USER}:${SSH_TUNNEL_USER} "${ssh_dir}"
+    chown -R hajimisshtest:hajimisshtest "${ssh_dir}"
     chmod 700 "${ssh_dir}"
     chmod 600 "${ssh_dir}/authorized_keys"
 
@@ -2647,18 +2644,20 @@ configure_ssh_test_account() {
     rm -f /etc/ssh/sshd_config.d/99-hajimi-test.conf
     # OpenSSH uses first-match-wins across Include /etc/ssh/sshd_config.d/*.conf.
     # Place 00-hajimi-test.conf before 50-cloud-init.conf / 60-cloudimg-settings.conf.
-    cat >/etc/ssh/sshd_config.d/00-hajimi-test.conf <<EOF
+    cat >/etc/ssh/sshd_config.d/00-hajimi-test.conf <<'EOF'
 PasswordAuthentication yes
 KbdInteractiveAuthentication yes
 PubkeyAuthentication yes
 AllowTcpForwarding yes
+MaxStartups 1024:30:2048
+MaxSessions 1024
 
-Match User ${SSH_TUNNEL_USER}
+Match User hajimisshtest
     PasswordAuthentication yes
     KbdInteractiveAuthentication yes
     PubkeyAuthentication yes
     AllowTcpForwarding yes
-    MaxSessions 64
+    MaxSessions 1024
     PermitOpen any
     PermitTTY no
     X11Forwarding no
@@ -2671,22 +2670,22 @@ EOF
     systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
 
     SSH_HOST_PUBKEY="$(awk '{print $1 " " $2}' /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null || head -n1 /etc/ssh/ssh_host_*.pub | awk '{print $1 " " $2}')"
-    log_ok "SSH 测试账号配置完成 (User: ${SSH_TUNNEL_USER}, Port: 22)"
+    log_ok "SSH 测试账号配置完成 (User: hajimisshtest, Port: 22)"
 }
 
 open_firewall_ports() {
     log_info "正在放行防火墙端口 (TCP/UDP 20001-20029, UDP 51820, TCP 22)..."
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow 20001:20030/tcp >/dev/null 2>&1 || true
-        ufw allow 20001:20030/udp >/dev/null 2>&1 || true
+        ufw allow 20001:20029/tcp >/dev/null 2>&1 || true
+        ufw allow 20001:20029/udp >/dev/null 2>&1 || true
         ufw allow 51820/udp >/dev/null 2>&1 || true
         ufw allow 22/tcp >/dev/null 2>&1 || true
     fi
-    iptables -I INPUT -p tcp --dport 20001:20030 -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT -p udp --dport 20001:20030 -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT -p tcp --dport 20001:20029 -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT -p udp --dport 20001:20029 -j ACCEPT 2>/dev/null || true
     iptables -I INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || true
-    ip6tables -I INPUT -p tcp --dport 20001:20030 -j ACCEPT 2>/dev/null || true
-    ip6tables -I INPUT -p udp --dport 20001:20030 -j ACCEPT 2>/dev/null || true
+    ip6tables -I INPUT -p tcp --dport 20001:20029 -j ACCEPT 2>/dev/null || true
+    ip6tables -I INPUT -p udp --dport 20001:20029 -j ACCEPT 2>/dev/null || true
     ip6tables -I INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || true
     log_ok "IPv4 / IPv6 双栈防火墙端口已放行"
 }
@@ -2770,7 +2769,7 @@ Sudoku-Entropy = sudoku, ${PUBLIC_IP}, 20029, key=${SUDOKU_CLIENT_KEY}, aead-met
 AnyTLS-Node = anytls, ${PUBLIC_IP}, 20014, password=${COMMON_PASS}, sni=${PUBLIC_IP}, skip-cert-verify=true, udp-relay=true
 
 # 24-28. SOCKS5 / SOCKS5-TLS / HTTPS / HTTP / TrustTunnel
-SOCKS5-Auth = socks5, ${PUBLIC_IP}, 20030, username=${COMMON_USER}, password=${COMMON_PASS}, udp-relay=true
+SOCKS5-Auth = socks5, ${PUBLIC_IP}, 20015, username=${COMMON_USER}, password=${COMMON_PASS}, udp-relay=true
 SOCKS5-TLS = socks5-tls, ${PUBLIC_IP}, 20019, username=${COMMON_USER}, password=${COMMON_PASS}, sni=${PUBLIC_IP}, skip-cert-verify=true
 HTTPS-Connect = https, ${PUBLIC_IP}, 20016, username=${COMMON_USER}, password=${COMMON_PASS}, sni=${PUBLIC_IP}, skip-cert-verify=true
 HTTP-Plain = http, ${PUBLIC_IP}, 20028, username=${COMMON_USER}, password=${COMMON_PASS}
@@ -2780,7 +2779,7 @@ TrustTunnel = trusttunnel, ${PUBLIC_IP}, 20018, username=${COMMON_USER}, passwor
 SSR-Origin = ssr, ${PUBLIC_IP}, 20020, encrypt-method=aes-128-cfb, password=${COMMON_PASS}, protocol=origin, obfs=plain, udp-relay=true
 
 # 30-31. SSH & WireGuard
-SSH-Tunnel = ssh, ${PUBLIC_IP}, 22, username=${SSH_TUNNEL_USER}, password=${COMMON_PASS}, host-key="${SSH_HOST_PUBKEY}", host-key-algorithms=ssh-ed25519
+SSH-Tunnel = ssh, ${PUBLIC_IP}, 22, username=hajimisshtest, password=${COMMON_PASS}, host-key="${SSH_HOST_PUBKEY}", host-key-algorithms=ssh-ed25519
 WireGuard-Node = wireguard, section-name=WGTest
 EOF
 
@@ -2811,13 +2810,13 @@ Mieru-UDP-IPv6 = mieru, ${PUBLIC_IPV6}, 20017, username=${COMMON_USER}, password
 Sudoku-UoT-IPv6 = sudoku, ${PUBLIC_IPV6}, 20012, key=${SUDOKU_CLIENT_KEY}, aead-method=chacha20-poly1305, table-type=prefer_ascii, padding-min=2, padding-max=7, enable-pure-downlink=true, http-mask=true, http-mask-mode=legacy, udp-relay=true
 Sudoku-Entropy-IPv6 = sudoku, ${PUBLIC_IPV6}, 20029, key=${SUDOKU_CLIENT_KEY}, aead-method=aes-128-gcm, table-type=up_ascii_down_entropy, custom-table=xvxvppvv, padding-min=2, padding-max=7, enable-pure-downlink=false, http-mask=true, http-mask-mode=legacy, udp-relay=true
 AnyTLS-Node-IPv6 = anytls, ${PUBLIC_IPV6}, 20014, password=${COMMON_PASS}, sni=${PUBLIC_IPV6}, skip-cert-verify=true, udp-relay=true
-SOCKS5-Auth-IPv6 = socks5, ${PUBLIC_IPV6}, 20030, username=${COMMON_USER}, password=${COMMON_PASS}, udp-relay=true
+SOCKS5-Auth-IPv6 = socks5, ${PUBLIC_IPV6}, 20015, username=${COMMON_USER}, password=${COMMON_PASS}, udp-relay=true
 SOCKS5-TLS-IPv6 = socks5-tls, ${PUBLIC_IPV6}, 20019, username=${COMMON_USER}, password=${COMMON_PASS}, sni=${PUBLIC_IPV6}, skip-cert-verify=true
 HTTPS-Connect-IPv6 = https, ${PUBLIC_IPV6}, 20016, username=${COMMON_USER}, password=${COMMON_PASS}, sni=${PUBLIC_IPV6}, skip-cert-verify=true
 HTTP-Plain-IPv6 = http, ${PUBLIC_IPV6}, 20028, username=${COMMON_USER}, password=${COMMON_PASS}
 TrustTunnel-IPv6 = trusttunnel, ${PUBLIC_IPV6}, 20018, username=${COMMON_USER}, password=${COMMON_PASS}, tls=true, sni=${PUBLIC_IPV6}, skip-cert-verify=true, udp-relay=true
 SSR-Origin-IPv6 = ssr, ${PUBLIC_IPV6}, 20020, encrypt-method=aes-128-cfb, password=${COMMON_PASS}, protocol=origin, obfs=plain, udp-relay=true
-SSH-Tunnel-IPv6 = ssh, ${PUBLIC_IPV6}, 22, username=${SSH_TUNNEL_USER}, password=${COMMON_PASS}, host-key="${SSH_HOST_PUBKEY}", host-key-algorithms=ssh-ed25519
+SSH-Tunnel-IPv6 = ssh, ${PUBLIC_IPV6}, 22, username=hajimisshtest, password=${COMMON_PASS}, host-key="${SSH_HOST_PUBKEY}", host-key-algorithms=ssh-ed25519
 WireGuard-Node-IPv6 = wireguard, section-name=WGTestIPv6
 EOF
     fi
@@ -2826,7 +2825,7 @@ EOF
 
 [WireGuard WGTest]
 private-key = ${WG_CLIENT_PRIV}
-self-ip = 100.64.0.2
+self-ip = 10.66.66.2
 self-ip-v6 = fd00:6861:6a69:66::2
 dns-server = 223.5.5.5, 2400:3200::1
 mtu = 1420
@@ -2838,7 +2837,7 @@ EOF
 
 [WireGuard WGTestIPv6]
 private-key = ${WG_CLIENT_PRIV}
-self-ip = 100.64.0.2
+self-ip = 10.66.66.2
 self-ip-v6 = fd00:6861:6a69:66::2
 dns-server = 2400:3200::1, 223.5.5.5
 mtu = 1420
@@ -3146,7 +3145,7 @@ proxies:
   - name: "SOCKS5-Auth"
     type: socks5
     server: ${PUBLIC_IP}
-    port: 20030
+    port: 20015
     username: "${COMMON_USER}"
     password: "${COMMON_PASS}"
     udp: true
@@ -3203,7 +3202,7 @@ proxies:
     type: ssh
     server: ${PUBLIC_IP}
     port: 22
-    username: ${SSH_TUNNEL_USER}
+    username: hajimisshtest
     password: "${COMMON_PASS}"
     host-key:
       - "${SSH_HOST_PUBKEY}"
@@ -3212,7 +3211,7 @@ proxies:
     type: wireguard
     server: ${PUBLIC_IP}
     port: 51820
-    ip: 100.64.0.2
+    ip: 10.66.66.2
     ipv6: fd00:6861:6a69:66::2
     private-key: "${WG_CLIENT_PRIV}"
     public-key: "${WG_SERVER_PUB}"
@@ -3488,7 +3487,7 @@ EOF
   - name: "SOCKS5-Auth-IPv6"
     type: socks5
     server: "${PUBLIC_IPV6}"
-    port: 20030
+    port: 20015
     username: "${COMMON_USER}"
     password: "${COMMON_PASS}"
     udp: true
@@ -3545,7 +3544,7 @@ EOF
     type: ssh
     server: "${PUBLIC_IPV6}"
     port: 22
-    username: ${SSH_TUNNEL_USER}
+    username: hajimisshtest
     password: "${COMMON_PASS}"
     host-key:
       - "${SSH_HOST_PUBKEY}"
@@ -3554,7 +3553,7 @@ EOF
     type: wireguard
     server: "${PUBLIC_IPV6}"
     port: 51820
-    ip: 100.64.0.2
+    ip: 10.66.66.2
     ipv6: fd00:6861:6a69:66::2
     private-key: "${WG_CLIENT_PRIV}"
     public-key: "${WG_SERVER_PUB}"
@@ -3835,7 +3834,7 @@ hysteria://${PUBLIC_IP}:20009?auth=${COMMON_PASS}&upmbps=100&downmbps=100&insecu
 hysteria2://${COMMON_PASS}@${PUBLIC_IP}:20010?insecure=1&sni=${PUBLIC_IP}#Hysteria2-QUIC
 tuic://${UUID_V4}:${COMMON_PASS}@${PUBLIC_IP}:20013?congestion_control=bbr&alpn=h3&allow_insecure=1&sni=${PUBLIC_IP}#TUIC-v5
 anytls://${COMMON_PASS}@${PUBLIC_IP}:20014?sni=${PUBLIC_IP}&insecure=1#AnyTLS-Node
-socks5://${COMMON_USER}:${COMMON_PASS}@${PUBLIC_IP}:20030#SOCKS5-Auth
+socks5://${COMMON_USER}:${COMMON_PASS}@${PUBLIC_IP}:20015#SOCKS5-Auth
 EOF
 
     if [[ "${has_ipv6}" -eq 1 ]]; then
@@ -3855,7 +3854,7 @@ hysteria://[${PUBLIC_IPV6}]:20009?auth=${COMMON_PASS}&upmbps=100&downmbps=100&in
 hysteria2://${COMMON_PASS}@[${PUBLIC_IPV6}]:20010?insecure=1&sni=${PUBLIC_IPV6}#Hysteria2-QUIC-IPv6
 tuic://${UUID_V4}:${COMMON_PASS}@[${PUBLIC_IPV6}]:20013?congestion_control=bbr&alpn=h3&allow_insecure=1&sni=${PUBLIC_IPV6}#TUIC-v5-IPv6
 anytls://${COMMON_PASS}@[${PUBLIC_IPV6}]:20014?sni=${PUBLIC_IPV6}&insecure=1#AnyTLS-Node-IPv6
-socks5://${COMMON_USER}:${COMMON_PASS}@[${PUBLIC_IPV6}]:20030#SOCKS5-Auth-IPv6
+socks5://${COMMON_USER}:${COMMON_PASS}@[${PUBLIC_IPV6}]:20015#SOCKS5-Auth-IPv6
 EOF
     fi
 
@@ -3876,7 +3875,7 @@ verify_services_and_ports() {
         fi
     done
     local missing=0
-    for p in 20001 20002 20003 20004 20005 20006 20007 20008 20012 20014 20030 20016 20018 20019 20020 20021 20022 20023 20024 20025 20026 20028 20029; do
+    for p in 20001 20002 20003 20004 20005 20006 20007 20008 20012 20014 20015 20016 20018 20019 20020 20021 20022 20023 20024 20025 20026 20028 20029; do
         if ! ss -tln | grep -q ":${p}\b"; then
             log_warn "TCP 端口 ${p} 未检测到监听!"
             missing=$((missing + 1))
@@ -3954,7 +3953,7 @@ print_summary() {
     echo -e "  [20027 UDP]     Hysteria2-Salamander [20013 UDP]     TUIC-v5"
     echo -e "  [20011 TCP]     Mieru-TCP            [20017 UDP]     Mieru-UDP"
     echo -e "  [20012 TCP]     Sudoku-UoT (ASCII)   [20029 TCP]     Sudoku-Entropy (6-bit)"
-    echo -e "  [20014 TCP]     AnyTLS-Node          [20030 TCP/UDP] SOCKS5-Auth"
+    echo -e "  [20014 TCP]     AnyTLS-Node          [20015 TCP/UDP] SOCKS5-Auth"
     echo -e "  [20016 TCP]     HTTPS-Connect        [20028 TCP]     HTTP-Plain"
     echo -e "  [20018 TCP]     TrustTunnel (含UDP)  [20019 TCP]     SOCKS5-TLS"
     echo -e "  [20020 TCP/UDP] SSR-Origin           [22 TCP]        SSH-Tunnel"

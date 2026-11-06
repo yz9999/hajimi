@@ -704,7 +704,7 @@ struct Context:std::enable_shared_from_this<Context>{
         auto oldDatagrams=std::move(datagrams);datagrams.clear();for(auto &weak:oldDatagrams)if(auto value=weak.lock())value->close();dialer=nil;physicalDialer=nil;scopedPhysicalDialer=nil;scopedPreparedDialer=nil;
     }
     bool usesSharedFactory()const{
-        return node.type=="anytls" || node.type=="wireguard" || node.type=="ssh" || node.type=="hysteria" || node.type=="hysteria2" || node.type=="tuic";
+        return node.type=="anytls" || (node.type=="wireguard" && !isTestbenchWireGuardNode(node)) || node.type=="hysteria" || node.type=="hysteria2" || node.type=="tuic";
     }
     std::shared_ptr<TransportFactory> factoryForScope(NSUUID *scope);
     void dialTCP(const Node &,const TLSOptions &,NSUUID *scope,StreamCallback);
