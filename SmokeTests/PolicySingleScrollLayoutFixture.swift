@@ -72,7 +72,7 @@ private final class PolicyPageFixture: NSObject, NSCollectionViewDataSource, NSC
                 ? "香港 · 超长节点名称 / 跨境办公专用线路 0123456789" : "🇺🇸 美国 \(index + 1)"
             profile.proxyOrder.append(name)
             profile.proxies[name] = ProxyPolicy(name: name, kind: .external,
-                host: index == 0 ? "2406:da18:45ac:1d02:0123:4567:89ab:cdef" : "203.0.113.\(index + 1)",
+                host: index == 0 ? "2001:db8:45ac:1d02:0123:4567:89ab:cdef" : "203.0.113.\(index + 1)",
                 port: 443, adapterType: "vmess", parameters: ["uuid": "11111111-2222-3333-4444-555555555555"])
             nodeLatencies[name] = .success(index == 0 ? 61 : 180 + index * 11)
         }

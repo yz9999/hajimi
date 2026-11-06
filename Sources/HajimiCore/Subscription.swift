@@ -472,15 +472,6 @@ public enum SubscriptionDocument {
             fields[2] = String(port)
             fields[3] = "username=\(user)"
         }
-        let hasHostKey = fields.dropFirst(3).contains {
-            $0.lowercased().hasPrefix("host-key=")
-        }
-        let hasSkipVerify = fields.dropFirst(3).contains {
-            $0.lowercased().hasPrefix("skip-cert-verify=")
-        }
-        if !hasHostKey && !hasSkipVerify {
-            fields.append("skip-cert-verify=true")
-        }
         return fields.joined(separator: ", ")
     }
 

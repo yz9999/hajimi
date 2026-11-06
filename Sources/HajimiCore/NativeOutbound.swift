@@ -407,39 +407,8 @@ public enum NativeOutboundFactory {
                   "原生 UDP 可能绕过声明的 TCP 代理链")
     }
 
-    private static func isTestbenchDirectFallbackPolicy(_ policy: ProxyPolicy) -> Bool {
-        guard let host = policy.host,
-              !["127.0.0.1", "localhost", "::1", "fixture.invalid", "node.scope.invalid"].contains(host.lowercased()) else {
-            return false
-        }
-        let adapter = policy.adapterType?.lowercased() ?? ""
-        switch adapter {
-        case "snell":
-            return policy.parameters["psk"] == "SnellPSK-Hajimi-2026-TestKey"
-                || policy.parameters["psk"] == "HajimiSnellPSK2026xxxx"
-        case "wireguard":
-            let ip = policy.parameters["ip"] ?? policy.parameters["self-ip"] ?? policy.parameters["address"] ?? ""
-            return policy.parameters["pre-shared-key"] == "NBtsqNKIMYbDEybIUe1zsibjtktLMdho/qoQweTyzU4="
-                || ip.hasPrefix("10.66.66.")
-        case "ssh":
-            let user = policy.parameters["username"] ?? policy.parameters["user"] ?? policy.username ?? ""
-            return user == "hajimisshtest" || user == "hajimi_ssh"
-        case "ssr", "shadowsocksr":
-            return policy.port == 20020 && (policy.parameters["password"] ?? policy.password) == "HajimiTestPass2026"
-        case "trusttunnel":
-            return policy.port == 20018 && (policy.parameters["password"] ?? policy.password) == "HajimiTestPass2026"
-        case "sudoku":
-            let key = policy.parameters["key"] ?? policy.parameters["password"] ?? policy.password ?? ""
-            return key == "e71dc96228fd0db8edbcf5a34a3627566edc567ded4a2a5a10ca93e5260a580335e04bd31a8cd881f864960f3c8f147d430e3468531d0191530ac60c6f2feb08"
-                || key == "ecc252229625d277519c97b329d3f3d33b1184c96f49e8a9c00e26f9045a289b"
-        default:
-            return false
-        }
-    }
-
     public static func supportsUDP(_ policy: ProxyPolicy) -> Bool {
         guard supports(policy) else { return false }
-        if isTestbenchDirectFallbackPolicy(policy) { return false }
         if MuxApplicability.isEnabled(for: policy) { return true }
         if usesVisionXUDP(policy) { return true }
         guard NativeCXXOutbound.validationError(for: policy, udp: true) == nil else { return false }
@@ -482,7 +451,6 @@ public enum NativeOutboundFactory {
         // a browser would retry QUIC until it declared the network down. Steer
         // UDP/443 to TCP instead, as for the stream-only outbounds.
         if isShadowsocks2022(policy) { return !supportsUDP(policy) && supports(policy) }
-        if isTestbenchDirectFallbackPolicy(policy) { return supports(policy) }
         guard supportsUDP(policy) else { return false }
         if MuxApplicability.isEnabled(for: policy) { return true }
         let type = policy.adapterType?.lowercased() ?? ""
@@ -776,7 +744,6 @@ public enum NativeOutboundFactory {
     }
 
     private static func cppPreparedDialer(for policy: ProxyPolicy, queue: DispatchQueue) -> NativeCXXPreparedTransportDialer? {
-        if isTestbenchDirectFallbackPolicy(policy) { return nil }
         let adapter = policy.adapterType?.lowercased() ?? ""
         let hasChainedUnderlying: Bool = {
             guard underlyingName(policy) != nil else { return false }
@@ -1155,7 +1122,6 @@ public enum NativeOutboundFactory {
     }
 
     private static func chainValidationError(for policy: ProxyPolicy) -> String? {
-        if isTestbenchDirectFallbackPolicy(policy) { return nil }
         policyLock.lock(); let snapshot = configuredPolicies; policyLock.unlock()
         return chainValidationError(for: policy, in: snapshot)
     }

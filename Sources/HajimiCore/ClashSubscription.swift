@@ -743,8 +743,8 @@ public enum ClashSubscription {
                 copy("host-key-algorithms")
             }
             copyBool("skip-cert-verify")
-            if parameters["host-key"] == nil && parameters["skip-cert-verify"] == nil {
-                parameters["skip-cert-verify"] = "true"
+            if parameters["host-key"] == nil && !boolean(parameters["skip-cert-verify"] ?? "") {
+                return .failure("SSH 节点缺少 host-key（请补充 host-key 或显式配置 skip-cert-verify: true）")
             }
         case "socks5", "socks5-tls":
             copy("username"); copy("password")

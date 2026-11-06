@@ -341,63 +341,11 @@ final class TCPNodeLatencyProbe {
         return network == "kcp" || network == "mkcp"
     }
 
-    static func testbenchFallbackPort(for policy: ProxyPolicy) -> UInt16? {
-        guard let rawHost = policy.host else { return nil }
-        var h = rawHost.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if h.hasPrefix("["), h.hasSuffix("]"), h.count >= 2 { h = String(h.dropFirst().dropLast()) }
-        if h.contains(":"), let pct = h.firstIndex(of: "%") { h = String(h[..<pct]) }
-        if h.isEmpty || h == "127.0.0.1" || h == "localhost" || h == "::1" ||
-           h == "fixture.invalid" || h == "node.scope.invalid" ||
-           h.hasPrefix("127.") || h.hasPrefix("192.0.2.") ||
-           h.hasPrefix("198.51.100.") || h.hasPrefix("203.0.113.") ||
-           h.hasPrefix("2001:db8:") || h.hasPrefix("2001:0db8:") ||
-           h.contains(".invalid") || h.contains(".example") {
-            return nil
-        }
-        let type = (policy.adapterType ?? "").lowercased()
-        let port = policy.port ?? 0
-        switch type {
-        case "snell":
-            let psk = policy.parameters["psk"] ?? ""
-            if port == 20003 || psk == "SnellPSK-Hajimi-2026-TestKey" || psk == "HajimiSnellPSK2026xxxx" {
-                return 20015
-            }
-        case "sudoku":
-            let key = policy.parameters["key"] ?? policy.parameters["password"] ?? policy.password ?? ""
-            if port == 20012 || port == 20029 ||
-               key == "e71dc96228fd0db8edbcf5a34a3627566edc567ded4a2a5a10ca93e5260a580335e04bd31a8cd881f864960f3c8f147d430e3468531d0191530ac60c6f2feb08" ||
-               key == "ecc252229625d277519c97b329d3f3d33b1184c96f49e8a9c00e26f9045a289b" {
-                return 20015
-            }
-        case "trusttunnel":
-            let user = policy.parameters["username"] ?? policy.username ?? ""
-            let pass = policy.parameters["password"] ?? policy.password ?? ""
-            if port == 20018 && user == "hajimi" && pass == "HajimiTestPass2026" {
-                return 20015
-            }
-        case "socks5-tls", "socks5":
-            let isTLS = type == "socks5-tls" || ["true", "1", "yes", "on"].contains((policy.parameters["tls"] ?? "").lowercased())
-            let user = policy.parameters["username"] ?? policy.username ?? ""
-            let pass = policy.parameters["password"] ?? policy.password ?? ""
-            if isTLS && port == 20019 && user == "hajimi" && pass == "HajimiTestPass2026" {
-                return 20015
-            }
-        case "ssr", "shadowsocksr":
-            let pass = policy.parameters["password"] ?? policy.password ?? ""
-            if port == 20020 && pass == "HajimiTestPass2026" {
-                return 20015
-            }
-        default:
-            break
-        }
-        return nil
-    }
-
     @discardableResult
-    static func measure(host: String, port: UInt16, udp: Bool = false, fallbackPort: UInt16? = nil,
+    static func measure(host: String, port: UInt16, udp: Bool = false,
                         timeout: TimeInterval = 4, scheduler: ProbeScheduler = userScheduler,
                         completion: @escaping (Result<Int, Error>) -> Void) -> ProbeScheduler.Ticket {
-        let operation = Operation(host: host, port: port, udp: udp, fallbackPort: fallbackPort, completion: completion)
+        let operation = Operation(host: host, port: port, udp: udp, completion: completion)
         return scheduler.submit(timeout: timeout, callbackQueue: .main, start: operation.start) {
             completion(.failure($0))
         }
@@ -409,21 +357,17 @@ final class TCPNodeLatencyProbe {
         let host: String
         let port: UInt16
         let udp: Bool
-        let fallbackPort: UInt16?
         let completion: (Result<Int, Error>) -> Void
         var connection: NodeTCPAddressProbe?
-        var fallbackConnection: NodeTCPAddressProbe?
         var udpProbe: UDPNodeAddressProbe?
         var resolverID: UUID?
-        var pendingTCPCount = 0
         var finished = false
         var lease: ProbeScheduler.Lease?
         var started: UInt64 = 0
 
-        init(host: String, port: UInt16, udp: Bool, fallbackPort: UInt16? = nil,
+        init(host: String, port: UInt16, udp: Bool,
              completion: @escaping (Result<Int, Error>) -> Void) {
-            self.host = host; self.port = port; self.udp = udp
-            self.fallbackPort = fallbackPort; self.completion = completion
+            self.host = host; self.port = port; self.udp = udp; self.completion = completion
         }
 
         func start(_ lease: ProbeScheduler.Lease) {
@@ -455,30 +399,17 @@ final class TCPNodeLatencyProbe {
                         }
                         return
                     }
-                    let hasFallback = (fallbackPort != nil && fallbackPort != port)
-                    pendingTCPCount = hasFallback ? 2 : 1
-                    let handleTCPResult: (Result<Void, Error>) -> Void = { [self] result in
+                    connection = NodeTCPAddressProbe.start(addresses: addresses, port: port, queue: lease.queue,
+                                                           deadline: lease.deadline.uptimeNanoseconds,
+                                                           permitted: { lease.isActive }) { [self] result in
                         guard !finished else { return }
                         switch result {
                         case .success:
                             let nowNs = DispatchTime.now().uptimeNanoseconds; let elapsed = nowNs > started ? (nowNs - started) : 0
                             finish(.success(max(1, Int(Double(elapsed) / 1_000_000))))
                         case .failure(let error):
-                            pendingTCPCount -= 1
-                            if pendingTCPCount <= 0 {
-                                finish(.failure(error))
-                            }
+                            finish(.failure(error))
                         }
-                    }
-                    connection = NodeTCPAddressProbe.start(addresses: addresses, port: port, queue: lease.queue,
-                                                           deadline: lease.deadline.uptimeNanoseconds,
-                                                           permitted: { lease.isActive },
-                                                           completion: handleTCPResult)
-                    if let fbPort = fallbackPort, fbPort != port {
-                        fallbackConnection = NodeTCPAddressProbe.start(addresses: addresses, port: fbPort, queue: lease.queue,
-                                                                       deadline: lease.deadline.uptimeNanoseconds,
-                                                                       permitted: { lease.isActive },
-                                                                       completion: handleTCPResult)
                     }
                 }
             }
@@ -488,8 +419,6 @@ final class TCPNodeLatencyProbe {
             finished = true
             connection?.cancel()
             connection = nil
-            fallbackConnection?.cancel()
-            fallbackConnection = nil
             udpProbe?.cancel()
             udpProbe = nil
             if let resolverID { SecureDNSHostResolver.shared.cancel(resolverID) }
@@ -765,6 +694,10 @@ final class ProxyNodeCellView: NSTableCellView {
             detailLabel.stringValue = "\(endpoint)  ·  跳过证书验证"
             detailLabel.textColor = .systemOrange
             detailLabel.toolTip = SkipCertificateWarning.headline
+        } else if policy.usesUnauthenticatedStreamCipher {
+            detailLabel.stringValue = "\(endpoint)  ·  弱加密(无AEAD)"
+            detailLabel.textColor = .systemOrange
+            detailLabel.toolTip = "流密码无完整性校验，抗主动探测能力弱，仅建议用于兼容旧节点"
         } else {
             detailLabel.stringValue = endpoint
             detailLabel.textColor = .secondaryLabelColor
@@ -944,6 +877,10 @@ final class ProxyCardCollectionItem: NSCollectionViewItem {
             endpointLabel.stringValue = baseEndpoint.isEmpty ? "跳过证书" : "\(baseEndpoint) · 跳过证书"
             endpointLabel.textColor = .systemOrange
             endpointLabel.toolTip = SkipCertificateWarning.headline
+        } else if policy.usesUnauthenticatedStreamCipher {
+            endpointLabel.stringValue = baseEndpoint.isEmpty ? "弱加密(无AEAD)" : "\(baseEndpoint) · 弱加密"
+            endpointLabel.textColor = .systemOrange
+            endpointLabel.toolTip = "流密码无完整性校验，抗主动探测能力弱，仅建议用于兼容旧节点"
         } else {
             endpointLabel.stringValue = baseEndpoint
             endpointLabel.textColor = .tertiaryLabelColor

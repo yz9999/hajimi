@@ -895,10 +895,6 @@ void connectSnell(const Node &node, const Target &target, std::shared_ptr<Transp
     if (target.host.empty() || target.host.size() > 255 || !target.port || target.host.find('\0') != std::string::npos) {
         completion({}, "Invalid Snell TCP destination"); return;
     }
-    if (isTestbenchSnellNode(node)) {
-        connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
-        return;
-    }
     std::string cleanTarget = unbracketAndStripZone(target.host);
     Buffer request{1, 1, 0, uint8_t(cleanTarget.size())};
     request.insert(request.end(), cleanTarget.begin(), cleanTarget.end()); snellPut16(request, target.port);
@@ -910,10 +906,6 @@ void connectSnell(const Node &node, const Target &target, std::shared_ptr<Transp
 void makeSnellDatagram(const Node &node, std::shared_ptr<TransportFactory> factory, DatagramCallback completion) {
     if (auto error = validateSnell(node, true); !error.empty()) { completion({}, std::move(error)); return; }
     if (!factory || !factory->tcp || !factory->post || !factory->after) { completion({}, "Snell platform transport is unavailable"); return; }
-    if (isTestbenchSnellNode(node)) {
-        makeTestbenchSocks5Datagram(node, std::move(factory), std::move(completion));
-        return;
-    }
     factory->post([node, factory, completion = std::move(completion)]() mutable {
         auto deliver = [completion = std::move(completion)](std::shared_ptr<Stream> stream, Error error) mutable {
             if (!error.empty()) completion({}, std::move(error));

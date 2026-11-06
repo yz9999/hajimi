@@ -123,6 +123,18 @@ struct TLSOptions {
 };
 /// Platform I/O only. Protocol framing, authentication, crypto and sessions
 /// must stay in .cpp code, not in the Swift/Objective-C adapters.
+struct ProtocolTimeouts {
+    static constexpr double tcpHandshakeSeconds = 10.0;
+    static constexpr double protocolSetupSeconds = 12.0;
+    static constexpr double socksHandshakeSeconds = 12.0;
+    static constexpr double idleKeepaliveSeconds = 30.0;
+    static constexpr double udpSessionIdleSeconds = 60.0;
+    static double clampSetupBudget(double requestedSeconds) {
+        if (requestedSeconds <= 0.0) return 0.200;
+        return requestedSeconds < protocolSetupSeconds ? requestedSeconds : protocolSetupSeconds;
+    }
+};
+
 struct TransportFactory {
     std::function<void(const Node &, const TLSOptions &, StreamCallback)> tcp;
     std::function<void(const Node &, DatagramCallback)> udp;
@@ -131,6 +143,7 @@ struct TransportFactory {
     // Cross-thread, fail-closed runtime shutdown signal (empty means false).
     // post/after still deliver cleanup work after this signal becomes true.
     std::function<bool()> cancelled;
+    double remainingDeadlineSeconds = ProtocolTimeouts::protocolSetupSeconds;
 };
 constexpr size_t maximumQueuedBytes = 2 * 1024 * 1024;
 constexpr size_t maximumReadBytes = 512 * 1024;
@@ -150,6 +163,7 @@ Error validateQUICProtocol(const Node &, bool udp);
 void connectSnell(const Node &, const Target &, std::shared_ptr<TransportFactory>, StreamCallback);
 void makeSnellDatagram(const Node &, std::shared_ptr<TransportFactory>, DatagramCallback);
 void connectSSH(const Node &, const Target &, std::shared_ptr<TransportFactory>, StreamCallback);
+void resetSSHClients();
 
 /// Bounded buffered stream parser, shared by handshake and frame engines.
 /// Its implementation preserves pending bytes and serializes raw reads.

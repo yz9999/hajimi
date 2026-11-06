@@ -1118,7 +1118,7 @@ final class SurgeProxyEditorController: NSWindowController {
         switch selectedType {
         case "http", "https", "socks5", "socks5-tls": required = "用户名和密码均可选"
         case "ss": required = "选择加密算法并填写密码，可选 simple-obfs 混淆"
-        case "ssr": required = "选择加密算法、协议插件与混淆插件并填写密码"
+        case "ssr": required = "选择加密算法、协议插件与混淆插件并填写密码（⚠️ 流密码无 AEAD 完整性校验，抗主动探测能力弱，仅建议用于兼容旧节点）"
         case "snell": required = "填写 PSK 密钥并选择协议版本"
         case "vmess", "vless": required = "填写 UUID；可在下方配置 TLS 与传输方式（TCP/WS/gRPC/XHTTP/mKCP）"
         case "trojan": required = "填写密码；默认启用 TLS，可在下方选择传输方式"

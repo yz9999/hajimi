@@ -43,6 +43,17 @@ public struct ProxyPolicy: Equatable, Codable {
             || Self.isTruthy(parameters["skip-common-name-verify"])
     }
 
+    /// True when this node uses an unauthenticated legacy stream cipher (such as
+    /// SSR origin+plain with AES-CFB) that lacks AEAD integrity protection.
+    public var usesUnauthenticatedStreamCipher: Bool {
+        let type = (adapterType ?? "").lowercased()
+        let cipher = (parameters["cipher"] ?? parameters["encrypt-method"] ?? "").lowercased()
+        if type == "ssr" || type == "shadowsocksr" {
+            return true
+        }
+        return cipher.hasSuffix("-cfb") || cipher.hasSuffix("-ctr") || cipher == "rc4-md5" || cipher == "chacha20-ietf"
+    }
+
     private static func isTruthy(_ value: String?) -> Bool {
         guard let value else { return false }
         return ["true", "yes", "on", "1"].contains(value.lowercased())

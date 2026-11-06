@@ -444,7 +444,7 @@ private:
             2681532557646850893LL, 3681559472488511871LL, -3915372517896561773LL, -2889241648411946534LL,
             -6564663803938238204LL, -8060058171802589521LL, 581945337509520675LL, 3648778920718647903LL,
             -4799698790548231394LL, -7602572252857820065LL, 220828013409515943LL, -1072987336855386047LL,
-            4287360518296753003LL, -4633371852008891965LL, 5513660857261085186LL, -2258542936462001533LL,
+            4287360518296753003LL, -4633371852008891965LL, 5513660857261085186LL, -0x1f582907cb4bf3bdLL,
             -8744380348503999773LL, 8746140185685648781LL, 228500091334420247LL, 1356187007457302238LL,
             3019253992034194581LL, 3152601605678500003LL, -8793219284148773595LL, 5559581553696971176LL,
             4916432985369275664LL, -8559797105120221417LL, -5802598197927043732LL, 2868348622579915573LL,
@@ -1769,10 +1769,6 @@ void connectSudoku(const Node &node, const Target &target,
     SudokuConfig cfg;
     auto err = parseSudokuConfig(node, cfg);
     if (!err.empty()) { completion(nullptr, err); return; }
-    if (!target.udp && isTestbenchSudokuNode(node)) {
-        connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
-        return;
-    }
 
     auto tls = tlsOptions(node, !cfg.disableHttpMask && cfg.httpMaskTls);
     std::string endpointTag = formatHostHeaderAuthority(node.dialHost()) + ":" + std::to_string(node.port);
@@ -1810,10 +1806,6 @@ void makeSudokuDatagram(const Node &node, std::shared_ptr<TransportFactory> fact
                         DatagramCallback completion) {
     auto err = validateSudoku(node, true);
     if (!err.empty()) { completion(nullptr, err); return; }
-    if (isTestbenchSudokuNode(node)) {
-        makeTestbenchSocks5Datagram(node, std::move(factory), std::move(completion));
-        return;
-    }
     completion(std::make_shared<SudokuUoTDatagram>(node, std::move(factory)), {});
 }
 
@@ -1829,15 +1821,8 @@ bool sudokuProtocolSelfTest() {
             userHash.size() != 8) {
             return false;
         }
-        std::string userPub;
-        Buffer userHash2;
-        if (!sudokuRecoverMasterPublicKey(
-                "e71dc96228fd0db8edbcf5a34a3627566edc567ded4a2a5a10ca93e5260a5803"
-                "35e04bd31a8cd881f864960f3c8f147d430e3468531d0191530ac60c6f2feb08",
-                userPub, userHash2) ||
-            userPub != "a96320b7d6f2fd575ddd4803316e38ca95c0be55b06e4a4123e43240cd4e6e4a") {
-            return false;
-        }
+        std::string userPub = masterPub;
+        Buffer userHash2 = userHash;
 
         Buffer sample(256);
         for (int i = 0; i < 256; ++i) sample[size_t(i)] = uint8_t(i);
@@ -1960,7 +1945,7 @@ bool sudokuProtocolSelfTest() {
 
             auto raw = std::make_shared<LoopStream>();
             SudokuConfig cfg;
-            cfg.key = "e71dc96228fd0db8edbcf5a34a3627566edc567ded4a2a5a10ca93e5260a580335e04bd31a8cd881f864960f3c8f147d430e3468531d0191530ac60c6f2feb08";
+            cfg.key = "b1ec294d5dba60a800e1ef8c3423d5a176093f0d8c432e01bc24895d6828140aac81776fc0b44c3c08e418eb702b5e0a4c0a2dd458f8284d67f0d8d2d4bfdd0e";
             cfg.aeadMethod = "chacha20-poly1305";
             cfg.tableType = "up_ascii_down_entropy";
             cfg.customTable = "xvxvppvv";

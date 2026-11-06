@@ -4523,8 +4523,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         nodeLatencies[name] = .testing
         if refreshStart { schedulePolicyCardUpdates(proxies: [name]) }
         let isUDP = TCPNodeLatencyProbe.usesUDPTransport(policy)
-        let fbPort = TCPNodeLatencyProbe.testbenchFallbackPort(for: policy)
-        nodeProbeTickets[name] = TCPNodeLatencyProbe.measure(host: host, port: port, udp: isUDP, fallbackPort: fbPort) { [weak self] result in
+        nodeProbeTickets[name] = TCPNodeLatencyProbe.measure(host: host, port: port, udp: isUDP) { [weak self] result in
             self?.finishNodeProbe(named: name, requestID: requestID, batchID: batchID, epoch: epoch, result: result)
         }
     }

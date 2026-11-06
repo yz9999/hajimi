@@ -3,6 +3,7 @@
 #include "Crypto.hpp"
 #include "ServerProtocols.hpp"
 #include "ModernProtocols.hpp"
+#include "SSH.hpp"
 #include <cstring>
 #include <stdexcept>
 
@@ -29,28 +30,29 @@ extern "C" int hajimi_cpp_protocol_self_test(void){
         auto length=hajimi_cpp_http_basic_authorization(username.data(),username.size(),password.data(),password.size(),output,sizeof(output));
         if(std::string(reinterpret_cast<char *>(output),length)!="Basic dXNlcjpwYXNz")return 7;
         if(!modernProtocolsSelfTest())return 9;
-        for (const auto &sshHost : {"47.129.156.248", "2406:da18:1792:d600:9a54:ebc4:e551:acd1"}) {
+        for (const auto &sshHost : {"198.51.100.10", "2001:db8::10"}) {
             Node sshNode;
             sshNode.type = "ssh";
             sshNode.host = sshHost;
             sshNode.port = 22;
-            sshNode.parameters["username"] = "hajimisshtest";
-            sshNode.parameters["password"] = "HajimiTestPass2026";
-            sshNode.parameters["host-key"] = "[ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINaAzGBPULXLmLDph0UFoOO0D3s87CoIWQgIqNFwGuvy]";
+            sshNode.parameters["username"] = "ssh-user";
+            sshNode.parameters["password"] = "example-secret";
+            sshNode.parameters["host-key"] = "[ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti]";
             sshNode.parameters["host-key-algorithms"] = "[ssh-ed25519]";
             if (!validateProtocol(sshNode, false).empty()) return 10;
         }
-        for (const auto &ssrHost : {"47.129.156.248", "2406:da18:1792:d600:9a54:ebc4:e551:acd1"}) {
+        for (const auto &ssrHost : {"198.51.100.10", "2001:db8::10"}) {
             Node ssrNode;
             ssrNode.type = "ssr";
             ssrNode.host = ssrHost;
-            ssrNode.port = 20020;
+            ssrNode.port = 8388;
             ssrNode.parameters["cipher"] = "aes-128-cfb";
-            ssrNode.parameters["password"] = "HajimiTestPass2026";
+            ssrNode.parameters["password"] = "example-secret";
             ssrNode.parameters["protocol"] = "origin";
             ssrNode.parameters["obfs"] = "plain";
             if (!validateProtocol(ssrNode, false).empty() || !validateProtocol(ssrNode, true).empty()) return 11;
         }
+        if (!sshSessionPoolSelfTest()) return 12;
         return 0;
     }catch(const std::exception &){return 99;}
 }

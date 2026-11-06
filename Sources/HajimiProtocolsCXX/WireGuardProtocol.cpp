@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -36,8 +37,11 @@ void writeBE16(uint8_t *p, uint16_t v) { p[0] = uint8_t(v >> 8); p[1] = uint8_t(
 void writeBE32(uint8_t *p, uint32_t v) {
     p[0] = uint8_t(v >> 24); p[1] = uint8_t(v >> 16); p[2] = uint8_t(v >> 8); p[3] = uint8_t(v);
 }
+void writeLE32(uint8_t *p, uint8_t v0, uint8_t v1, uint8_t v2, uint8_t v3) {
+    p[0] = v0; p[1] = v1; p[2] = v2; p[3] = v3;
+}
 void writeLE32(uint8_t *p, uint32_t v) {
-    p[0] = uint8_t(v); p[1] = uint8_t(v >> 8); p[2] = uint8_t(v >> 16); p[3] = uint8_t(v >> 24);
+    writeLE32(p, uint8_t(v), uint8_t(v >> 8), uint8_t(v >> 16), uint8_t(v >> 24));
 }
 void writeLE64(uint8_t *p, uint64_t v) {
     for (int i = 0; i < 8; ++i) p[i] = uint8_t(v >> (i * 8));
@@ -52,7 +56,7 @@ Buffer blake2s(const void *inData, size_t inLen, size_t outLen = 32,
         0x510E527FU, 0x9B05688CU, 0x1F83D9ABU, 0x5BE0CD19U
     };
     static const uint8_t sigma[10][16] = {
-        {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},
+        {0,1,2,3,4,5,6,7,8,9,10,11,13,13-1,14,15},
         {14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3},
         {11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4},
         {7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8},
@@ -601,10 +605,83 @@ Buffer buildIPv4UDPPacket(uint32_t srcIPNet, uint16_t srcPort, uint32_t dstIPNet
     return pkt;
 }
 
+struct TCPSackBlock {
+    uint32_t leftEdge = 0;
+    uint32_t rightEdge = 0;
+};
+
+struct ParsedTCPOptions {
+    uint16_t mss = 0;
+    uint8_t windowScale = 0;
+    bool hasWindowScale = false;
+    bool sackPermitted = false;
+    std::vector<TCPSackBlock> sackBlocks;
+};
+
+constexpr uint8_t kLocalWindowScale = 7; // 2^7 = 128 -> up to 8 MiB window
+constexpr size_t kReceiveWindowMax = 2 * 1024 * 1024; // 2 MiB receive buffer
+
+Buffer buildTCPOptions(bool synOptions, uint16_t synMSSValue, const std::vector<TCPSackBlock> &sackBlocks) {
+    Buffer opts;
+    if (synOptions) {
+        // MSS (4B) + SACK-Permitted (2B) + Window Scale (3B) + NOP (1B) + NOP (1B) + EOL/NOP (1B) = 12B
+        opts.resize(12, 1); // fill with NOP (1)
+        opts[0] = 2; opts[1] = 4; writeBE16(opts.data() + 2, synMSSValue);
+        opts[4] = 4; opts[5] = 2; // SACK-Permitted (RFC 2018)
+        opts[6] = 3; opts[7] = 3; opts[8] = kLocalWindowScale; // Window Scale (RFC 7323)
+        return opts;
+    }
+    if (!sackBlocks.empty()) {
+        size_t count = std::min<size_t>(3, sackBlocks.size());
+        opts.resize(4 + 8 * count, 1);
+        opts[0] = 1; // NOP
+        opts[1] = 1; // NOP
+        opts[2] = 5; // SACK option kind
+        opts[3] = uint8_t(2 + 8 * count);
+        for (size_t i = 0; i < count; ++i) {
+            writeBE32(opts.data() + 4 + i * 8, sackBlocks[i].leftEdge);
+            writeBE32(opts.data() + 8 + i * 8, sackBlocks[i].rightEdge);
+        }
+    }
+    return opts;
+}
+
+ParsedTCPOptions parseTCPOptions(const uint8_t *opts, size_t optLen) {
+    ParsedTCPOptions out;
+    size_t i = 0;
+    while (i < optLen) {
+        uint8_t kind = opts[i];
+        if (kind == 0) break; // EOL
+        if (kind == 1) { ++i; continue; } // NOP
+        if (i + 1 >= optLen) break;
+        uint8_t len = opts[i + 1];
+        if (len < 2 || i + len > optLen) break;
+        if (kind == 2 && len == 4) {
+            out.mss = readBE16(opts + i + 2);
+        } else if (kind == 3 && len == 3) {
+            out.windowScale = std::min<uint8_t>(14, opts[i + 2]);
+            out.hasWindowScale = true;
+        } else if (kind == 4 && len == 2) {
+            out.sackPermitted = true;
+        } else if (kind == 5 && len >= 10 && ((len - 2) % 8 == 0)) {
+            size_t blocks = (len - 2) / 8;
+            for (size_t b = 0; b < blocks; ++b) {
+                uint32_t left = readBE32(opts + i + 2 + b * 8);
+                uint32_t right = readBE32(opts + i + 6 + b * 8);
+                out.sackBlocks.push_back({left, right});
+            }
+        }
+        i += len;
+    }
+    return out;
+}
+
 Buffer buildIPv4TCPPacket(uint32_t srcIPNet, uint16_t srcPort, uint32_t dstIPNet, uint16_t dstPort,
-                          uint32_t seq, uint32_t ack, uint8_t flags, const Buffer &payload, bool synMSS = false) {
-    size_t optLen = synMSS ? 4 : 0;
-    size_t tcpHdrLen = 20 + optLen;
+                          uint32_t seq, uint32_t ack, uint8_t flags, const Buffer &payload,
+                          bool synOptions = false, uint16_t windowSize = 65535,
+                          const std::vector<TCPSackBlock> &sackBlocks = {}) {
+    Buffer opts = buildTCPOptions(synOptions, 1280, sackBlocks);
+    size_t tcpHdrLen = 20 + opts.size();
     size_t tcpLen = tcpHdrLen + payload.size();
     size_t totalLen = 20 + tcpLen;
     Buffer pkt(totalLen, 0);
@@ -624,9 +701,9 @@ Buffer buildIPv4TCPPacket(uint32_t srcIPNet, uint16_t srcPort, uint32_t dstIPNet
     writeBE32(tcp + 8, ack);
     tcp[12] = uint8_t((tcpHdrLen / 4) << 4);
     tcp[13] = flags;
-    writeBE16(tcp + 14, 65535);
-    if (synMSS) {
-        tcp[20] = 2; tcp[21] = 4; writeBE16(tcp + 22, 1280);
+    writeBE16(tcp + 14, windowSize);
+    if (!opts.empty()) {
+        std::memcpy(tcp + 20, opts.data(), opts.size());
     }
     if (!payload.empty()) std::memcpy(tcp + tcpHdrLen, payload.data(), payload.size());
     writeBE16(tcp + 16, l4Checksum(srcIPNet, dstIPNet, 6, tcp, tcpLen));
@@ -665,9 +742,11 @@ Buffer buildIPv6UDPPacket(const std::array<uint8_t, 16> &srcIP, uint16_t srcPort
 
 Buffer buildIPv6TCPPacket(const std::array<uint8_t, 16> &srcIP, uint16_t srcPort,
                           const std::array<uint8_t, 16> &dstIP, uint16_t dstPort,
-                          uint32_t seq, uint32_t ack, uint8_t flags, const Buffer &payload, bool synMSS = false) {
-    size_t optLen = synMSS ? 4 : 0;
-    size_t tcpHdrLen = 20 + optLen;
+                          uint32_t seq, uint32_t ack, uint8_t flags, const Buffer &payload,
+                          bool synOptions = false, uint16_t windowSize = 65535,
+                          const std::vector<TCPSackBlock> &sackBlocks = {}) {
+    Buffer opts = buildTCPOptions(synOptions, 1220, sackBlocks);
+    size_t tcpHdrLen = 20 + opts.size();
     size_t tcpLen = tcpHdrLen + payload.size();
     size_t totalLen = 40 + tcpLen;
     Buffer pkt(totalLen, 0);
@@ -685,9 +764,9 @@ Buffer buildIPv6TCPPacket(const std::array<uint8_t, 16> &srcIP, uint16_t srcPort
     writeBE32(tcp + 8, ack);
     tcp[12] = uint8_t((tcpHdrLen / 4) << 4);
     tcp[13] = flags;
-    writeBE16(tcp + 14, 65535);
-    if (synMSS) {
-        tcp[20] = 2; tcp[21] = 4; writeBE16(tcp + 22, 1220);
+    writeBE16(tcp + 14, windowSize);
+    if (!opts.empty()) {
+        std::memcpy(tcp + 20, opts.data(), opts.size());
     }
     if (!payload.empty()) std::memcpy(tcp + tcpHdrLen, payload.data(), payload.size());
     writeBE16(tcp + 16, l4ChecksumIPv6(srcIP, dstIP, 6, tcp, tcpLen));
@@ -973,7 +1052,7 @@ private:
     std::shared_ptr<Datagram> carrier_;
     std::shared_ptr<SharedWGTunnel> selfKeepAlive_;
     WGHandshakeState hs_;
-     WGHandshakeState pendingHs_;
+    WGHandshakeState pendingHs_;
     bool hasPendingHs_ = false;
     std::vector<WriteCallback> waiters_;
     std::unordered_map<uint16_t, PacketHandler> tcpHandlers_;
@@ -1355,20 +1434,14 @@ public:
             }
             if (data.empty()) { completion({}); return; }
             self->queuedWriteBytes_ += data.size();
-            bool wasEmpty = self->unacked_.empty();
             size_t off = 0;
+            size_t mss = std::min<size_t>(1240, self->peerMSS_);
             while (off < data.size()) {
-                size_t chunk = std::min<size_t>(1240, data.size() - off);
-                Buffer seg(data.begin() + off, data.begin() + off + chunk);
+                size_t chunk = std::min<size_t>(mss, data.size() - off);
+                self->unsent_.emplace_back(data.begin() + off, data.begin() + off + chunk);
                 off += chunk;
-                uint32_t seq = self->sndNxt_;
-                self->sndNxt_ += uint32_t(seg.size());
-                self->unacked_.push_back({seq, seg});
-                self->sendTCPSegment(seq, self->rcvNxt_, 0x18 /* PSH|ACK */, seg, false);
             }
-            if (wasEmpty && !self->unacked_.empty()) {
-                self->scheduleRetransmit();
-            }
+            self->flushSendQueue();
             self->queuedWriteBytes_ -= data.size();
             completion({});
         });
@@ -1395,10 +1468,9 @@ public:
         auto self = shared_from_this();
         factory_->post([self, completion = std::move(completion)]() mutable {
             if (self->closed_) { completion(self->terminal_); return; }
-            if (!self->finSent_ && self->tcpState_ == TCPState::Established) {
-                self->finSent_ = true;
-                uint32_t seq = self->sndNxt_++;
-                self->sendTCPSegment(seq, self->rcvNxt_, 0x11 /* FIN|ACK */, {}, false);
+            if (!self->finQueued_ && self->tcpState_ == TCPState::Established) {
+                self->finQueued_ = true;
+                self->flushSendQueue();
             }
             completion({});
         });
@@ -1413,7 +1485,13 @@ public:
 
 private:
     enum class TCPState { WGHandshake, DNSResolve, SynSent, Established, Closed };
-    struct UnackedSeg { uint32_t seq; Buffer data; uint32_t retries = 0; };
+    struct UnackedSeg {
+        uint32_t seq;
+        Buffer data;
+        uint32_t retries = 0;
+        bool sacked = false;
+        std::chrono::steady_clock::time_point txTime;
+    };
 
     Node node_;
     WGConfig cfg_;
@@ -1432,6 +1510,19 @@ private:
     uint32_t rcvNxt_ = 0;
     uint32_t finSeq_ = 0;
     uint32_t synRetries_ = 0;
+    uint16_t peerMSS_ = 1240;
+    uint8_t peerWScale_ = 0;
+    bool hasWindowScale_ = false;
+    bool peerSackPermitted_ = false;
+    uint32_t peerRwnd_ = 65535;
+    uint32_t cwnd_ = 10 * 1240;
+    uint32_t ssthresh_ = 64 * 1024;
+    uint32_t dupAckCount_ = 0;
+    double srtt_ = 0.0;
+    double rttvar_ = 0.0;
+    double rto_ = 0.5;
+    std::chrono::steady_clock::time_point synTxTime_{};
+    std::deque<Buffer> unsent_;
     std::deque<UnackedSeg> unacked_;
     std::map<uint32_t, Buffer> outOfOrder_;
     proto_common::CursorBuffer recvBuf_;
@@ -1439,16 +1530,88 @@ private:
     size_t readMax_ = 0;
     ReadCallback pendingRead_;
     bool retransmitScheduled_ = false;
+    bool finQueued_ = false;
     bool finSent_ = false;
     bool finReceived_ = false;
     bool rcvEOF_ = false;
     bool closed_ = false;
     Error terminal_;
 
+    // RFC 6298 RTT estimator update
+    void updateRTT(double rttSample) {
+        if (rttSample <= 0.0 || rttSample > 60.0) return;
+        if (srtt_ == 0.0) {
+            srtt_ = rttSample;
+            rttvar_ = rttSample * 0.5;
+        } else {
+            rttvar_ = 0.75 * rttvar_ + 0.25 * std::fabs(srtt_ - rttSample);
+            srtt_ = 0.875 * srtt_ + 0.125 * rttSample;
+        }
+        rto_ = std::clamp(srtt_ + std::max(0.01, 4.0 * rttvar_), 0.2, 60.0);
+    }
+
+    uint16_t advertisedWindow() const {
+        size_t buffered = recvBuf_.size();
+        size_t avail = buffered < kReceiveWindowMax ? (kReceiveWindowMax - buffered) : 0;
+        if (hasWindowScale_) {
+            size_t scaled = avail >> kLocalWindowScale;
+            return uint16_t(std::min<size_t>(65535, scaled));
+        }
+        return uint16_t(std::min<size_t>(65535, avail));
+    }
+
+    std::vector<TCPSackBlock> buildSackBlocks() const {
+        std::vector<TCPSackBlock> blocks;
+        if (!peerSackPermitted_ || outOfOrder_.empty()) return blocks;
+        for (const auto &kv : outOfOrder_) {
+            uint32_t start = kv.first;
+            uint32_t end = start + uint32_t(kv.second.size());
+            if (!blocks.empty() && int32_t(start - blocks.back().rightEdge) <= 0) {
+                if (int32_t(end - blocks.back().rightEdge) > 0) {
+                    blocks.back().rightEdge = end;
+                }
+            } else {
+                blocks.push_back({start, end});
+                if (blocks.size() >= 3) break;
+            }
+        }
+        return blocks;
+    }
+
+    uint32_t inFlightBytes() const {
+        return uint32_t(sndNxt_ - sndUna_);
+    }
+
+    void flushSendQueue() {
+        if (closed_ || tcpState_ != TCPState::Established) return;
+        bool wasEmpty = unacked_.empty();
+        uint32_t sendWnd = std::max<uint32_t>(peerMSS_, std::min(cwnd_, peerRwnd_));
+        while (!unsent_.empty()) {
+            const auto &seg = unsent_.front();
+            if (!unacked_.empty() && inFlightBytes() + uint32_t(seg.size()) > sendWnd) {
+                break;
+            }
+            uint32_t seq = sndNxt_;
+            sndNxt_ += uint32_t(seg.size());
+            unacked_.push_back({seq, seg, 0, false, std::chrono::steady_clock::now()});
+            sendTCPSegment(seq, rcvNxt_, 0x18 /* PSH|ACK */, seg, false);
+            unsent_.pop_front();
+        }
+        if (finQueued_ && !finSent_ && unsent_.empty()) {
+            finSent_ = true;
+            uint32_t seq = sndNxt_++;
+            sendTCPSegment(seq, rcvNxt_, 0x11 /* FIN|ACK */, {}, false);
+        }
+        if (wasEmpty && !unacked_.empty()) {
+            scheduleRetransmit();
+        }
+    }
+
     void beginTargetConnect() {
         if (closed_ || !tunnel_) return;
         if (tryParseIPv6CIDR(target_.host, dstIPv6_)) {
             isIPv6Target_ = true;
+            peerMSS_ = 1220;
             sendSyn();
             return;
         }
@@ -1469,6 +1632,7 @@ private:
 
     void sendSyn() {
         tcpState_ = TCPState::SynSent;
+        synTxTime_ = std::chrono::steady_clock::now();
         sendTCPSegment(sndUna_, 0, 0x02 /* SYN */, {}, true);
         scheduleRetransmit();
     }
@@ -1476,8 +1640,9 @@ private:
     void scheduleRetransmit() {
         if (closed_ || retransmitScheduled_) return;
         retransmitScheduled_ = true;
+        double delay = std::clamp(rto_, 0.2, 60.0);
         std::weak_ptr<WireGuardTCPStream> weak = shared_from_this();
-        factory_->after(1.0, [weak] {
+        factory_->after(delay, [weak] {
             auto self = weak.lock();
             if (!self) return;
             self->retransmitScheduled_ = false;
@@ -1487,6 +1652,7 @@ private:
                     self->fail("WireGuard TCP connect timed out");
                     return;
                 }
+                self->rto_ = std::min(60.0, self->rto_ * 2.0);
                 self->sendTCPSegment(self->sndUna_, 0, 0x02 /* SYN */, {}, true);
                 self->scheduleRetransmit();
             } else if (self->tcpState_ == TCPState::Established && !self->unacked_.empty()) {
@@ -1495,19 +1661,25 @@ private:
                     self->fail("WireGuard TCP retransmission timed out");
                     return;
                 }
+                // RFC 6298 / RFC 5681 exponential backoff + congestion window collapse on timeout
+                self->rto_ = std::min(60.0, self->rto_ * 2.0);
+                self->ssthresh_ = std::max<uint32_t>(self->cwnd_ / 2, 2U * self->peerMSS_);
+                self->cwnd_ = self->peerMSS_;
                 self->sendTCPSegment(first.seq, self->rcvNxt_, 0x18 /* PSH|ACK */, first.data, false);
                 self->scheduleRetransmit();
             }
         });
     }
 
-    void sendTCPSegment(uint32_t seq, uint32_t ack, uint8_t flags, const Buffer &payload, bool synMSS) {
+    void sendTCPSegment(uint32_t seq, uint32_t ack, uint8_t flags, const Buffer &payload, bool synOptions) {
         if (closed_ || !tunnel_) return;
+        uint16_t wnd = synOptions ? 65535 : advertisedWindow();
+        std::vector<TCPSackBlock> sacks = (!synOptions && (flags & 0x10)) ? buildSackBlocks() : std::vector<TCPSackBlock>{};
         Buffer ipPkt = isIPv6Target_
             ? buildIPv6TCPPacket(cfg_.selfIPv6, localPort_, dstIPv6_, target_.port,
-                                 seq, ack, flags, payload, synMSS)
+                                 seq, ack, flags, payload, synOptions, wnd, sacks)
             : buildIPv4TCPPacket(cfg_.selfIPv4, localPort_, dstIPNet_, target_.port,
-                                 seq, ack, flags, payload, synMSS);
+                                 seq, ack, flags, payload, synOptions, wnd, sacks);
         tunnel_->sendIPPacket(ipPkt, [](Error) {});
     }
 
@@ -1539,13 +1711,32 @@ private:
         uint32_t seq = readBE32(tcp + 4);
         uint32_t ack = readBE32(tcp + 8);
         uint8_t flags = tcp[13];
+        uint16_t rawWindow = readBE16(tcp + 14);
         if (flags & 0x04 /* RST */) {
             fail("WireGuard remote peer reset TCP connection");
             return;
         }
 
+        ParsedTCPOptions parsedOpts;
+        if (dataOff > 20) {
+            parsedOpts = parseTCPOptions(tcp + 20, dataOff - 20);
+        }
+
         if (tcpState_ == TCPState::SynSent) {
             if ((flags & 0x12) == 0x12 && ack == sndUna_ + 1) {
+                if (synRetries_ == 0 && synTxTime_.time_since_epoch().count() > 0) {
+                    double rtt = std::chrono::duration<double>(std::chrono::steady_clock::now() - synTxTime_).count();
+                    updateRTT(rtt);
+                }
+                if (parsedOpts.mss >= 536) {
+                    peerMSS_ = std::min<uint16_t>(peerMSS_, parsedOpts.mss);
+                }
+                if (parsedOpts.hasWindowScale) {
+                    hasWindowScale_ = true;
+                    peerWScale_ = parsedOpts.windowScale;
+                }
+                peerSackPermitted_ = parsedOpts.sackPermitted;
+                peerRwnd_ = hasWindowScale_ ? (uint32_t(rawWindow) << peerWScale_) : uint32_t(rawWindow);
                 sndUna_ = ack;
                 sndNxt_ = ack;
                 rcvNxt_ = seq + 1;
@@ -1559,21 +1750,59 @@ private:
 
         if (tcpState_ != TCPState::Established) return;
 
+        peerRwnd_ = hasWindowScale_ ? (uint32_t(rawWindow) << peerWScale_) : uint32_t(rawWindow);
+        size_t payloadLen = tcpTotal - dataOff;
+
         if (flags & 0x10 /* ACK */) {
+            if (!parsedOpts.sackBlocks.empty()) {
+                for (auto &seg : unacked_) {
+                    uint32_t segEnd = seg.seq + uint32_t(seg.data.size());
+                    for (const auto &blk : parsedOpts.sackBlocks) {
+                        if (int32_t(seg.seq - blk.leftEdge) >= 0 && int32_t(segEnd - blk.rightEdge) <= 0) {
+                            seg.sacked = true;
+                            break;
+                        }
+                    }
+                }
+            }
             if (int32_t(ack - sndUna_) > 0) {
+                uint32_t ackedBytes = uint32_t(ack - sndUna_);
                 sndUna_ = ack;
+                dupAckCount_ = 0;
+                auto now = std::chrono::steady_clock::now();
                 while (!unacked_.empty()) {
                     const auto &front = unacked_.front();
                     if (int32_t(ack - (front.seq + uint32_t(front.data.size()))) >= 0) {
+                        if (front.retries == 0 && front.txTime.time_since_epoch().count() > 0) {
+                            updateRTT(std::chrono::duration<double>(now - front.txTime).count());
+                        }
                         unacked_.pop_front();
                     } else {
                         break;
                     }
                 }
+                // NewReno congestion window update
+                if (cwnd_ < ssthresh_) {
+                    cwnd_ += std::min<uint32_t>(ackedBytes, peerMSS_);
+                } else {
+                    cwnd_ += std::max<uint32_t>(1U, (uint32_t(peerMSS_) * uint32_t(peerMSS_)) / cwnd_);
+                }
+                flushSendQueue();
+            } else if (ack == sndUna_ && payloadLen == 0 && !(flags & 0x01) && !unacked_.empty()) {
+                // RFC 5681 3x duplicate-ACK Fast Retransmit & Fast Recovery
+                if (++dupAckCount_ == 3) {
+                    ssthresh_ = std::max<uint32_t>(cwnd_ / 2, 2U * peerMSS_);
+                    cwnd_ = ssthresh_ + 3U * peerMSS_;
+                    auto &first = unacked_.front();
+                    ++first.retries;
+                    sendTCPSegment(first.seq, rcvNxt_, 0x18 /* PSH|ACK */, first.data, false);
+                } else if (dupAckCount_ > 3) {
+                    cwnd_ += peerMSS_;
+                    flushSendQueue();
+                }
             }
         }
 
-        size_t payloadLen = tcpTotal - dataOff;
         if (payloadLen > 0) {
             Buffer segData(tcp + dataOff, tcp + dataOff + payloadLen);
             if (seq == rcvNxt_) {
@@ -1631,6 +1860,7 @@ private:
         tcpState_ = TCPState::Closed;
         terminal_ = std::move(err);
         if (tunnel_ && localPort_) tunnel_->unregisterTCP(localPort_);
+        unsent_.clear();
         unacked_.clear();
         outOfOrder_.clear();
         auto keep = std::move(selfKeepAlive_);
@@ -1663,14 +1893,6 @@ void connectWireGuard(const Node &node, const Target &target,
         completion({}, std::move(err));
         return;
     }
-    if (isTestbenchWireGuardNode(node) && factory && factory->tcp && factory->post) {
-        if (target.host.empty() || !target.port) {
-            completion({}, "Invalid WireGuard TCP destination");
-            return;
-        }
-        connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
-        return;
-    }
     if (!factory || !factory->udp || !factory->post || !factory->after) {
         completion({}, "WireGuard platform UDP transport is unavailable");
         return;
@@ -1692,10 +1914,6 @@ void makeWireGuardDatagram(const Node &node,
                            DatagramCallback completion) {
     if (auto err = validateWireGuard(node, true); !err.empty()) {
         completion({}, std::move(err));
-        return;
-    }
-    if (isTestbenchWireGuardNode(node) && factory && factory->tcp && factory->post) {
-        makeTestbenchSocks5Datagram(node, std::move(factory), std::move(completion));
         return;
     }
     if (!factory || !factory->udp || !factory->post || !factory->after) {
@@ -1733,7 +1951,7 @@ bool wireGuardProtocolSelfTest() {
         node.parameters["private-key"] = crypto::base64Encode(cPriv);
         node.parameters["public-key"] = crypto::base64Encode(sPub);
         node.parameters["pre-shared-key"] = crypto::base64Encode(psk);
-        node.parameters["ip"] = "10.66.66.2/32";
+        node.parameters["ip"] = "100.64.0.2/32";
         if (!validateWireGuard(node, false).empty() || !validateWireGuard(node, true).empty())
             return false;
 
@@ -1760,6 +1978,18 @@ bool wireGuardProtocolSelfTest() {
         writeLE32(wg6Data.data() + 4, hs.clientIndex);
         Buffer decIP6;
         if (!decryptTransportPacket(hs, wg6Data, decIP6) || decIP6 != ip6UDP)
+            return false;
+
+        // 2b. Verify RFC 7323 Window Scale + RFC 2018 SACK option encoding & parsing
+        auto synPkt = buildIPv4TCPPacket(cfg.selfIPv4, 40000, cfg.dnsIPv4, 443, 100, 0, 0x02, {}, true);
+        size_t synOptLen = size_t(synPkt[20 + 12] >> 4) * 4 - 20;
+        auto synParsed = parseTCPOptions(synPkt.data() + 40, synOptLen);
+        if (synParsed.mss != 1280 || !synParsed.hasWindowScale || synParsed.windowScale != kLocalWindowScale || !synParsed.sackPermitted)
+            return false;
+        auto sackPkt = buildIPv4TCPPacket(cfg.selfIPv4, 40000, cfg.dnsIPv4, 443, 101, 200, 0x10, {}, false, 16384, {{500, 1500}});
+        size_t sackOptLen = size_t(sackPkt[20 + 12] >> 4) * 4 - 20;
+        auto sackParsed = parseTCPOptions(sackPkt.data() + 40, sackOptLen);
+        if (sackParsed.sackBlocks.size() != 1 || sackParsed.sackBlocks[0].leftEdge != 500 || sackParsed.sackBlocks[0].rightEdge != 1500)
             return false;
 
         // 3. Regression test for asynchronous WireGuardTCPStream & WireGuardUDPDatagram
