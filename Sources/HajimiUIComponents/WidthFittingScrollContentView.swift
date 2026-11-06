@@ -11,6 +11,10 @@ public final class WidthFittingScrollContentView: NSView {
     private let document = Document()
     private var viewportFrameObserver: NSObjectProtocol?
     private var contentFrameObserver: NSObjectProtocol?
+    private var isPerformingLayout = false
+    private var isSuspended = false
+    private var lastSettledViewportSize: NSSize = .zero
+    private var lastSettledContentSize: NSSize = .zero
     public let content: NSView
 
     public init(content: NSView) {
@@ -31,7 +35,11 @@ public final class WidthFittingScrollContentView: NSView {
         ) { [weak self] _ in
             // A late overlay/legacy change can resize only the clip view.
             // Scrolling changes its bounds and does not invalidate this host.
-            self?.needsLayout = true
+            guard let self, !self.isPerformingLayout, !self.isSuspended else { return }
+            let size = self.scrollView.contentView.bounds.size
+            guard abs(size.width - self.lastSettledViewportSize.width) > 0.5
+                || abs(size.height - self.lastSettledViewportSize.height) > 0.5 else { return }
+            self.needsLayout = true
         }
         content.translatesAutoresizingMaskIntoConstraints = false
         document.addSubview(content)
@@ -48,7 +56,11 @@ public final class WidthFittingScrollContentView: NSView {
         ) { [weak self] _ in
             // Async diagnostics can resize their Auto Layout content without
             // changing the viewport. Refit the document when that happens.
-            self?.needsLayout = true
+            guard let self, !self.isPerformingLayout, !self.isSuspended else { return }
+            let size = self.content.frame.size
+            guard abs(size.width - self.lastSettledContentSize.width) > 0.5
+                || abs(size.height - self.lastSettledContentSize.height) > 0.5 else { return }
+            self.needsLayout = true
         }
     }
 
@@ -63,7 +75,26 @@ public final class WidthFittingScrollContentView: NSView {
         }
     }
 
+    public func setSuspended(_ suspended: Bool) {
+        isSuspended = suspended
+        scrollView.contentView.postsFrameChangedNotifications = !suspended
+        content.postsFrameChangedNotifications = !suspended
+        if !suspended {
+            needsLayout = true
+        }
+    }
+
     public override func layout() {
+        guard !isSuspended else {
+            super.layout()
+            return
+        }
+        isPerformingLayout = true
+        defer {
+            lastSettledViewportSize = scrollView.contentView.bounds.size
+            lastSettledContentSize = content.frame.size
+            isPerformingLayout = false
+        }
         super.layout()
         scrollView.frame = bounds
         // A legacy scroller can claim width after the document gains height.

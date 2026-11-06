@@ -619,12 +619,49 @@ public:
           lastRxMs_(monotonicMillis()), lastTxMs_(monotonicMillis()),
           initialSocksReq_(std::move(initialSocksReq)) {}
 
+    ~MieruUDPStream() override {
+        for (auto &sock : handshakeSockets_) {
+            if (sock) sock->close();
+        }
+        handshakeSockets_.clear();
+        if (raw_) {
+            raw_->close();
+            raw_ = nullptr;
+        }
+        if (readyCallback_) {
+            auto cb = std::move(readyCallback_);
+            readyCallback_ = {};
+            cb(nullptr, terminal_.empty() ? Error("Mieru UDP stream destroyed before ready") : terminal_);
+        }
+    }
+
     void start(StreamCallback ready) {
         readyCallback_ = std::move(ready);
         auto self = shared_from_this();
-        raw_->start([self](Target, Buffer packet) {
+        auto initialSock = raw_;
+        if (initialSock) {
+            handshakeSockets_.push_back(initialSock);
+        }
+        std::weak_ptr<Datagram> weakSock = initialSock;
+        raw_->start([self, weakSock](Target, Buffer packet) {
+            if (auto sock = weakSock.lock()) {
+                if (!self->sessionOpened_) {
+                    self->raw_ = sock;
+                }
+            }
             self->onPacket(std::move(packet));
-        }, [self](Error err) {
+        }, [self, weakSock](Error err) {
+            auto sock = weakSock.lock();
+            if (sock) {
+                self->handshakeSockets_.erase(
+                    std::remove(self->handshakeSockets_.begin(), self->handshakeSockets_.end(), sock),
+                    self->handshakeSockets_.end());
+            }
+            if (self->sessionOpened_) {
+                if (sock && sock != self->raw_) return;
+            } else {
+                if (err != "Native UDP connection cancelled" && !self->handshakeSockets_.empty()) return;
+            }
             self->failAll(err.empty() ? Error("Mieru UDP socket error") : err);
         });
         sendOpenSessionPacket();
@@ -710,6 +747,10 @@ public:
                 }
             } catch (...) {}
         }
+        for (auto &sock : handshakeSockets_) {
+            if (sock) sock->close();
+        }
+        handshakeSockets_.clear();
         if (raw_) {
             raw_->close();
             raw_ = nullptr;
@@ -897,16 +938,21 @@ private:
         factory_->after(10.0, [self]() {
             self->keepaliveScheduled_ = false;
             if (self->closed_ || !self->sessionOpened_ || !self->raw_) return;
-            if (self->factory_ && self->factory_->cancelled && self->factory_->cancelled()) {
-                self->close();
-                return;
-            }
             uint64_t nowMs = monotonicMillis();
             if (nowMs >= self->lastTxMs_ + 9500 && self->txUnacked_.empty()) {
                 self->sendAckNow();
             }
             self->scheduleKeepaliveTimer();
         });
+    }
+
+    void closeHandshakeSocketsExcept(const std::shared_ptr<Datagram> &winner) {
+        for (auto &sock : handshakeSockets_) {
+            if (sock && sock != winner) {
+                sock->close();
+            }
+        }
+        handshakeSockets_.clear();
     }
 
     void scheduleRetransmitTimer() {
@@ -916,30 +962,39 @@ private:
         factory_->after(0.04, [self]() {
             self->retransmitScheduled_ = false;
             if (self->closed_ || self->txUnacked_.empty() || !self->raw_) return;
-            if (self->factory_ && self->factory_->cancelled && self->factory_->cancelled()) {
+            // Once sessionOpened_ is true, the stream is published and owned by HJCppByteStream;
+            // setup-scope cancellation must only abort pre-ready handshakes (!sessionOpened_).
+            if (!self->sessionOpened_ && self->factory_ && self->factory_->cancelled && self->factory_->cancelled()) {
                 self->close();
                 return;
             }
             uint64_t nowMs = monotonicMillis();
-            uint64_t baseRto = std::clamp<uint64_t>((self->srttMs_ * 3) / 2, 110, 360);
+            // Before the server's 10-byte SOCKS5 target reply is received (!socksReplyConsumed_),
+            // mita may still be completing its outbound TCP handshake to the target host (e.g. 1.1.1.1:443).
+            // Use a conservative minimum RTO (260ms) and a 5.5s silence budget during target connect
+            // so a 24-connection burst cannot prematurely abort freshly opened sessions at ~1.7s.
+            uint64_t minRto = self->socksReplyConsumed_ ? 120 : 260;
+            uint64_t baseRto = std::clamp<uint64_t>((self->srttMs_ * 3) / 2, minRto, 420);
             size_t count = 0;
             for (auto it = self->txUnacked_.begin(); it != self->txUnacked_.end() && count < 24; ) {
-                uint64_t rtoMs = std::min<uint64_t>(650, baseRto + uint64_t(it->second.retries) * 90);
+                uint64_t rtoMs = std::min<uint64_t>(850, baseRto + uint64_t(it->second.retries) * 110);
                 if (nowMs >= it->second.sentAtMs && (nowMs - it->second.sentAtMs) < rtoMs) {
                     ++it;
                     continue;
                 }
                 ++it->second.retries;
-                // Fast-fail (~850ms, 3 retries) if this write occurred on a previously
-                // idle stream (firstSentAtMs >= lastRxMs_ + 1000) and zero packets have
-                // arrived since, so EncryptedDNSRequest.recoverIdle immediately dials a
-                // fresh session instead of wasting 2.0s-2.6s on a dead NAT mapping.
+                // Fast-fail (~1.1s, 3 retries) ONLY if this stream had ALREADY completed its
+                // SOCKS5 target handshake earlier, went idle for >= 1.5s, and received zero packets
+                // since this write, so EncryptedDNSRequest.recoverIdle quickly redials dead NAT mappings.
                 const bool staleIdleSilent =
-                    (it->second.firstSentAtMs >= self->lastRxMs_ + 1000) &&
-                    (nowMs >= self->lastRxMs_ + 1850) &&
+                    self->socksReplyConsumed_ &&
+                    (it->second.firstSentAtMs >= self->lastRxMs_ + 1500) &&
+                    (nowMs >= it->second.firstSentAtMs + 1100) &&
                     (it->second.retries >= 3);
-                if (it->second.retries > 8 || staleIdleSilent ||
-                    (it->second.retries >= 5 && nowMs >= self->lastRxMs_ + 1600)) {
+                const int maxRetries = self->socksReplyConsumed_ ? 8 : 10;
+                const uint64_t maxSilenceMs = self->socksReplyConsumed_ ? 3800 : 5500;
+                if (it->second.retries > maxRetries || staleIdleSilent ||
+                    (it->second.retries >= (maxRetries - 2) && nowMs >= self->lastRxMs_ + maxSilenceMs)) {
                     self->failAll("Mieru UDP retransmission limit exceeded");
                     return;
                 }
@@ -1009,14 +1064,34 @@ private:
                 self->sendOpenSessionPacketForSid(self->sessionID_);
                 return;
             }
-            if (self->raw_) {
-                self->raw_->close();
+            // Keep previous handshake sockets open in handshakeSockets_ until sessionOpened_
+            // becomes true so a delayed openSessionResponse arriving on Socket #0 is never dropped.
+            if (self->raw_ && std::find(self->handshakeSockets_.begin(), self->handshakeSockets_.end(), self->raw_) == self->handshakeSockets_.end()) {
+                self->handshakeSockets_.push_back(self->raw_);
             }
-            self->raw_ = std::move(freshDgram);
+            self->handshakeSockets_.push_back(freshDgram);
+            self->raw_ = freshDgram;
             self->serverTarget_ = std::move(nextTarget);
-            self->raw_->start([self](Target, Buffer packet) {
+            std::weak_ptr<Datagram> weakFresh = freshDgram;
+            freshDgram->start([self, weakFresh](Target, Buffer packet) {
+                if (auto sock = weakFresh.lock()) {
+                    if (!self->sessionOpened_) {
+                        self->raw_ = sock;
+                    }
+                }
                 self->onPacket(std::move(packet));
-            }, [self](Error sockErr) {
+            }, [self, weakFresh](Error sockErr) {
+                auto sock = weakFresh.lock();
+                if (sock) {
+                    self->handshakeSockets_.erase(
+                        std::remove(self->handshakeSockets_.begin(), self->handshakeSockets_.end(), sock),
+                        self->handshakeSockets_.end());
+                }
+                if (self->sessionOpened_) {
+                    if (sock && sock != self->raw_) return;
+                } else {
+                    if (sockErr != "Native UDP connection cancelled" && !self->handshakeSockets_.empty()) return;
+                }
                 self->failAll(sockErr.empty() ? Error("Mieru UDP socket error") : sockErr);
             });
             self->sessionID_ = self->allocateFreshSessionID();
@@ -1035,11 +1110,14 @@ private:
             return;
         }
         auto self = shared_from_this();
-        const double delay = (attempt == 1) ? 0.25
-                           : ((attempt == 2) ? 0.40
-                           : ((attempt == 3) ? 0.60
-                           : ((attempt == 4) ? 0.85
-                           : ((attempt == 5) ? 1.10 : 1.35))));
+        const double jitter = (attempt >= 2)
+            ? (double((initialSessionID_ ^ uint32_t(attempt * 2654435761u)) % 45) * 0.001)
+            : 0.0;
+        const double delay = ((attempt == 1) ? 0.32
+                           : ((attempt == 2) ? 0.52
+                           : ((attempt == 3) ? 0.75
+                           : ((attempt == 4) ? 1.00
+                           : ((attempt == 5) ? 1.25 : 1.45))))) + jitter;
         factory_->after(delay, [self, attempt]() {
             if (self->closed_ || self->sessionOpened_) return;
             if (self->factory_ && self->factory_->cancelled && self->factory_->cancelled()) {
@@ -1047,34 +1125,44 @@ private:
                 return;
             }
             self->openRetryAttempt_ = attempt;
+            uint64_t nowSec = unixSeconds();
             if (!self->rxKeyLocked_) {
-                uint64_t nowSec = unixSeconds();
                 self->currentKeyBucket_ = ((nowSec + 60) / 120) * 120;
                 self->candidateKeys_ = mieruCandidateKeys(self->cfg_.username, self->cfg_.password, nowSec);
                 if (!self->candidateKeys_.empty()) {
-                    // On attempt >= 3, cycle across candidateKeys_ (t, t-120s, t+120s)
-                    // to survive client/server clock skew near a 2-minute bucket boundary.
-                    size_t keyIdx = (attempt >= 3) ? (size_t(attempt - 2) % self->candidateKeys_.size()) : 0;
-                    self->txKey_ = self->candidateKeys_[keyIdx];
+                    // Always keep txKey_ locked to the current 2-minute bucket key (index 0).
+                    self->txKey_ = self->candidateKeys_.front();
                 }
             }
             if (attempt == 1) {
-                // First fast retry (250ms): re-send original sessionID_ in case the
+                // First fast retry: re-send original sessionID_ in case the
                 // initial uplink UDP datagram was dropped.
                 self->sendOpenSessionPacketForSid(self->initialSessionID_);
             } else if (attempt == 2 || attempt == 4) {
-                // If 2+ packets on the current UDP 5-tuple yielded zero response (650ms / 2.1s),
-                // rotate the underlying UDP socket (binding a fresh ephemeral source port and
-                // re-sampling port-range) to escape ISP UDP 5-tuple QoS blackholes or a wedged
-                // mita PacketUnderlay entry on the server.
+                // Add a fresh ephemeral UDP socket in parallel (while keeping earlier
+                // handshake sockets open) to escape ISP UDP 5-tuple QoS blackholes without
+                // dropping late responses arriving on the initial socket.
                 self->rotateUnderlyingSocketAndSendOpen();
             } else {
-                // Subsequent retries: allocate a fresh sessionID so that if an earlier
-                // openSessionReq reached the server and its downlink openSessionResp was
-                // lost during a burst, the server's KnownSession anti-replay filter will
-                // not drop or reject our retry.
+                // Allocate a fresh sessionID so that if an earlier openSessionReq reached
+                // the server and its downlink openSessionResp was lost during a burst,
+                // the server's KnownSession anti-replay filter will not reject our retry.
                 self->sessionID_ = self->allocateFreshSessionID();
                 self->sendOpenSessionPacketForSid(self->sessionID_);
+            }
+            // If within ±20s of a 2-minute bucket boundary on attempt >= 3, send an
+            // additional probe packet encrypted with the adjacent bucket key without
+            // mutating txKey_.
+            const uint64_t mod120 = (nowSec + 60) % 120;
+            if (attempt >= 3 && (mod120 <= 20 || mod120 >= 100) && self->candidateKeys_.size() > 1 && self->raw_) {
+                const size_t adjIdx = (mod120 <= 20) ? 1 : (self->candidateKeys_.size() > 2 ? 2 : 1);
+                try {
+                    Buffer openMeta = buildMieruSessionMetadata(
+                        kMieruOpenSessionReq, self->sessionID_, 0, 0, uint16_t(self->initialSocksReq_.size()), 0);
+                    Buffer adjPkt = sealMieruUDPSegmentWithKey(
+                        self->cfg_.username, self->candidateKeys_[adjIdx], openMeta, self->initialSocksReq_);
+                    self->raw_->send(self->serverTarget_, std::move(adjPkt), {});
+                } catch (...) {}
             }
             self->scheduleOpenRetry(attempt + 1);
         });
@@ -1203,10 +1291,12 @@ private:
                 }
             }
 
+            bool justOpened = false;
             if (!sessionOpened_) {
                 uint32_t winningSid = parsed.sessionID;
                 sessionID_ = winningSid;
                 sessionOpened_ = true;
+                justOpened = true;
                 if (openRetryAttempt_ == 0 && nowMs > handshakeStartMs_) {
                     uint64_t hsRtt = nowMs - handshakeStartMs_;
                     if (hsRtt >= 10 && hsRtt <= 1500) {
@@ -1223,13 +1313,9 @@ private:
                         }
                     }
                 }
+                closeHandshakeSocketsExcept(raw_);
                 validSessionIDs_.assign(1, winningSid);
                 scheduleKeepaliveTimer();
-                if (readyCallback_) {
-                    auto cb = std::move(readyCallback_);
-                    readyCallback_ = {};
-                    cb(shared_from_this(), {});
-                }
             }
 
             bool needCoalescedAck = false;
@@ -1300,6 +1386,11 @@ private:
                     if (needImmediateAck) sendAckNow();
                     else if (needCoalescedAck) requestCoalescedAck(ackOutOfOrder, newlyAckedCount);
                     if (needGapTimer) scheduleGapAckTimer();
+                    if (justOpened && !closed_ && readyCallback_) {
+                        auto cb = std::move(readyCallback_);
+                        readyCallback_ = {};
+                        cb(shared_from_this(), {});
+                    }
                     return;
                 }
                 if (!socksErr.empty()) {
@@ -1313,12 +1404,6 @@ private:
                 }
             }
 
-            if (socksReplyConsumed_ && !pending_.empty() && pendingRead_) {
-                auto cb = std::move(pendingRead_);
-                pendingRead_ = {};
-                cb(pending_.consume(pendingReadMax_), false, {});
-            }
-
             if (needImmediateAck) {
                 sendAckNow();
             } else if (needCoalescedAck) {
@@ -1326,6 +1411,18 @@ private:
             }
             if (needGapTimer) {
                 scheduleGapAckTimer();
+            }
+
+            if (justOpened && !closed_ && readyCallback_) {
+                auto cb = std::move(readyCallback_);
+                readyCallback_ = {};
+                cb(shared_from_this(), {});
+            }
+
+            if (socksReplyConsumed_ && !pending_.empty() && pendingRead_) {
+                auto cb = std::move(pendingRead_);
+                pendingRead_ = {};
+                cb(pending_.consume(pendingReadMax_), false, {});
             }
         } catch (...) {
             // Ignore malformed/unauthenticated UDP packets per datagram security rules
@@ -1338,6 +1435,10 @@ private:
         txUnacked_.clear();
         reorderBuf_.clear();
         terminal_ = std::move(err);
+        for (auto &sock : handshakeSockets_) {
+            if (sock) sock->close();
+        }
+        handshakeSockets_.clear();
         if (raw_) {
             raw_->close();
             raw_ = nullptr;
@@ -1355,6 +1456,7 @@ private:
     }
 
     std::shared_ptr<Datagram> raw_;
+    std::vector<std::shared_ptr<Datagram>> handshakeSockets_;
     std::shared_ptr<TransportFactory> factory_;
     Node dialNode_;
     Target serverTarget_;
@@ -1429,13 +1531,7 @@ public:
         }
 
         auto self = shared_from_this();
-        ensureStream(target, [self, packet = std::move(encapsulated), completion = std::move(completion)](Error err) mutable {
-            if (!err.empty() || !self->stream_) {
-                completion(err.empty() ? Error("Mieru UDP associate stream unavailable") : err);
-                return;
-            }
-            self->stream_->write(std::move(packet), std::move(completion));
-        });
+        sendPacketWithRetry(target, std::move(encapsulated), std::move(completion), true);
     }
 
     void start(PacketCallback receive, WriteCallback failure) override {
@@ -1446,11 +1542,39 @@ public:
     void close() override {
         if (closed_) return;
         closed_ = true;
-        if (reader_) reader_->close();
-        else if (stream_) stream_->close();
+        resetActiveStream();
     }
 
 private:
+    void resetActiveStream() {
+        auto r = std::move(reader_);
+        auto s = std::move(stream_);
+        streamUsed_ = false;
+        if (r) r->close();
+        else if (s) s->close();
+    }
+
+    void sendPacketWithRetry(Target target, Buffer packet, WriteCallback completion, bool allowRetry) {
+        auto self = shared_from_this();
+        ensureStream(target, [self, target, packet = std::move(packet), completion = std::move(completion), allowRetry](Error err) mutable {
+            if (!err.empty() || !self->stream_) {
+                completion(err.empty() ? Error("Mieru UDP associate stream unavailable") : err);
+                return;
+            }
+            auto active = self->stream_;
+            const bool wasUsed = self->streamUsed_;
+            self->streamUsed_ = true;
+            active->write(packet, [self, target, packet, completion = std::move(completion), active, wasUsed, allowRetry](Error writeErr) mutable {
+                if (!writeErr.empty() && !self->closed_ && wasUsed && allowRetry) {
+                    if (self->stream_ == active) self->resetActiveStream();
+                    self->sendPacketWithRetry(std::move(target), std::move(packet), std::move(completion), false);
+                    return;
+                }
+                completion(std::move(writeErr));
+            });
+        });
+    }
+
     void ensureStream(const Target &initialTarget, WriteCallback ready) {
         if (stream_) { ready({}); return; }
         pendingReady_.push_back(std::move(ready));
@@ -1471,6 +1595,7 @@ private:
             }
             self->stream_ = std::move(stream);
             self->reader_ = std::make_shared<Reader>(self->stream_);
+            self->streamUsed_ = false;
             for (auto &cb : callbacks) cb({});
             self->readLoop();
         });
@@ -1479,10 +1604,13 @@ private:
     void readLoop() {
         if (closed_ || !reader_) return;
         auto self = shared_from_this();
-        reader_->exactly(3, [self](Buffer hdr, Error err) {
-            if (self->closed_) return;
+        auto activeReader = reader_;
+        activeReader->exactly(3, [self, activeReader](Buffer hdr, Error err) {
+            if (self->closed_ || self->reader_ != activeReader) return;
             if (!err.empty()) {
-                if (self->failure_ && err != "EOF") self->failure_(err);
+                const bool wasUsed = self->streamUsed_;
+                self->resetActiveStream();
+                if (self->failure_ && err != "EOF" && !wasUsed) self->failure_(err);
                 return;
             }
             if (hdr[0] != 0x00) {
@@ -1490,9 +1618,10 @@ private:
                 return;
             }
             uint16_t dataLen = readBE16(hdr.data() + 1);
-            self->reader_->exactly(size_t(dataLen) + 1, [self, dataLen](Buffer body, Error berr) {
-                if (self->closed_) return;
+            activeReader->exactly(size_t(dataLen) + 1, [self, activeReader, dataLen](Buffer body, Error berr) {
+                if (self->closed_ || self->reader_ != activeReader) return;
                 if (!berr.empty()) {
+                    self->resetActiveStream();
                     if (self->failure_) self->failure_(berr);
                     return;
                 }
@@ -1521,6 +1650,7 @@ private:
     std::vector<WriteCallback> pendingReady_;
     PacketCallback receive_;
     WriteCallback failure_;
+    bool streamUsed_ = false;
     bool connecting_ = false;
     bool closed_ = false;
 };
@@ -1848,6 +1978,82 @@ bool mieruProtocolSelfTest() {
             return false;
         }
         rotatedStream->close();
+
+        // 4. Late openSessionResp arriving on Socket #1 AFTER Socket #2 was rotated on attempt == 2
+        // must still be received on Socket #1, promote Socket #1 as winner, and close Socket #2.
+        struct DelayedSocketDatagram final : public Datagram {
+            PacketCallback rx;
+            bool closed = false;
+            uint32_t capturedSid = 0;
+            Target capturedTarget;
+            Buffer serverKey;
+            void send(Target target, Buffer data, WriteCallback completion) override {
+                if (completion) completion({});
+                if (data.size() < 72) return;
+                Buffer pktNonce(data.begin(), data.begin() + 24);
+                Buffer encM(data.begin() + 24, data.begin() + 72);
+                try {
+                    Buffer plainM = crypto::open(crypto::AEAD::XChaCha20Poly1305, serverKey, pktNonce, encM);
+                    ParsedMieruMetadata pm = parseMieruMetadata(plainM);
+                    if (pm.protoType == kMieruOpenSessionReq && capturedSid == 0) {
+                        capturedSid = pm.sessionID;
+                        capturedTarget = target;
+                    }
+                } catch (...) {}
+            }
+            void start(PacketCallback receive, WriteCallback) override { rx = std::move(receive); }
+            void close() override { closed = true; rx = nullptr; }
+        };
+        auto lateSockFactory = std::make_shared<TransportFactory>();
+        std::vector<std::shared_ptr<DelayedSocketDatagram>> parallelSocks;
+        std::vector<std::function<void()>> lateTimers;
+        lateSockFactory->udp = [&](const Node &, DatagramCallback cb) {
+            auto dg = std::make_shared<DelayedSocketDatagram>();
+            dg->serverKey = serverKey;
+            parallelSocks.push_back(dg);
+            cb(dg, {});
+        };
+        lateSockFactory->post = [](std::function<void()> work) { work(); };
+        lateSockFactory->after = [&](double, std::function<void()> work) {
+            lateTimers.push_back(std::move(work));
+        };
+        std::shared_ptr<Stream> lateWinStream;
+        connectMieru(mieruNode, Target{"1.1.1.1", 443, false, false}, lateSockFactory,
+                     [&](std::shared_ptr<Stream> s, Error err) { if (err.empty()) lateWinStream = std::move(s); });
+        // Fire attempt 1 and attempt 2 (rotates to Socket #2, while Socket #1 MUST remain open!)
+        for (size_t idx = 0; idx < lateTimers.size() && idx < 2; ++idx) {
+            auto fn = lateTimers[idx];
+            fn();
+        }
+        if (parallelSocks.size() < 2 || parallelSocks[0]->closed || parallelSocks[1]->closed) {
+            return false;
+        }
+        // Now deliver openSessionResp on Socket #1 (simulating 700ms burst RTT on the initial socket)
+        Buffer lateRespMeta = buildMieruSessionMetadata(kMieruOpenSessionResp, parallelSocks[0]->capturedSid, 0, 0, 0, 0);
+        parallelSocks[0]->rx(parallelSocks[0]->capturedTarget,
+                             sealMieruUDPSegmentWithKey("alice", serverKey, lateRespMeta, {}));
+        // Socket #1 must win and remain open; Socket #2 must be automatically closed!
+        if (!lateWinStream || parallelSocks[0]->closed || !parallelSocks[1]->closed) {
+            return false;
+        }
+        // 5. Verify established MieruUDPStream survives 40ms retransmit timer even if setup
+        // factory->cancelled() returns true after readyCallback_ (post-setup scope detachment).
+        bool scopeFlagAfterReady = true;
+        lateSockFactory->cancelled = [&]() { return scopeFlagAfterReady; };
+        Error writeAfterReadyErr = "unset";
+        lateWinStream->write({0x16, 0x03, 0x01, 0x02, 0x00}, [&](Error e) { writeAfterReadyErr = std::move(e); });
+        if (!writeAfterReadyErr.empty() || parallelSocks[0]->closed) {
+            return false;
+        }
+        // Trigger the scheduled 40ms retransmit timer
+        if (!lateTimers.empty()) {
+            auto retransmitFn = lateTimers.back();
+            retransmitFn();
+        }
+        if (parallelSocks[0]->closed) {
+            return false;
+        }
+        lateWinStream->close();
 
         return true;
     } catch (...) {

@@ -857,6 +857,8 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     /// Best-effort helper teardown for process exit. Safe to call more than once.
     func shutdownEnhancedModeForQuit() {
+        diagnosticsPanel?.closeAndTeardown()
+        diagnosticsPanel = nil
         if let ticket = enhancedRequestIntent.cancel() { enhancedRequestIntent.release(ticket) }
         enhancedMode.shutdownForQuit()
         networkRuntime.lifecycleDidChange()
@@ -1233,7 +1235,12 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
                 return self.networkRuntime.startDiagnostics(configuration: self.networkDiagnosticsConfiguration,
                     onUpdate: update)
             })
-            diagnosticsPanel = NetworkDiagnosticsPanelController(capabilities: capabilities)
+            let panel = NetworkDiagnosticsPanelController(capabilities: capabilities)
+            panel.onClose = { [weak self, weak panel] in
+                guard let self, self.diagnosticsPanel === panel else { return }
+                self.diagnosticsPanel = nil
+            }
+            diagnosticsPanel = panel
         }
         diagnosticsPanel?.showWindow(nil)
         diagnosticsPanel?.window?.makeKeyAndOrderFront(nil)
@@ -4516,7 +4523,8 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         nodeLatencies[name] = .testing
         if refreshStart { schedulePolicyCardUpdates(proxies: [name]) }
         let isUDP = TCPNodeLatencyProbe.usesUDPTransport(policy)
-        nodeProbeTickets[name] = TCPNodeLatencyProbe.measure(host: host, port: port, udp: isUDP) { [weak self] result in
+        let fbPort = TCPNodeLatencyProbe.testbenchFallbackPort(for: policy)
+        nodeProbeTickets[name] = TCPNodeLatencyProbe.measure(host: host, port: port, udp: isUDP, fallbackPort: fbPort) { [weak self] result in
             self?.finishNodeProbe(named: name, requestID: requestID, batchID: batchID, epoch: epoch, result: result)
         }
     }

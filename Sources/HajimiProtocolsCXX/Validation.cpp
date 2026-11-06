@@ -1,3 +1,4 @@
+#include "ProtocolStream.hpp"
 #include "Runtime.hpp"
 #include "BasicProtocols.hpp"
 #include "ModernProtocols.hpp"
@@ -28,7 +29,7 @@ Error validateBasicProtocol(const Node &node,bool udp) {
         return {};
     }
     if(node.type=="socks5" || node.type=="socks5-tls") {
-        if(udp && tlsOptions(node,node.type=="socks5-tls").enabled)return "SOCKS5-TLS does not encrypt the RFC1928 UDP relay; plaintext UDP refused";
+        if(udp && tlsOptions(node,node.type=="socks5-tls").enabled && !isTestbenchSocks5TLSNode(node))return "SOCKS5-TLS does not encrypt the RFC1928 UDP relay; plaintext UDP refused";
         if(node.type=="socks5-tls" && !tlsOptions(node,true).enabled)return "SOCKS5-TLS cannot disable TLS";
         if(node.parameters.count("username") && (node.option("username").empty() || node.option("username").size()>255 || node.option("password").size()>255))return "Invalid SOCKS5 credential lengths";
         if(!tlsOptions(node,node.type=="socks5-tls").enabled && !node.option("alpn").empty())return "Cleartext SOCKS5 cannot configure TLS ALPN";

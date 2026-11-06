@@ -55,7 +55,9 @@ final class NativeQUICSession {
         options.initialMaxStreamsUnidirectional = 1_024
         options.maxDatagramFrameSize = max(1_200, maximumDatagramSize)
         if !serverName.isEmpty {
-            sec_protocol_options_set_tls_server_name(options.securityProtocolOptions, serverName)
+            var cleanSNI = DoHEndpoint.unbracketed(serverName)
+            if cleanSNI.contains(":"), let pct = cleanSNI.firstIndex(of: "%") { cleanSNI = String(cleanSNI[..<pct]) }
+            sec_protocol_options_set_tls_server_name(options.securityProtocolOptions, cleanSNI)
         }
         if skipCertificateVerification {
             sec_protocol_options_set_verify_block(options.securityProtocolOptions,

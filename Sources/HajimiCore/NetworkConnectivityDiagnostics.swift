@@ -140,6 +140,8 @@ public final class NetworkConnectivityDiagnosticsSession {
         guard !delivery.isCancelled else { cancelRound(detail: "本轮网络诊断已取消"); return }
         guard tasks.contains(where: { $0.operation != nil }) else { ended = true; publish(); return }
         guard isCurrent() else { cancelRound(detail: "配置或网络接口已变化，请重新测试"); return }
+        let maxRoundWallSeconds: TimeInterval = max(15, min(45, Double(tasks.count) * 4 + 8))
+        let roundDeadline = ProcessInfo.processInfo.systemUptime + maxRoundWallSeconds
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(250),
                        leeway: .milliseconds(50))
@@ -148,6 +150,9 @@ public final class NetworkConnectivityDiagnosticsSession {
             if !self.isCurrent() {
                 self.delivery.cancel()
                 self.cancelRound(detail: "配置或网络接口已变化，请重新测试")
+            } else if ProcessInfo.processInfo.systemUptime >= roundDeadline {
+                self.delivery.cancel()
+                self.cancelRound(detail: "本轮网络检测已达最大总时限，自动退出")
             }
         }
         monitor = timer; timer.resume()
@@ -385,7 +390,8 @@ final class NetworkConnectivityHTTPExchange {
         switch result {
         case .failure(let error): finish(.init(status: .failure, detail: "连接或代理握手失败", error: error))
         case .success(let (stream, initial)):
-            let request = "GET \(path) HTTP/1.1\r\nHost: \(host)\r\nUser-Agent: Hajimi\r\nConnection: close\r\n\r\n"
+            let hostHeader = (host.contains(":") && !host.hasPrefix("[")) ? "[\(host)]" : host
+            let request = "GET \(path) HTTP/1.1\r\nHost: \(hostHeader)\r\nUser-Agent: Hajimi\r\nConnection: close\r\n\r\n"
             stream.send(Data(request.utf8)) { [weak self] error in
                 guard let self else { return }
                 self.queue.async {

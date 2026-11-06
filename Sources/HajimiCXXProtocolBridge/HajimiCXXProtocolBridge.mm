@@ -41,29 +41,40 @@ NSError *nativeError(const Error &error, bool cancelled = false) {
     if(error.empty())return nil;
     if(cancelled)return cancelledError();
     if(auto platform=std::dynamic_pointer_cast<const PlatformErrorMetadata>(error.metadata()))return platform->native();
-    if(error=="Stream closed" || error=="Protocol client cancelled" || error=="Native UDP connection cancelled" || error=="Datagram session closed" || error=="Mieru UDP session closed")return cancelledError();
+    if(error=="Protocol client cancelled" || error=="Native UDP connection cancelled")return cancelledError();
     NSString *message=[[NSString alloc]initWithBytes:error.data() length:error.size() encoding:NSUTF8StringEncoding];
-    if(error=="Mieru UDP session handshake timed out" ||
-       error=="Mieru UDP retransmission limit exceeded" ||
-       error=="C++ protocol connection timed out" ||
-       error=="Sudoku KIP handshake timed out" ||
-       error=="TrustTunnel CONNECT handshake timed out" ||
-       error=="Snell handshake timed out" ||
-       error=="SSH handshake timed out" ||
-       error=="WireGuard handshake timed out" ||
-       error=="WireGuard TCP connect timed out" ||
-       error=="WireGuard in-tunnel DNS timed out"){
+    if(error.find("timed out") != std::string::npos ||
+       error.find("timeout") != std::string::npos ||
+       error=="Mieru UDP retransmission limit exceeded"){
         return [NSError errorWithDomain:NSPOSIXErrorDomain code:ETIMEDOUT userInfo:@{NSLocalizedDescriptionKey:message?:@"Connection timed out"}];
     }
-    if(error=="Mieru UDP socket error" ||
+    if(error=="Mieru SOCKS5 target connect rejected"){
+        return [NSError errorWithDomain:NSPOSIXErrorDomain code:ECONNREFUSED userInfo:@{NSLocalizedDescriptionKey:message?:@"Connection refused"}];
+    }
+    if(error=="EOF" ||
+       error=="Stream closed" ||
+       error=="Datagram session closed" ||
+       error=="Mieru UDP session closed" ||
+       error=="Mieru UDP openSessionResponse rejected" ||
+       error=="Mieru SOCKS5 reply invalid" ||
+       error=="Mieru UDP socket error" ||
        error=="Mieru UDP target connection closed by server" ||
        error=="Mieru UDP dial failed" ||
        error=="UDP transport send failed" ||
        error=="UDP transport receive failed" ||
        error=="Native UDP connection failed" ||
        error=="UDP transport closed" ||
+       error=="Chained UDP transport closed" ||
        error=="WireGuard remote peer reset TCP connection" ||
-       error=="WireGuard UDP carrier failed"){
+       error=="WireGuard UDP carrier failed" ||
+       error=="AnyTLS session closed" ||
+       error=="AnyTLS UoT carrier closed" ||
+       error=="Sudoku UoT carrier closed" ||
+       error=="UDP carrier closed" ||
+       error=="QUIC peer closed connection" ||
+       error=="QUIC UDP receive failed" ||
+       error=="QUIC UDP send failed" ||
+       error=="Snell peer closed during handshake"){
         return [NSError errorWithDomain:NSPOSIXErrorDomain code:ECONNRESET userInfo:@{NSLocalizedDescriptionKey:message?:@"Connection reset by peer"}];
     }
     return [NSError errorWithDomain:HJCppProtocolErrorDomain code:1 userInfo:@{NSLocalizedDescriptionKey:message?:@"Native protocol failure"}];
@@ -126,8 +137,15 @@ bool isLoopbackSockaddr(const sockaddr *address, socklen_t size) {
     return false;
 }
 bool addressLiteral(const std::string &host) {
+    std::string clean = host;
+    if (clean.size() >= 2 && clean.front() == '[' && clean.back() == ']')
+        clean = clean.substr(1, clean.size() - 2);
+    if (clean.find(':') != std::string::npos) {
+        auto scope = clean.find('%');
+        if (scope != std::string::npos) clean.resize(scope);
+    }
     in_addr ipv4{}; in6_addr ipv6{};
-    return inet_pton(AF_INET,host.c_str(),&ipv4)==1 || inet_pton(AF_INET6,host.c_str(),&ipv6)==1;
+    return inet_pton(AF_INET,clean.c_str(),&ipv4)==1 || inet_pton(AF_INET6,clean.c_str(),&ipv6)==1;
 }
 Node decode(NSData *configuration) {
     if(configuration.length>1024*1024)throw std::runtime_error("Protocol configuration is too large");
@@ -222,12 +240,51 @@ void closeOwnedSocket(const std::shared_ptr<std::atomic<int>> &owner) noexcept {
 // socket buffers, synchronous zero-copy ::send (guaranteeing closeSessionRequest
 // delivery before socket teardown), and batched DISPATCH_SOURCE_TYPE_READ receive.
 class PreparedStreamDatagram final:public Datagram,public std::enable_shared_from_this<PreparedStreamDatagram>{
+    struct PendingWrite {
+        Buffer framed;
+        WriteCallback completion;
+    };
     id<HJByteStream> native_;
     dispatch_queue_t queue_;
     Target peer_;
-    bool closed_ = false, started_ = false;
+    Buffer rxBuffer_;
+    size_t rxOffset_ = 0;
+    std::deque<PendingWrite> writeQueue_;
+    size_t queuedWriteBytes_ = 0;
+    bool closed_ = false, started_ = false, sending_ = false;
     PacketCallback receive_;
     WriteCallback failure_;
+    void flushWrites() {
+        if (closed_ || !native_ || sending_ || writeQueue_.empty()) return;
+        sending_ = true;
+        auto self = shared_from_this();
+        NSData *payload = data(std::move(writeQueue_.front().framed));
+        const size_t sentBytes = payload.length;
+        const auto dispatchBytes = dispatch_data_create(payload.bytes, payload.length, nullptr, ^{ (void)payload; });
+        [native_ sendContent:dispatchBytes isComplete:NO completion:^(NSError *error) {
+            auto failure = cppError(error);
+            post(self->queue_, [self, sentBytes, failure] {
+                if (self->closed_) return;
+                self->sending_ = false;
+                if (self->writeQueue_.empty()) return;
+                auto current = std::move(self->writeQueue_.front());
+                self->writeQueue_.pop_front();
+                self->queuedWriteBytes_ = self->queuedWriteBytes_ >= sentBytes ? self->queuedWriteBytes_ - sentBytes : 0;
+                if (!failure.empty()) {
+                    auto remaining = std::move(self->writeQueue_);
+                    self->writeQueue_.clear();
+                    self->queuedWriteBytes_ = 0;
+                    if (current.completion) current.completion(failure);
+                    for (auto &item : remaining) {
+                        if (item.completion) item.completion(failure);
+                    }
+                    return;
+                }
+                if (current.completion) current.completion({});
+                self->flushWrites();
+            });
+        }];
+    }
     void pumpRead() {
         if (closed_ || !started_ || !native_) return;
         auto self = shared_from_this();
@@ -242,8 +299,29 @@ class PreparedStreamDatagram final:public Datagram,public std::enable_shared_fro
             }
             post(self->queue_, [self, value = std::move(value), ended, failure]() mutable {
                 if (self->closed_) return;
-                if (!value.empty() && self->receive_) {
-                    self->receive_(self->peer_, std::move(value));
+                if (!value.empty()) {
+                    if (self->rxOffset_ == self->rxBuffer_.size()) {
+                        self->rxBuffer_.clear();
+                        self->rxOffset_ = 0;
+                    } else if (self->rxOffset_ >= 65536 && self->rxOffset_ * 2 >= self->rxBuffer_.size()) {
+                        self->rxBuffer_.erase(self->rxBuffer_.begin(), self->rxBuffer_.begin() + self->rxOffset_);
+                        self->rxOffset_ = 0;
+                    }
+                    self->rxBuffer_.insert(self->rxBuffer_.end(), value.begin(), value.end());
+                    while (self->rxBuffer_.size() - self->rxOffset_ >= 2) {
+                        const uint8_t *p = self->rxBuffer_.data() + self->rxOffset_;
+                        uint16_t frameLen = (uint16_t(p[0]) << 8) | uint16_t(p[1]);
+                        if (self->rxBuffer_.size() - self->rxOffset_ < 2 + size_t(frameLen)) break;
+                        Buffer packet(p + 2, p + 2 + frameLen);
+                        self->rxOffset_ += 2 + size_t(frameLen);
+                        if (self->receive_ && !self->closed_) {
+                            self->receive_(self->peer_, std::move(packet));
+                        }
+                    }
+                    if (self->rxOffset_ == self->rxBuffer_.size()) {
+                        self->rxBuffer_.clear();
+                        self->rxOffset_ = 0;
+                    }
                 }
                 if (!failure.empty() || ended) {
                     auto cb = std::move(self->failure_);
@@ -260,19 +338,30 @@ public:
         : native_(native), queue_(queue), peer_(std::move(peer)) {}
     ~PreparedStreamDatagram() override { close(); }
     void send(Target, Buffer value, WriteCallback completion) override {
-        if (closed_ || !native_) {
-            if (completion) completion("UDP transport closed");
+        if (value.size() > 65535) {
+            if (completion) completion("UDP packet exceeds wire limit");
             return;
         }
-        NSData *payload = data(std::move(value));
         auto self = shared_from_this();
-        const auto dispatchBytes = dispatch_data_create(payload.bytes, payload.length, nullptr, ^{ (void)payload; });
-        [native_ sendContent:dispatchBytes isComplete:NO completion:^(NSError *error) {
-            auto failure = cppError(error);
-            post(self->queue_, [self, completion, failure] {
-                if (completion) completion(failure);
-            });
-        }];
+        post(queue_, [self, value = std::move(value), completion = std::move(completion)]() mutable {
+            if (self->closed_ || !self->native_) {
+                if (completion) completion("UDP transport closed");
+                return;
+            }
+            const size_t framedSize = 2 + value.size();
+            if (self->writeQueue_.size() >= 256 || framedSize > maximumQueuedBytes - self->queuedWriteBytes_) {
+                if (completion) completion("Chained UDP write queue limit exceeded");
+                return;
+            }
+            Buffer framed;
+            framed.reserve(framedSize);
+            framed.push_back(uint8_t((value.size() >> 8) & 0xff));
+            framed.push_back(uint8_t(value.size() & 0xff));
+            framed.insert(framed.end(), value.begin(), value.end());
+            self->queuedWriteBytes_ += framedSize;
+            self->writeQueue_.push_back({std::move(framed), std::move(completion)});
+            self->flushWrites();
+        });
     }
     void start(PacketCallback receive, WriteCallback failure) override {
         if (closed_ || !native_) {
@@ -293,7 +382,16 @@ public:
         closed_ = true;
         receive_ = nullptr;
         failure_ = nullptr;
+        rxBuffer_.clear();
+        rxOffset_ = 0;
+        auto pending = std::move(writeQueue_);
+        writeQueue_.clear();
+        queuedWriteBytes_ = 0;
+        sending_ = false;
         [native_ cancel];
+        for (auto &item : pending) {
+            if (item.completion) item.completion("UDP transport closed");
+        }
     }
 };
 
@@ -332,10 +430,8 @@ public:
         if (sent < 0 && errno == EINTR) {
             sent = ::send(fd, bufPtr, value.size(), 0);
         }
-        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
-            ::usleep(150);
-            sent = ::send(fd, bufPtr, value.size(), 0);
-        }
+        // Never block context->queue with ::usleep on transient EAGAIN/ENOBUFS;
+        // upper-layer MieruUDPStream / QUIC / WireGuard timers handle retransmission asynchronously.
         if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS || errno == ECONNREFUSED)) {
             if (completion) completion({});
             return;
@@ -516,10 +612,18 @@ struct Context:std::enable_shared_from_this<Context>{
         std::lock_guard<std::mutex> lock(scopeMutex);
         if (scopeFlags.size() > 256) {
             for (auto it = scopeFlags.begin(); it != scopeFlags.end(); ) {
-                if (it->second.use_count() <= 1) it = scopeFlags.erase(it);
-                else ++it;
+                if (!it->second || (it->second.use_count() <= 1 && !it->second->load())) {
+                    it = scopeFlags.erase(it);
+                } else {
+                    ++it;
+                }
             }
-            if (scopeFlags.size() > 256) scopeFlags.clear();
+            if (scopeFlags.size() > 1024) {
+                for (auto it = scopeFlags.begin(); it != scopeFlags.end(); ) {
+                    if (it->second.use_count() <= 1) it = scopeFlags.erase(it);
+                    else ++it;
+                }
+            }
         }
         auto &flag = scopeFlags[scopeKey];
         if (!flag) flag = std::make_shared<std::atomic<bool>>(false);
@@ -535,6 +639,11 @@ struct Context:std::enable_shared_from_this<Context>{
         if (scopeKey.empty()) return;
         scopeSetupDatagrams.erase(scopeKey);
         scopeOperations.erase(scopeKey);
+        // MUST unconditionally erase scopeKey from scopeFlags once setup completes:
+        // HJCppByteStream._factory and MieruUDPStream.factory_ both retain the scoped
+        // TransportFactory (so scopeFlag.use_count() is >= 2 on success). Leaving
+        // scopeKey in scopeFlags caused post-setup cleanup calls to cancelScope(scopeKey)
+        // to store(true) into the live stream's scopeFlag and kill Mieru-UDP at 40ms!
         std::lock_guard<std::mutex> lock(scopeMutex);
         scopeFlags.erase(scopeKey);
     }
@@ -669,13 +778,12 @@ void Context::dialTCP(const Node &node,const TLSOptions &tls,NSUUID *scope,Strea
 }
 void Context::dialUDP(const Node &node,const std::string &scopeKey,DatagramCallback completion){
     if(closed){completion(nullptr,"Protocol client cancelled");return;}
-    if(!scopeKey.empty()){
-        std::lock_guard<std::mutex> lock(scopeMutex);
-        auto it=scopeFlags.find(scopeKey);
-        if(it!=scopeFlags.end() && it->second && it->second->load()){
-            completion(nullptr,"Native UDP connection cancelled");
-            return;
-        }
+    // IMPORTANT: Never hold scopeMutex while invoking completion(), because
+    // completion() -> done() -> detachScopeSetup() acquires scopeMutex on the
+    // same thread and would self-deadlock context->queue and DoHResolver.queue!
+    if (isScopeCancelled(scopeKey)) {
+        completion(nullptr, "Native UDP connection cancelled");
+        return;
     }
     if ((dialer || scopedPreparedDialer) && !node.option("underlying-proxy", node.option("dialer-proxy")).empty()) {
         auto context = shared_from_this();
@@ -825,11 +933,11 @@ void deliver(dispatch_queue_t queue,HJStreamWriteCompletion completion,Error err
 }
 - (void)sendPayload:(NSData *)payload host:(NSString *)host port:(uint16_t)port completion:(HJStreamWriteCompletion)completion{
     auto context=_context;auto datagram=_datagram;auto output=_output;
-    if(_cancelled.load()){deliver(output,completion,"Datagram session closed");return;}
+    if(_cancelled.load()){deliver(output,completion,"Datagram session closed",true);return;}
     if(!reserve(_queuedBytes,_queuedRequests,payload.length)){deliver(output,completion,"Datagram write queue limit exceeded");return;}
     NSData *snapshot=[payload copy];NSString *destination=[host copy];size_t size=snapshot.length;
     post(context->queue,[self,context,datagram,output,snapshot,destination,port,size,completion]{
-        auto done=[self,context,output,size,completion](Error error){self->_queuedBytes.fetch_sub(size);self->_queuedRequests.fetch_sub(1);deliver(output,completion,std::move(error));};
+        auto done=[self,context,output,size,completion](Error error){self->_queuedBytes.fetch_sub(size);self->_queuedRequests.fetch_sub(1);deliver(output,completion,std::move(error),self->_cancelled.load() || context->closed);};
         if(self->_cancelled.load() || context->closed){done("Datagram session closed");return;}
         try{Target target{cppString(destination),port,true,false};datagram->send(std::move(target),buffer(snapshot),done);}
         catch(const std::exception &e){done(e.what());}

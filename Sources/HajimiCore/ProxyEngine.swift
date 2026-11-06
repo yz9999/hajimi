@@ -9261,8 +9261,10 @@ private func connectTCP(host: String, port: UInt16,
         let options = NWProtocolTLS.Options()
         // Without a custom verify block, Network.framework validates the
         // certificate chain and hostname using the server name below.
-        sec_protocol_options_set_tls_server_name(options.securityProtocolOptions,
-                                                 serverName?.isEmpty == false ? serverName! : host)
+        let rawSNI = serverName?.isEmpty == false ? serverName! : host
+        var cleanSNI = DoHEndpoint.unbracketed(rawSNI)
+        if cleanSNI.contains(":"), let pct = cleanSNI.firstIndex(of: "%") { cleanSNI = String(cleanSNI[..<pct]) }
+        sec_protocol_options_set_tls_server_name(options.securityProtocolOptions, cleanSNI)
         alpn.forEach {
             sec_protocol_options_add_tls_application_protocol(options.securityProtocolOptions, $0)
         }
@@ -10833,7 +10835,9 @@ private func parseSOCKSAddress(_ data: Data, type: UInt8) -> Result<RequestTarge
     return .success(RequestTarget(host: host, port: port, protocolName: "TCP"))
 }
 
-private func socksAddress(host: String, port: UInt16) -> Data {
+private func socksAddress(host rawHost: String, port: UInt16) -> Data {
+    var host = DoHEndpoint.unbracketed(rawHost)
+    if host.contains(":"), let pct = host.firstIndex(of: "%") { host = String(host[..<pct]) }
     var ipv4 = in_addr()
     var ipv6 = in6_addr()
     var data = Data()
@@ -10880,7 +10884,7 @@ private func parseHostPort(_ value: String, defaultPort: UInt16) -> (String, UIn
 }
 
 private func hostPort(_ host: String, _ port: UInt16) -> String {
-    host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
+    (host.contains(":") && !host.hasPrefix("[")) ? "[\(host)]:\(port)" : "\(host):\(port)"
 }
 
 private func endpointDescription(_ endpoint: NWEndpoint) -> String {
@@ -10988,11 +10992,13 @@ enum ListenPortAllocator {
         address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
         address.sin6_family = sa_family_t(AF_INET6)
         address.sin6_port = port.bigEndian
-        if host == "::" || host.isEmpty {
+        var clean = DoHEndpoint.unbracketed(host)
+        if clean.contains(":"), let pct = clean.firstIndex(of: "%") { clean = String(clean[..<pct]) }
+        if clean == "::" || clean.isEmpty {
             address.sin6_addr = in6addr_loopback
         } else {
             var addr = in6_addr()
-            guard host.withCString({ inet_pton(AF_INET6, $0, &addr) }) == 1 else { return true }
+            guard clean.withCString({ inet_pton(AF_INET6, $0, &addr) }) == 1 else { return true }
             address.sin6_addr = addr
         }
         let result = withUnsafePointer(to: &address) {

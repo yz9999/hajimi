@@ -207,6 +207,12 @@ TLSOptions tlsOptions(const Node &node, bool defaultTLS) {
     options.skipVerify = node.flag("skip-cert-verify") || node.flag("skip-common-name-verify");
     options.serverName = node.option("sni", node.option("servername", node.option("ws-host",node.host)));
     if(options.serverName.empty())options.serverName=node.host;
+    if(options.serverName.size()>1 && options.serverName.front()=='[' && options.serverName.back()==']')
+        options.serverName=options.serverName.substr(1,options.serverName.size()-2);
+    if(options.serverName.find(':')!=std::string::npos){
+        auto scope=options.serverName.find('%');
+        if(scope!=std::string::npos)options.serverName.resize(scope);
+    }
     auto value = node.option("alpn"); std::string item;
     auto append = [&] { if (!item.empty()) options.alpn.push_back(item); item.clear(); };
     for (char ch : value) {

@@ -321,7 +321,8 @@ public enum PolicyProbe {
                     }
                     reservation.release()
                     guard lease.isActive else { _ = resources.finish(); return }
-                    let request = "GET \(options.path) HTTP/1.1\r\nHost: \(options.host)\r\n"
+                    let hostHeader = (options.host.contains(":") && !options.host.hasPrefix("[")) ? "[\(options.host)]" : options.host
+                    let request = "GET \(options.path) HTTP/1.1\r\nHost: \(hostHeader)\r\n"
                         + "User-Agent: Hajimi\r\nConnection: close\r\n\r\n"
                     stream.send(Data(request.utf8)) { error in
                         if let error {

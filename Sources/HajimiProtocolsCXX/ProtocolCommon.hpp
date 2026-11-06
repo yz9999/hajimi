@@ -1,5 +1,6 @@
 #pragma once
 #include "Runtime.hpp"
+#include "ProtocolStream.hpp"
 #include "Crypto.hpp"
 #include <algorithm>
 #include <cctype>
@@ -207,10 +208,12 @@ private:
 class PrefixedStream final : public Stream {
 public:
     PrefixedStream(std::shared_ptr<Stream> raw, std::shared_ptr<Reader> reader)
-        : raw_(std::move(raw)), reader_(std::move(reader)) {}
+        : raw_(std::move(raw)),
+          reader_(std::move(reader)),
+          writer_(std::make_shared<OrderedWriter>(raw_)) {}
 
     void write(Buffer data, WriteCallback completion) override {
-        raw_->write(std::move(data), std::move(completion));
+        writer_->write(std::move(data), std::move(completion));
     }
 
     void read(size_t maximum, ReadCallback completion) override {
@@ -218,12 +221,22 @@ public:
     }
 
     void close() override {
+        writer_->close();
         reader_->close();
+    }
+
+    void shutdownWrite(WriteCallback completion) override {
+        writer_->finish(std::move(completion));
+    }
+
+    bool supportsHalfClose() const override {
+        return raw_->supportsHalfClose();
     }
 
 private:
     std::shared_ptr<Stream> raw_;
     std::shared_ptr<Reader> reader_;
+    std::shared_ptr<OrderedWriter> writer_;
 };
 
 } // namespace hajimi::proto_common

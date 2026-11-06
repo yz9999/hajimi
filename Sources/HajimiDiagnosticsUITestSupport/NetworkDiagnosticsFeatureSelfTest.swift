@@ -495,5 +495,19 @@ final class NetworkDiagnosticsFeatureSelfTest {
         environment.localCallbacks[0](local()); drainMain()
         try expect(environment.reports.isEmpty && environment.cancellations[0].value == 1,
                    "deallocated feature delivered late results or repeated cleanup")
+
+        var panelClosedCount = 0
+        var panel: NetworkDiagnosticsPanelController? = NetworkDiagnosticsPanelController(capabilities: environment.capabilities())
+        weak var weakPanel = panel
+        panel?.onClose = {
+            panelClosedCount += 1
+            panel = nil
+        }
+        guard let closeButton = button(panel!.feature.view, titled: "退出诊断") else {
+            throw Failure(text: "missing explicit exit diagnostics button")
+        }
+        closeButton.performClick(nil)
+        try expect(panelClosedCount == 1 && weakPanel == nil,
+                   "explicit exit diagnostics button did not tear down and release panel controller")
     }
 }

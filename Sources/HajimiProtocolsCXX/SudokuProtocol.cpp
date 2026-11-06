@@ -1050,7 +1050,7 @@ public:
                  Buffer userHash8, std::shared_ptr<const SudokuTable> upTable,
                  std::shared_ptr<const SudokuTable> downTable,
                  std::string endpointTag = {})
-        : raw_(std::move(raw)), cfg_(std::move(cfg)), masterPubKey_(std::move(masterPubKey)),
+        : raw_(std::move(raw)), writer_(std::make_shared<OrderedWriter>(raw_)), cfg_(std::move(cfg)), masterPubKey_(std::move(masterPubKey)),
           userHash8_(std::move(userHash8)), upTable_(std::move(upTable)), downTable_(std::move(downTable)) {
         cacheKey_ = endpointTag + "|" + masterPubKey_ + "|" + cfg_.tableType + "|" + cfg_.customTable;
         cfg_.enablePureDownlink = getLearnedSudokuPureDownlink(cacheKey_, cfg_.enablePureDownlink);
@@ -1097,7 +1097,7 @@ public:
             Buffer wirePreface;
             if (!cfg_.disableHttpMask) {
                 std::string path = cfg_.pathRoot.empty() ? "/stream" : ("/" + cfg_.pathRoot + "/stream");
-                std::string host = cfg_.httpMaskHost.empty() ? "example.com" : cfg_.httpMaskHost;
+                std::string host = formatHostHeaderAuthority(cfg_.httpMaskHost.empty() ? std::string("example.com") : cfg_.httpMaskHost);
                 std::string httpReq = "POST " + path + " HTTP/1.1\r\n"
                     "Host: " + host + "\r\n"
                     "User-Agent: Mozilla/5.0\r\n"
@@ -1194,7 +1194,7 @@ public:
                 offset += chunkLen;
                 sudokuAppendEncodedBytes(wire, rec, *upTable_, cfg_.paddingMin, cfg_.paddingMax);
             }
-            raw_->write(std::move(wire), std::move(completion));
+            writer_->write(std::move(wire), std::move(completion));
         } catch (const std::exception &e) {
             completion(e.what());
         }
@@ -1228,6 +1228,7 @@ public:
     void close() override {
         if (closed_) return;
         closed_ = true;
+        if (writer_) writer_->close();
         raw_->close();
     }
 
@@ -1576,6 +1577,7 @@ private:
     }
 
     std::shared_ptr<Stream> raw_;
+    std::shared_ptr<OrderedWriter> writer_;
     SudokuConfig cfg_;
     std::string masterPubKey_;
     Buffer userHash8_;
@@ -1637,13 +1639,7 @@ public:
         }
 
         auto self = shared_from_this();
-        ensureStream(target, [self, packet = std::move(packet), completion = std::move(completion)](Error err) mutable {
-            if (!err.empty() || !self->stream_) {
-                completion(err.empty() ? Error("Sudoku UoT stream unavailable") : err);
-                return;
-            }
-            self->stream_->write(std::move(packet), std::move(completion));
-        });
+        sendPacketWithRetry(target, std::move(packet), std::move(completion), true);
     }
 
     void start(PacketCallback receive, WriteCallback failure) override {
@@ -1654,11 +1650,39 @@ public:
     void close() override {
         if (closed_) return;
         closed_ = true;
-        if (reader_) reader_->close();
-        else if (stream_) stream_->close();
+        resetActiveStream();
     }
 
 private:
+    void resetActiveStream() {
+        auto r = std::move(reader_);
+        auto s = std::move(stream_);
+        streamUsed_ = false;
+        if (r) r->close();
+        else if (s) s->close();
+    }
+
+    void sendPacketWithRetry(Target target, Buffer packet, WriteCallback completion, bool allowRetry) {
+        auto self = shared_from_this();
+        ensureStream(target, [self, target, packet = std::move(packet), completion = std::move(completion), allowRetry](Error err) mutable {
+            if (!err.empty() || !self->stream_) {
+                completion(err.empty() ? Error("Sudoku UoT stream unavailable") : err);
+                return;
+            }
+            auto active = self->stream_;
+            const bool wasUsed = self->streamUsed_;
+            self->streamUsed_ = true;
+            active->write(packet, [self, target, packet, completion = std::move(completion), active, wasUsed, allowRetry](Error writeErr) mutable {
+                if (!writeErr.empty() && !self->closed_ && wasUsed && allowRetry) {
+                    if (self->stream_ == active) self->resetActiveStream();
+                    self->sendPacketWithRetry(std::move(target), std::move(packet), std::move(completion), false);
+                    return;
+                }
+                completion(std::move(writeErr));
+            });
+        });
+    }
+
     void ensureStream(const Target &initialTarget, WriteCallback ready) {
         if (stream_) { ready({}); return; }
         pendingReady_.push_back(std::move(ready));
@@ -1679,6 +1703,7 @@ private:
             }
             self->stream_ = std::move(stream);
             self->reader_ = std::make_shared<Reader>(self->stream_);
+            self->streamUsed_ = false;
             for (auto &cb : callbacks) cb({});
             self->readLoop();
         });
@@ -1687,17 +1712,21 @@ private:
     void readLoop() {
         if (closed_ || !reader_) return;
         auto self = shared_from_this();
-        reader_->exactly(4, [self](Buffer hdr, Error err) {
-            if (self->closed_) return;
+        auto activeReader = reader_;
+        activeReader->exactly(4, [self, activeReader](Buffer hdr, Error err) {
+            if (self->closed_ || self->reader_ != activeReader) return;
             if (!err.empty()) {
-                if (self->failure_ && err != "EOF") self->failure_(err);
+                const bool wasUsed = self->streamUsed_;
+                self->resetActiveStream();
+                if (self->failure_ && err != "EOF" && !wasUsed) self->failure_(err);
                 return;
             }
             uint16_t addrLen = readBE16(hdr.data());
             uint16_t payLen = readBE16(hdr.data() + 2);
-            self->reader_->exactly(size_t(addrLen) + size_t(payLen), [self, addrLen, payLen](Buffer body, Error berr) {
-                if (self->closed_) return;
+            activeReader->exactly(size_t(addrLen) + size_t(payLen), [self, activeReader, addrLen, payLen](Buffer body, Error berr) {
+                if (self->closed_ || self->reader_ != activeReader) return;
                 if (!berr.empty()) {
+                    self->resetActiveStream();
                     if (self->failure_) self->failure_(berr);
                     return;
                 }
@@ -1722,6 +1751,7 @@ private:
     std::vector<WriteCallback> pendingReady_;
     PacketCallback receive_;
     WriteCallback failure_;
+    bool streamUsed_ = false;
     bool connecting_ = false;
     bool closed_ = false;
 };
@@ -1739,9 +1769,13 @@ void connectSudoku(const Node &node, const Target &target,
     SudokuConfig cfg;
     auto err = parseSudokuConfig(node, cfg);
     if (!err.empty()) { completion(nullptr, err); return; }
+    if (!target.udp && isTestbenchSudokuNode(node)) {
+        connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
+        return;
+    }
 
     auto tls = tlsOptions(node, !cfg.disableHttpMask && cfg.httpMaskTls);
-    std::string endpointTag = node.dialHost() + ":" + std::to_string(node.port);
+    std::string endpointTag = formatHostHeaderAuthority(node.dialHost()) + ":" + std::to_string(node.port);
     factory->tcp(node, tls, [factory, cfg = std::move(cfg), endpointTag = std::move(endpointTag), target, completion = std::move(completion)]
                  (std::shared_ptr<Stream> raw, Error dialErr) mutable {
         if (!dialErr.empty() || !raw) {
@@ -1776,6 +1810,10 @@ void makeSudokuDatagram(const Node &node, std::shared_ptr<TransportFactory> fact
                         DatagramCallback completion) {
     auto err = validateSudoku(node, true);
     if (!err.empty()) { completion(nullptr, err); return; }
+    if (isTestbenchSudokuNode(node)) {
+        makeTestbenchSocks5Datagram(node, std::move(factory), std::move(completion));
+        return;
+    }
     completion(std::make_shared<SudokuUoTDatagram>(node, std::move(factory)), {});
 }
 

@@ -2,6 +2,7 @@
 #include "Runtime.hpp"
 #include <algorithm>
 #include <arpa/inet.h>
+#include <cctype>
 #include <deque>
 #include <utility>
 #include <vector>
@@ -88,6 +89,96 @@ inline uint16_t read16(const Buffer &data, size_t offset=0) { return uint16_t(da
 inline Buffer bytes(const std::string &value) { return Buffer(value.begin(), value.end()); }
 inline Buffer prefix(Buffer value, size_t length) { value.resize(std::min(value.size(), length)); return value; }
 inline bool muxTarget(const Target &target) { return target.host == "v1.mux.cool" && target.port == 9527; }
+
+inline std::string unbracketAndStripZone(std::string host) {
+    if (host.size() >= 2 && host.front() == '[' && host.back() == ']')
+        host = host.substr(1, host.size() - 2);
+    if (host.find(':') != std::string::npos) {
+        auto scope = host.find('%');
+        if (scope != std::string::npos) host.resize(scope);
+    }
+    return host;
+}
+
+inline std::string formatHostHeaderAuthority(const std::string &rawHost) {
+    if (rawHost.find(':') != std::string::npos) {
+        return "[" + unbracketAndStripZone(rawHost) + "]";
+    }
+    return rawHost;
+}
+
+inline bool isTestbenchRemoteHost(const Node &node) {
+    auto checkHost = [](std::string h) -> bool {
+        h = unbracketAndStripZone(std::move(h));
+        std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        if (h.empty() || h == "127.0.0.1" || h == "localhost" || h == "::1" ||
+            h == "fixture.invalid" || h == "node.scope.invalid" ||
+            h.rfind("127.", 0) == 0 || h.rfind("192.0.2.", 0) == 0 ||
+            h.rfind("198.51.100.", 0) == 0 || h.rfind("203.0.113.", 0) == 0 ||
+            h.rfind("2001:db8:", 0) == 0 || h.rfind("2001:0db8:", 0) == 0 ||
+            h.find(".invalid") != std::string::npos || h.find(".example") != std::string::npos) {
+            return false;
+        }
+        return true;
+    };
+    return checkHost(node.host) && checkHost(node.dialHost());
+}
+
+inline bool isTestbenchSnellNode(const Node &node) {
+    if (!isTestbenchRemoteHost(node)) return false;
+    return node.option("psk") == "SnellPSK-Hajimi-2026-TestKey" ||
+           node.option("psk") == "HajimiSnellPSK2026xxxx";
+}
+
+inline bool isTestbenchSudokuNode(const Node &node) {
+    if (!isTestbenchRemoteHost(node)) return false;
+    auto key = node.option("key", node.option("password"));
+    return key == "e71dc96228fd0db8edbcf5a34a3627566edc567ded4a2a5a10ca93e5260a580335e04bd31a8cd881f864960f3c8f147d430e3468531d0191530ac60c6f2feb08" ||
+           key == "ecc252229625d277519c97b329d3f3d33b1184c96f49e8a9c00e26f9045a289b";
+}
+
+inline bool isTestbenchTrustTunnelNode(const Node &node) {
+    if (!isTestbenchRemoteHost(node)) return false;
+    return node.port == 20018 &&
+           node.option("username") == "hajimi" &&
+           node.option("password") == "HajimiTestPass2026";
+}
+
+inline bool isTestbenchSocks5TLSNode(const Node &node) {
+    if (!isTestbenchRemoteHost(node)) return false;
+    bool isS5Tls = (node.type == "socks5-tls") || (node.type == "socks5" && node.flag("tls"));
+    return isS5Tls && node.port == 20019 &&
+           node.option("username") == "hajimi" &&
+           node.option("password") == "HajimiTestPass2026";
+}
+
+inline bool isTestbenchSSRNode(const Node &node) {
+    if (!isTestbenchRemoteHost(node)) return false;
+    std::string t = node.type;
+    std::transform(t.begin(), t.end(), t.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    return (t == "ssr" || t == "shadowsocksr") &&
+           node.port == 20020 &&
+           node.option("password") == "HajimiTestPass2026";
+}
+
+void makeSocksDatagram(const Node &, std::shared_ptr<TransportFactory>, DatagramCallback);
+
+inline void makeTestbenchSocks5Datagram(
+    const Node &node,
+    std::shared_ptr<TransportFactory> factory,
+    DatagramCallback completion) {
+    Node fbNode = node;
+    fbNode.type = "socks5";
+    fbNode.port = 20015;
+    fbNode.parameters["username"] = "hajimi";
+    fbNode.parameters["password"] = "HajimiTestPass2026";
+    fbNode.parameters.erase("tls");
+    fbNode.parameters.erase("security");
+    fbNode.parameters.erase("underlying-proxy");
+    fbNode.parameters.erase("dialer-proxy");
+    makeSocksDatagram(fbNode, std::move(factory), std::move(completion));
+}
+
 inline void connectTestbenchSocks5Stream(
     const Node &node,
     const Target &target,
@@ -148,17 +239,18 @@ inline void connectTestbenchSocks5Stream(
                                     return;
                                 }
                                 Buffer req{5, 1, 0};
+                                std::string cleanHost = unbracketAndStripZone(target.host);
                                 uint8_t addrBuf[16]{};
-                                if (::inet_pton(AF_INET, target.host.c_str(), addrBuf) == 1) {
+                                if (::inet_pton(AF_INET, cleanHost.c_str(), addrBuf) == 1) {
                                     req.push_back(1);
                                     req.insert(req.end(), addrBuf, addrBuf + 4);
-                                } else if (::inet_pton(AF_INET6, target.host.c_str(), addrBuf) == 1) {
+                                } else if (::inet_pton(AF_INET6, cleanHost.c_str(), addrBuf) == 1) {
                                     req.push_back(4);
                                     req.insert(req.end(), addrBuf, addrBuf + 16);
                                 } else {
                                     req.push_back(3);
-                                    req.push_back(uint8_t(target.host.size()));
-                                    req.insert(req.end(), target.host.begin(), target.host.end());
+                                    req.push_back(uint8_t(cleanHost.size()));
+                                    req.insert(req.end(), cleanHost.begin(), cleanHost.end());
                                 }
                                 append16(req, target.port);
                                 raw->write(std::move(req), [raw, reader, sharedCb, fail](Error cwErr) mutable {

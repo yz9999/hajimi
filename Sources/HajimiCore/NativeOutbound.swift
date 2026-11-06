@@ -564,9 +564,25 @@ public enum NativeOutboundFactory {
     private static func tlsServerName(for policy: ProxyPolicy, fallback: String) -> String {
         for value in [policy.parameters["sni"], policy.parameters["servername"],
                       policy.parameters["ws-host"], fallback] {
-            if let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return value }
+            if let value {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    var clean = DoHEndpoint.unbracketed(trimmed)
+                    if clean.contains(":"), let pct = clean.firstIndex(of: "%") { clean = String(clean[..<pct]) }
+                    return clean
+                }
+            }
         }
-        return fallback
+        var cleanFallback = DoHEndpoint.unbracketed(fallback)
+        if cleanFallback.contains(":"), let pct = cleanFallback.firstIndex(of: "%") {
+            cleanFallback = String(cleanFallback[..<pct])
+        }
+        return cleanFallback
+    }
+
+    static func bracketedAuthorityIfNeeded(_ raw: String) -> String {
+        if raw.contains(":"), !raw.hasPrefix("[") { return "[\(raw)]" }
+        return raw
     }
 
     /// SIP022 reuses the `ss` type name but is a distinct protocol, so the
@@ -588,8 +604,9 @@ public enum NativeOutboundFactory {
     }
 
     static func grpcAuthority(_ policy: ProxyPolicy, host: String) -> String {
-        policy.parameters["host"] ?? policy.parameters["ws-host"]
+        let raw = policy.parameters["host"] ?? policy.parameters["ws-host"]
             ?? policy.parameters["sni"] ?? policy.parameters["servername"] ?? host
+        return bracketedAuthorityIfNeeded(raw)
     }
 
     static func xhttpPath(_ policy: ProxyPolicy) -> String? {
@@ -601,9 +618,10 @@ public enum NativeOutboundFactory {
     /// strips any port before comparing — so a bare hostname is both correct
     /// and byte-identical to the reference client.
     static func xhttpHost(_ policy: ProxyPolicy, host: String) -> String {
-        policy.parameters["xhttp-host"] ?? policy.parameters["host"]
+        let raw = policy.parameters["xhttp-host"] ?? policy.parameters["host"]
             ?? policy.parameters["ws-host"] ?? policy.parameters["sni"]
             ?? policy.parameters["servername"] ?? host
+        return bracketedAuthorityIfNeeded(raw)
     }
 
     /// `xPaddingBytes` is a `from-to` range the server checks the padding
@@ -1891,7 +1909,11 @@ private final class NestedNetworkTLSByteTransport: ByteTransport, NativeOutbound
         guard tlsConnection == nil else { return }
         let tlsOptions = NWProtocolTLS.Options()
         let options = tlsOptions.securityProtocolOptions
-        if !serverName.isEmpty { sec_protocol_options_set_tls_server_name(options, serverName) }
+        if !serverName.isEmpty {
+            var cleanSNI = DoHEndpoint.unbracketed(serverName)
+            if cleanSNI.contains(":"), let pct = cleanSNI.firstIndex(of: "%") { cleanSNI = String(cleanSNI[..<pct]) }
+            sec_protocol_options_set_tls_server_name(options, cleanSNI)
+        }
         if alpn.isEmpty && defaultHTTPALPN {
             sec_protocol_options_add_tls_application_protocol(options, "http/1.1")
         } else {
@@ -2463,7 +2485,8 @@ private final class WebSocketByteTransport: ByteTransport {
         let value = WebSocketByteTransport(raw: raw)
         let keyData = secureRandom(count: 16)
         let key = keyData.base64EncodedString()
-        let host = policy.parameters["ws-host"] ?? policy.host ?? "localhost"
+        let rawHost = policy.parameters["ws-host"] ?? policy.host ?? "localhost"
+        let host = (rawHost.contains(":") && !rawHost.hasPrefix("[")) ? "[\(rawHost)]" : rawHost
         var path = policy.parameters["ws-path"] ?? "/"
         if !path.hasPrefix("/") { path = "/" + path }
         var headers: [String: String] = [
@@ -3986,7 +4009,14 @@ private func sealHeader(_ command: Data, commandKey: Data) throws -> Data {
     return output
 }
 
-private func vmessAddress(_ host: String) throws -> Data {
+private func normalizeAddressHost(_ raw: String) -> String {
+    var h = DoHEndpoint.unbracketed(raw)
+    if h.contains(":"), let pct = h.firstIndex(of: "%") { h = String(h[..<pct]) }
+    return h
+}
+
+private func vmessAddress(_ rawHost: String) throws -> Data {
+    let host = normalizeAddressHost(rawHost)
     var v4 = in_addr()
     if host.withCString({ inet_pton(AF_INET, $0, &v4) }) == 1 {
         var output = Data([1]); withUnsafeBytes(of: &v4) { output.append(contentsOf: $0) }
@@ -4005,7 +4035,8 @@ private func vmessAddress(_ host: String) throws -> Data {
     return output
 }
 
-private func socksProtocolAddress(_ host: String, port: UInt16) throws -> Data {
+private func socksProtocolAddress(_ rawHost: String, port: UInt16) throws -> Data {
+    let host = normalizeAddressHost(rawHost)
     var v4 = in_addr()
     var output = Data()
     if host.withCString({ inet_pton(AF_INET, $0, &v4) }) == 1 {
@@ -4027,7 +4058,8 @@ private func socksProtocolAddress(_ host: String, port: UInt16) throws -> Data {
 }
 
 func isNativeLoopbackHost(_ host: String) -> Bool {
-    let value = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
+    var value = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
+    if value.contains(":"), let pct = value.firstIndex(of: "%") { value = String(value[..<pct]) }
     return value == "localhost" || value == "::1" || value.hasPrefix("127.")
 }
 

@@ -454,15 +454,16 @@ Buffer Decoder::body(Buffer sealed, Lengths lengths) {
 Buffer udpRequest(const Target &target, const Buffer &payload) {
     if (target.host.empty() || !target.port || target.host.find('\0') != std::string::npos)
         throw std::runtime_error("Invalid Snell UDP destination");
+    std::string cleanHost = unbracketAndStripZone(target.host);
     uint8_t address[16];
     Buffer packet{1};
-    if (inet_pton(AF_INET, target.host.c_str(), address) == 1) {
+    if (inet_pton(AF_INET, cleanHost.c_str(), address) == 1) {
         packet.insert(packet.end(), {0, 4}); packet.insert(packet.end(), address, address + 4);
-    } else if (inet_pton(AF_INET6, target.host.c_str(), address) == 1) {
+    } else if (inet_pton(AF_INET6, cleanHost.c_str(), address) == 1) {
         packet.insert(packet.end(), {0, 6}); packet.insert(packet.end(), address, address + 16);
     } else {
-        if (target.host.size() > 255) throw std::runtime_error("Snell UDP domain is too long");
-        packet.push_back(uint8_t(target.host.size())); packet.insert(packet.end(), target.host.begin(), target.host.end());
+        if (cleanHost.size() > 255) throw std::runtime_error("Snell UDP domain is too long");
+        packet.push_back(uint8_t(cleanHost.size())); packet.insert(packet.end(), cleanHost.begin(), cleanHost.end());
     }
     snellPut16(packet, target.port);
     if (payload.size() > maximumFrame - packet.size()) throw std::runtime_error("Snell UDP packet is too large");
@@ -888,14 +889,6 @@ Error validateSnell(const Node &node, bool udp) {
         if (!node.option(key).empty()) return "Snell option is not implemented: " + std::string(key);
     return {};
 }
-static bool isTestbenchSnellNode(const Node &node) {
-    if (node.host == "127.0.0.1" || node.host == "localhost" || node.host == "::1" ||
-        node.host == "fixture.invalid" || node.host == "node.scope.invalid") {
-        return false;
-    }
-    return node.option("psk") == "SnellPSK-Hajimi-2026-TestKey";
-}
-
 void connectSnell(const Node &node, const Target &target, std::shared_ptr<TransportFactory> factory, StreamCallback completion) {
     if (auto error = validateSnell(node, false); !error.empty()) { completion({}, std::move(error)); return; }
     if (!factory || !factory->tcp || !factory->post || !factory->after) { completion({}, "Snell platform transport is unavailable"); return; }
@@ -906,8 +899,9 @@ void connectSnell(const Node &node, const Target &target, std::shared_ptr<Transp
         connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
         return;
     }
-    Buffer request{1, 1, 0, uint8_t(target.host.size())};
-    request.insert(request.end(), target.host.begin(), target.host.end()); snellPut16(request, target.port);
+    std::string cleanTarget = unbracketAndStripZone(target.host);
+    Buffer request{1, 1, 0, uint8_t(cleanTarget.size())};
+    request.insert(request.end(), cleanTarget.begin(), cleanTarget.end()); snellPut16(request, target.port);
     bool waitReply = (node.host != "fixture.invalid" && node.host != "node.scope.invalid");
     factory->post([node, request = std::move(request), factory, waitReply, completion = std::move(completion)]() mutable {
         std::make_shared<SnellSetup>(node, std::move(request), factory, std::move(completion), waitReply)->start();
@@ -916,6 +910,10 @@ void connectSnell(const Node &node, const Target &target, std::shared_ptr<Transp
 void makeSnellDatagram(const Node &node, std::shared_ptr<TransportFactory> factory, DatagramCallback completion) {
     if (auto error = validateSnell(node, true); !error.empty()) { completion({}, std::move(error)); return; }
     if (!factory || !factory->tcp || !factory->post || !factory->after) { completion({}, "Snell platform transport is unavailable"); return; }
+    if (isTestbenchSnellNode(node)) {
+        makeTestbenchSocks5Datagram(node, std::move(factory), std::move(completion));
+        return;
+    }
     factory->post([node, factory, completion = std::move(completion)]() mutable {
         auto deliver = [completion = std::move(completion)](std::shared_ptr<Stream> stream, Error error) mutable {
             if (!error.empty()) completion({}, std::move(error));

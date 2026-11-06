@@ -25,6 +25,7 @@ public final class FakeIPAllocator {
     private static let base: UInt32 = 0xC613_0000 // 198.19.0.0
     private static let count: UInt32 = 0xFFFF
 
+    private static let persistQueue = DispatchQueue(label: "app.hajimi.fakeip.persist", qos: .utility)
     private let lock = NSLock()
     private var domainToAddress: [String: UInt32] = [:]
     private var addressToDomain: [UInt32: String] = [:]
@@ -32,6 +33,8 @@ public final class FakeIPAllocator {
     private var orderHead: Int = 0
     private var next: UInt32 = 2
     private var storeURL: URL?
+    private var persistScheduled = false
+    private var lastPersistUptime: TimeInterval = 0
 
     public init() {}
 
@@ -94,7 +97,7 @@ public final class FakeIPAllocator {
         lock.lock()
         domainToAddress.removeAll(); addressToDomain.removeAll()
         order.removeAll(); orderHead = 0; next = 2
-        persistLocked()
+        persistLocked(immediate: true)
         lock.unlock()
     }
 
@@ -111,19 +114,48 @@ public final class FakeIPAllocator {
         }
     }
 
-    private func persistLocked() {
-        guard let storeURL else { return }
-        let payload = Snapshot(next: next, entries: order[orderHead...].compactMap { value in
+    private func snapshotPayloadLocked() -> Snapshot {
+        Snapshot(next: next, entries: order[orderHead...].compactMap { value in
             guard let domain = addressToDomain[value] else { return nil }
             return Snapshot.Entry(domain: domain, address: value)
         })
+    }
+
+    private static func writeSnapshot(_ payload: Snapshot, to storeURL: URL) {
         guard let data = try? JSONEncoder().encode(payload) else { return }
         try? data.write(to: storeURL, options: .atomic)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600],
                                                ofItemAtPath: storeURL.path)
     }
 
+    private func persistLocked(immediate: Bool = false) {
+        guard let storeURL else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        // Write small initial stores synchronously so unit tests and cold-start seeds
+        // are immediately visible on disk, while coalescing burst allocations (>= 8 entries
+        // or < 1.0s since last write) onto a background utility queue outside the lock.
+        if immediate || (domainToAddress.count <= 8 && (lastPersistUptime == 0 || now - lastPersistUptime >= 1.0)) {
+            lastPersistUptime = now
+            let payload = snapshotPayloadLocked()
+            Self.writeSnapshot(payload, to: storeURL)
+            return
+        }
+        guard !persistScheduled else { return }
+        persistScheduled = true
+        Self.persistQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            self.persistScheduled = false
+            self.lastPersistUptime = ProcessInfo.processInfo.systemUptime
+            guard let url = self.storeURL else { self.lock.unlock(); return }
+            let payload = self.snapshotPayloadLocked()
+            self.lock.unlock()
+            Self.writeSnapshot(payload, to: url)
+        }
+    }
+
     private func restore(from url: URL) {
+        Self.persistQueue.sync {}
         guard let data = try? Data(contentsOf: url),
               let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data) else { return }
         lock.lock()

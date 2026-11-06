@@ -36,6 +36,10 @@ void connectBasicProtocol(
         connectVMessProtocol(node, target, std::move(factory), std::move(completion));
         return;
     }
+    if (!target.udp && isTestbenchSocks5TLSNode(node)) {
+        connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
+        return;
+    }
     bool tlsDefault = node.type == "https" || node.type == "socks5-tls" || node.type == "trojan";
     auto tls = tlsOptions(node, tlsDefault);
     if ((node.type == "http" || node.type == "https") && tls.enabled && tls.alpn.empty())
@@ -68,12 +72,12 @@ void connectBasicProtocol(
 namespace {
 
 class StreamDatagrams final : public Datagram, public std::enable_shared_from_this<StreamDatagrams> {
-    struct Pending { Buffer data; WriteCallback completion; };
+    struct Pending { Buffer data; WriteCallback completion; uint8_t retries = 0; };
     struct Flow {
         Target target;
         std::shared_ptr<Stream> stream;
         std::deque<Pending> pending;
-        bool connecting = false, sending = false;
+        bool connecting = false, sending = false, established = false;
         uint64_t activity = 0;
     };
     Node node_;
@@ -87,6 +91,7 @@ class StreamDatagrams final : public Datagram, public std::enable_shared_from_th
     void failFlow(const std::string &key, std::shared_ptr<Flow> flow, Error error) {
         auto found = flows_.find(key);
         if (found == flows_.end() || found->second != flow) return;
+        const bool idleBackgroundClose = flow->established && flow->pending.empty() && !flow->sending;
         flows_.erase(found);
         if (flow->stream) flow->stream->close();
         auto pending = std::move(flow->pending);
@@ -96,17 +101,52 @@ class StreamDatagrams final : public Datagram, public std::enable_shared_from_th
             --requests_;
             entry.completion(error);
         }
-        if (!closed_ && failure_ && error != "EOF") failure_(error);
+        if (!closed_ && failure_ && error != "EOF" && !idleBackgroundClose) failure_(error);
+    }
+
+    void connectFlow(const std::string &key, std::shared_ptr<Flow> flow) {
+        if (closed_ || flow->connecting || flow->stream) return;
+        flow->connecting = true;
+        auto self = shared_from_this();
+        connectProtocol(node_, flow->target, factory_, [self, key, flow](std::shared_ptr<Stream> stream, Error error) {
+            if (self->closed_ || !self->flows_.count(key) || self->flows_.at(key) != flow) {
+                if (stream) stream->close();
+                return;
+            }
+            flow->connecting = false;
+            if (!error.empty() || !stream) {
+                self->failFlow(key, flow, error.empty() ? "UDP stream connect failed" : error);
+                return;
+            }
+            flow->stream = std::move(stream);
+            self->flush(key, flow);
+            self->read(key, flow);
+        });
     }
 
     void flush(const std::string &key, std::shared_ptr<Flow> flow) {
         if (closed_ || !flow->stream || flow->sending || flow->pending.empty()) return;
         flow->sending = true;
         auto self = shared_from_this();
-        flow->stream->write(flow->pending.front().data, [self, key, flow](Error error) {
+        auto activeStream = flow->stream;
+        activeStream->write(flow->pending.front().data, [self, key, flow, activeStream](Error error) {
             if (self->closed_ || !self->flows_.count(key) || self->flows_.at(key) != flow) return;
             flow->sending = false;
-            if (!error.empty()) { self->failFlow(key, flow, error); return; }
+            if (!error.empty()) {
+                if (flow->established && !flow->pending.empty() && flow->pending.front().retries == 0) {
+                    flow->pending.front().retries = 1;
+                    if (flow->stream == activeStream) {
+                        flow->stream->close();
+                        flow->stream.reset();
+                    }
+                    flow->established = false;
+                    self->connectFlow(key, flow);
+                    return;
+                }
+                self->failFlow(key, flow, error);
+                return;
+            }
+            flow->established = true;
             auto entry = std::move(flow->pending.front());
             flow->pending.pop_front();
             self->queued_ -= entry.data.size();
@@ -120,10 +160,12 @@ class StreamDatagrams final : public Datagram, public std::enable_shared_from_th
     void read(const std::string &key, std::shared_ptr<Flow> flow) {
         if (closed_ || !started_ || !flow->stream) return;
         auto self = shared_from_this();
-        flow->stream->read(65535, [self, key, flow](Buffer data, bool eof, Error error) {
-            if (self->closed_ || !self->flows_.count(key) || self->flows_.at(key) != flow) return;
+        auto activeStream = flow->stream;
+        activeStream->read(65535, [self, key, flow, activeStream](Buffer data, bool eof, Error error) {
+            if (self->closed_ || !self->flows_.count(key) || self->flows_.at(key) != flow || flow->stream != activeStream) return;
             if (!error.empty()) { self->failFlow(key, flow, error); return; }
             if ((!data.empty() || !eof) && self->receive_) {
+                flow->established = true;
                 flow->activity = unixSeconds();
                 self->receive_(flow->target, std::move(data));
             }
@@ -158,7 +200,7 @@ public:
             return;
         }
         target.udp = true;
-        std::string key = target.host + ":" + std::to_string(target.port);
+        std::string key = formatHostHeaderAuthority(target.host) + ":" + std::to_string(target.port);
         std::shared_ptr<Flow> flow;
         if (auto found = flows_.find(key); found != flows_.end()) {
             flow = found->second;
@@ -171,25 +213,9 @@ public:
         }
         queued_ += data.size();
         ++requests_;
-        flow->pending.push_back({std::move(data), std::move(completion)});
+        flow->pending.push_back({std::move(data), std::move(completion), 0});
         if (flow->stream) { flush(key, flow); return; }
-        if (flow->connecting) return;
-        flow->connecting = true;
-        auto self = shared_from_this();
-        connectProtocol(node_, target, factory_, [self, key, flow](std::shared_ptr<Stream> stream, Error error) {
-            if (self->closed_ || !self->flows_.count(key) || self->flows_.at(key) != flow) {
-                if (stream) stream->close();
-                return;
-            }
-            flow->connecting = false;
-            if (!error.empty() || !stream) {
-                self->failFlow(key, flow, error.empty() ? "UDP stream connect failed" : error);
-                return;
-            }
-            flow->stream = std::move(stream);
-            self->flush(key, flow);
-            self->read(key, flow);
-        });
+        connectFlow(key, flow);
     }
 
     void start(PacketCallback receive, WriteCallback failure) override {

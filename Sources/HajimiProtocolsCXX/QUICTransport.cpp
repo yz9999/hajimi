@@ -307,18 +307,52 @@ Error Connection::Impl::setupSocket() {
         rem4.sin_family = AF_INET; rem4.sin_port = htons(activePort ? activePort : 443); rem4.sin_addr.s_addr = htonl(0x7f000002);
         localLength = sizeof(loc4); remoteLength = sizeof(rem4);
         std::memcpy(&local, &loc4, localLength); std::memcpy(&remote, &rem4, remoteLength);
-        std::mutex waitLock; std::condition_variable waitCV; bool done = false;
-        std::shared_ptr<Datagram> dgram; Error dialErr;
-        factory->udp(node, [&](std::shared_ptr<Datagram> d, Error e) {
-            std::lock_guard<std::mutex> g(waitLock);
-            dgram = std::move(d); dialErr = std::move(e); done = true; waitCV.notify_one();
-        });
+        struct ChainedUDPWaitState {
+            std::mutex lock;
+            std::condition_variable cv;
+            bool done = false;
+            bool abandoned = false;
+            std::shared_ptr<Datagram> dgram;
+            Error dialErr;
+        };
+        auto waitState = std::make_shared<ChainedUDPWaitState>();
+        auto startUDP = [factory = this->factory, node = this->node, waitState]() {
+            factory->udp(node, [waitState](std::shared_ptr<Datagram> d, Error e) {
+                bool shouldClose = false;
+                {
+                    std::lock_guard<std::mutex> g(waitState->lock);
+                    if (waitState->abandoned) {
+                        shouldClose = true;
+                    } else {
+                        waitState->dgram = std::move(d);
+                        waitState->dialErr = std::move(e);
+                        waitState->done = true;
+                    }
+                }
+                if (shouldClose && d) d->close();
+                waitState->cv.notify_one();
+            });
+        };
+        if (factory->post) factory->post(startUDP);
+        else startUDP();
+        std::shared_ptr<Datagram> dgram;
+        Error dialErr;
+        bool completed = false;
         {
-            std::unique_lock<std::mutex> u(waitLock);
-            waitCV.wait_for(u, std::chrono::seconds(10), [&] { return done || cancelled(); });
+            std::unique_lock<std::mutex> u(waitState->lock);
+            waitState->cv.wait_for(u, std::chrono::seconds(10), [&] { return waitState->done || cancelled(); });
+            if (!waitState->done || cancelled()) {
+                waitState->abandoned = true;
+                dgram = std::move(waitState->dgram);
+            } else {
+                completed = true;
+                dgram = std::move(waitState->dgram);
+                dialErr = std::move(waitState->dialErr);
+            }
         }
         if (cancelled()) { if (dgram) dgram->close(); return "QUIC connection cancelled"; }
-        if (!done || !dialErr.empty() || !dgram) {
+        if (!completed || !dialErr.empty() || !dgram) {
+            if (dgram) dgram->close();
             return dialErr.empty() ? Error("QUIC underlying-proxy UDP relay unavailable") : dialErr;
         }
         chainedDatagram = dgram;
@@ -439,6 +473,12 @@ Error Connection::Impl::setupTLS() {
     };
     SSL_set_app_data(tls, &reference); SSL_set_connect_state(tls);
     std::string name = options.serverName.empty() ? node.host : options.serverName;
+    if (name.size() >= 2 && name.front() == '[' && name.back() == ']')
+        name = name.substr(1, name.size() - 2);
+    if (name.find(':') != std::string::npos) {
+        auto scope = name.find('%');
+        if (scope != std::string::npos) name.resize(scope);
+    }
     uint8_t numeric[16];
     bool isIP = inet_pton(AF_INET, name.c_str(), numeric) == 1 ||
                 inet_pton(AF_INET6, name.c_str(), numeric) == 1;
@@ -866,7 +906,7 @@ Error Connection::Impl::readPackets() {
         auto length = ::recv(socket, input, sizeof(input), 0);
         if (length < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return {};
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == ECONNREFUSED) continue;
             return "QUIC UDP receive failed";
         }
         auto data = obfuscate(input, static_cast<size_t>(length), false);
@@ -915,7 +955,7 @@ Error Connection::Impl::writePackets() {
             pendingWire.clear();
             return 1;
         }
-        if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
+        if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == ENOBUFS || errno == ECONNREFUSED)) return 0;
         if (length < 0 && (errno == EMSGSIZE || ++consecutiveSendLosses_ >= 3) && maxTxPayload_ > 1200) {
             maxTxPayload_ = maxTxPayload_ > 1280 ? 1280 : 1200;
             pmtudState_ = DPLPMTUDState::BlackholeRecovery;
@@ -925,11 +965,11 @@ Error Connection::Impl::writePackets() {
             pendingWire.clear();
             return 1;
         }
-        if (length < 0 && (errno == EADDRNOTAVAIL || errno == ENETDOWN || errno == ENETUNREACH)
+        if (length < 0 && (errno == EADDRNOTAVAIL || errno == ENETDOWN || errno == ENETUNREACH || errno == EHOSTUNREACH || errno == ENOTCONN)
             && migrateSocketOnPathChange()) {
             auto retried = ::send(socket, pendingWire.data(), pendingWire.size(), 0);
             if (retried == static_cast<ssize_t>(pendingWire.size())) { pendingWire.clear(); return 1; }
-            if (retried < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
+            if (retried < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == ENOBUFS || errno == ECONNREFUSED)) return 0;
         }
         return -1;
     };

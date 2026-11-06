@@ -1701,6 +1701,7 @@ private func rawUUIDData(_ uuid: UUID) -> Data {
 private func tuicAddress(_ target: RequestTarget) throws -> Data {
     var host = target.host
     if host.hasPrefix("["), host.hasSuffix("]") { host = String(host.dropFirst().dropLast()) }
+    if host.contains(":"), let pct = host.firstIndex(of: "%") { host = String(host[..<pct]) }
     var ipv4 = in_addr()
     if host.withCString({ inet_pton(AF_INET, $0, &ipv4) }) == 1 {
         var data = Data([0x01]); withUnsafeBytes(of: &ipv4) { data.append(contentsOf: $0) }

@@ -1,4 +1,5 @@
 #include "WireGuardProtocol.hpp"
+#include "ProtocolCommon.hpp"
 #include "ProtocolStream.hpp"
 #include "Crypto.hpp"
 #include <openssl/crypto.h>
@@ -276,6 +277,8 @@ struct WGConfig {
     Buffer psk;
     uint32_t selfIPv4 = 0; // Network byte order
     uint32_t dnsIPv4 = 0;  // Network byte order
+    std::array<uint8_t, 16> selfIPv6{};
+    bool hasSelfIPv6 = false;
     std::array<uint8_t, 3> reserved{0, 0, 0};
     size_t mtu = 1420;
     ~WGConfig() {
@@ -283,6 +286,22 @@ struct WGConfig {
         if (!psk.empty()) OPENSSL_cleanse(psk.data(), psk.size());
     }
 };
+
+bool tryParseIPv6CIDR(std::string text, std::array<uint8_t, 16> &out) {
+    auto slash = text.find('/');
+    if (slash != std::string::npos) text = text.substr(0, slash);
+    auto semi = text.find(';');
+    if (semi != std::string::npos) text = text.substr(0, semi);
+    auto comma = text.find(',');
+    if (comma != std::string::npos) text = text.substr(0, comma);
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) text.erase(text.begin());
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) text.pop_back();
+    text = unbracketAndStripZone(std::move(text));
+    in6_addr addr6{};
+    if (inet_pton(AF_INET6, text.c_str(), &addr6) != 1) return false;
+    std::memcpy(out.data(), &addr6, 16);
+    return true;
+}
 
 uint32_t parseIPv4CIDR(std::string text) {
     auto slash = text.find('/');
@@ -339,6 +358,12 @@ WGConfig parseWGConfig(const Node &node) {
         cfg.psk = Buffer(32, 0);
     }
     cfg.selfIPv4 = parseIPv4CIDR(ipStr);
+    auto ipv6Str = node.option("ipv6", node.option("self-ip-v6"));
+    if (!ipv6Str.empty() && tryParseIPv6CIDR(ipv6Str, cfg.selfIPv6)) {
+        cfg.hasSelfIPv6 = true;
+    } else {
+        tryParseIPv6CIDR("fd00:6861:6a69:66::2", cfg.selfIPv6);
+    }
     auto dnsStr = node.option("dns", node.option("dns-server", "223.5.5.5"));
     try { cfg.dnsIPv4 = parseIPv4CIDR(dnsStr); }
     catch (...) { cfg.dnsIPv4 = parseIPv4CIDR("223.5.5.5"); }
@@ -502,6 +527,14 @@ bool decryptTransportPacket(const WGHandshakeState &hs, const Buffer &pkt, Buffe
                 ipPacketOut = std::move(plain);
                 return true;
             }
+        } else if ((plain[0] >> 4) == 6 && plain.size() >= 40) {
+            uint16_t payloadLen = readBE16(plain.data() + 4);
+            size_t totalLen = 40 + size_t(payloadLen);
+            if (totalLen <= plain.size()) {
+                plain.resize(totalLen);
+                ipPacketOut = std::move(plain);
+                return true;
+            }
         }
         return false;
     } catch (...) {
@@ -600,6 +633,67 @@ Buffer buildIPv4TCPPacket(uint32_t srcIPNet, uint16_t srcPort, uint32_t dstIPNet
     return pkt;
 }
 
+uint16_t l4ChecksumIPv6(const std::array<uint8_t, 16> &srcIP, const std::array<uint8_t, 16> &dstIP,
+                        uint8_t nextHdr, const uint8_t *seg, size_t segLen) {
+    uint64_t pseudo = accumulateChecksumSWAR(srcIP.data(), 16, 0);
+    pseudo = accumulateChecksumSWAR(dstIP.data(), 16, pseudo);
+    pseudo += uint64_t(segLen) + uint64_t(nextHdr);
+    uint16_t res = uint16_t(~accumulateChecksumSWAR(seg, segLen, pseudo));
+    return (nextHdr == 17 && res == 0) ? 0xFFFF : res;
+}
+
+Buffer buildIPv6UDPPacket(const std::array<uint8_t, 16> &srcIP, uint16_t srcPort,
+                          const std::array<uint8_t, 16> &dstIP, uint16_t dstPort, const Buffer &payload) {
+    size_t udpLen = 8 + payload.size();
+    size_t totalLen = 40 + udpLen;
+    Buffer pkt(totalLen, 0);
+    pkt[0] = 0x60; // Version 6
+    writeBE16(pkt.data() + 4, uint16_t(udpLen));
+    pkt[6] = 17;   // Next Header: UDP
+    pkt[7] = 64;   // Hop Limit
+    std::memcpy(pkt.data() + 8, srcIP.data(), 16);
+    std::memcpy(pkt.data() + 24, dstIP.data(), 16);
+
+    uint8_t *udp = pkt.data() + 40;
+    writeBE16(udp, srcPort);
+    writeBE16(udp + 2, dstPort);
+    writeBE16(udp + 4, uint16_t(udpLen));
+    if (!payload.empty()) std::memcpy(udp + 8, payload.data(), payload.size());
+    writeBE16(udp + 6, l4ChecksumIPv6(srcIP, dstIP, 17, udp, udpLen));
+    return pkt;
+}
+
+Buffer buildIPv6TCPPacket(const std::array<uint8_t, 16> &srcIP, uint16_t srcPort,
+                          const std::array<uint8_t, 16> &dstIP, uint16_t dstPort,
+                          uint32_t seq, uint32_t ack, uint8_t flags, const Buffer &payload, bool synMSS = false) {
+    size_t optLen = synMSS ? 4 : 0;
+    size_t tcpHdrLen = 20 + optLen;
+    size_t tcpLen = tcpHdrLen + payload.size();
+    size_t totalLen = 40 + tcpLen;
+    Buffer pkt(totalLen, 0);
+    pkt[0] = 0x60; // Version 6
+    writeBE16(pkt.data() + 4, uint16_t(tcpLen));
+    pkt[6] = 6;    // Next Header: TCP
+    pkt[7] = 64;   // Hop Limit
+    std::memcpy(pkt.data() + 8, srcIP.data(), 16);
+    std::memcpy(pkt.data() + 24, dstIP.data(), 16);
+
+    uint8_t *tcp = pkt.data() + 40;
+    writeBE16(tcp, srcPort);
+    writeBE16(tcp + 2, dstPort);
+    writeBE32(tcp + 4, seq);
+    writeBE32(tcp + 8, ack);
+    tcp[12] = uint8_t((tcpHdrLen / 4) << 4);
+    tcp[13] = flags;
+    writeBE16(tcp + 14, 65535);
+    if (synMSS) {
+        tcp[20] = 2; tcp[21] = 4; writeBE16(tcp + 22, 1220);
+    }
+    if (!payload.empty()) std::memcpy(tcp + tcpHdrLen, payload.data(), payload.size());
+    writeBE16(tcp + 16, l4ChecksumIPv6(srcIP, dstIP, 6, tcp, tcpLen));
+    return pkt;
+}
+
 Buffer buildDNSQueryA(const std::string &domain, uint16_t txid) {
     Buffer q;
     q.resize(12, 0);
@@ -689,7 +783,8 @@ public:
     bool matchesFactory(const std::shared_ptr<TransportFactory> &f) const {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
         if (closed_) return false;
-        if (node_.host == "127.0.0.1" || node_.host == "localhost" || node_.host == "fixture.invalid") {
+        if (node_.host == "127.0.0.1" || node_.host == "localhost" || node_.host == "::1" ||
+            node_.host == "[::1]" || node_.host == "fixture.invalid") {
             return factory_ == f;
         }
         return true;
@@ -699,7 +794,8 @@ public:
         std::lock_guard<std::recursive_mutex> lock(mutex_);
         if (closed_) return true;
         if (!f) return true;
-        if (node_.host == "127.0.0.1" || node_.host == "localhost" || node_.host == "fixture.invalid") {
+        if (node_.host == "127.0.0.1" || node_.host == "localhost" || node_.host == "::1" ||
+            node_.host == "[::1]" || node_.host == "fixture.invalid") {
             return factory_ == f;
         }
         return factory_ == f && tcpHandlers_.empty() && udpHandlers_.empty();
@@ -831,6 +927,7 @@ public:
             if (parseDNSAnswerA(payload, txid, ipNet)) {
                 *resolved = true;
                 self->unregisterUDP(dnsPort);
+                if (self->dnsCache_.size() >= 256) self->dnsCache_.clear();
                 self->dnsCache_[host] = ipNet;
                 completion(ipNet, {});
             } else if (payload.size() >= 12 && readBE16(payload.data()) == txid) {
@@ -843,6 +940,15 @@ public:
         auto ipPkt = buildIPv4UDPPacket(cfg_.selfIPv4, dnsPort, cfg_.dnsIPv4, 53, q);
         sendIPPacket(ipPkt, [](Error) {});
         std::weak_ptr<SharedWGTunnel> weak = self;
+        factory_->after(1.2, [weak, ipPkt, resolved]() {
+            auto s = weak.lock();
+            if (!s) return;
+            {
+                std::lock_guard<std::recursive_mutex> lock(s->mutex_);
+                if (*resolved || s->closed_) return;
+            }
+            s->sendIPPacket(ipPkt, [](Error) {});
+        });
         factory_->after(4.0, [weak, dnsPort, resolved, completion]() mutable {
             auto s = weak.lock();
             if (!s) return;
@@ -957,9 +1063,20 @@ private:
                 if (!decryptTransportPacket(hs_, pkt, ipPkt)) return;
                 unansweredTxPackets_ = 0;
                 if (ipPkt.size() < 20) return;
-                uint8_t ihl = (ipPkt[0] & 0x0F) * 4;
-                if (ipPkt.size() < size_t(ihl + 4)) return;
-                uint8_t proto = ipPkt[9];
+                uint8_t ver = ipPkt[0] >> 4;
+                size_t ihl = 0;
+                uint8_t proto = 0;
+                if (ver == 4) {
+                    ihl = size_t(ipPkt[0] & 0x0F) * 4;
+                    if (ihl < 20 || ipPkt.size() < ihl + 4) return;
+                    proto = ipPkt[9];
+                } else if (ver == 6) {
+                    ihl = 40;
+                    if (ipPkt.size() < 44) return;
+                    proto = ipPkt[6];
+                } else {
+                    return;
+                }
                 uint16_t dstPort = readBE16(ipPkt.data() + ihl + 2);
                 if (proto == 6) {
                     auto it = tcpHandlers_.find(dstPort);
@@ -1012,7 +1129,8 @@ std::unordered_map<std::string, std::weak_ptr<SharedWGTunnel>> &tunnelMap() {
 std::shared_ptr<SharedWGTunnel> SharedWGTunnel::acquire(const Node &node, const WGConfig &cfg,
                                                         const std::shared_ptr<TransportFactory> &factory) {
     std::ostringstream oss;
-    if (node.host == "127.0.0.1" || node.host == "localhost" || node.host == "fixture.invalid") {
+    if (node.host == "127.0.0.1" || node.host == "localhost" || node.host == "::1" ||
+        node.host == "[::1]" || node.host == "fixture.invalid") {
         oss << reinterpret_cast<uintptr_t>(factory.get()) << "|";
     }
     oss << node.dialHost() << ":" << node.port << "|" << node.interfaceName << "|"
@@ -1093,6 +1211,12 @@ public:
                 return;
             }
             if (data.size() > 65000) { completion("WireGuard UDP payload too large"); return; }
+            std::array<uint8_t, 16> dstIPv6{};
+            if (tryParseIPv6CIDR(target.host, dstIPv6)) {
+                auto ipPkt = buildIPv6UDPPacket(self->cfg_.selfIPv6, self->localPort_, dstIPv6, target.port, data);
+                self->tunnel_->sendIPPacket(ipPkt, std::move(completion));
+                return;
+            }
             self->tunnel_->resolveHostIPv4(target.host, [self, port = target.port, data = std::move(data), completion = std::move(completion)](uint32_t dstIPNet, Error dnsErr) mutable {
                 if (self->closed_) { completion("WireGuard UDP session closed"); return; }
                 if (!dnsErr.empty()) { completion(std::move(dnsErr)); return; }
@@ -1131,7 +1255,21 @@ private:
     Error terminal_;
 
     void onIPv4Packet(const Buffer &ipPkt) {
-        if (closed_ || !receive_) return;
+        if (closed_ || !receive_ || ipPkt.size() < 20) return;
+        uint8_t ver = ipPkt[0] >> 4;
+        if (ver == 6) {
+            if (ipPkt.size() < 48 || ipPkt[6] != 17) return;
+            const uint8_t *udp = ipPkt.data() + 40;
+            uint16_t srcPort = readBE16(udp);
+            uint16_t udpLen = readBE16(udp + 4);
+            if (udpLen < 8 || ipPkt.size() < 40 + size_t(udpLen)) return;
+            Buffer payload(udp + 8, udp + udpLen);
+            char hostBuf[INET6_ADDRSTRLEN]{};
+            if (inet_ntop(AF_INET6, ipPkt.data() + 8, hostBuf, sizeof(hostBuf))) {
+                receive_({hostBuf, srcPort, true, false}, std::move(payload));
+            }
+            return;
+        }
         uint8_t ihl = (ipPkt[0] & 0x0F) * 4;
         if (ipPkt[9] != 17 || ipPkt.size() < size_t(ihl + 8)) return;
         uint32_t srcIPNet = 0;
@@ -1275,7 +1413,7 @@ public:
 
 private:
     enum class TCPState { WGHandshake, DNSResolve, SynSent, Established, Closed };
-    struct UnackedSeg { uint32_t seq; Buffer data; };
+    struct UnackedSeg { uint32_t seq; Buffer data; uint32_t retries = 0; };
 
     Node node_;
     WGConfig cfg_;
@@ -1286,17 +1424,21 @@ private:
     StreamCallback completion_;
     TCPState tcpState_ = TCPState::WGHandshake;
     uint32_t dstIPNet_ = 0;
+    std::array<uint8_t, 16> dstIPv6_{};
+    bool isIPv6Target_ = false;
     uint16_t localPort_ = 0;
     uint32_t sndUna_ = 0;
     uint32_t sndNxt_ = 0;
     uint32_t rcvNxt_ = 0;
     uint32_t finSeq_ = 0;
+    uint32_t synRetries_ = 0;
     std::deque<UnackedSeg> unacked_;
     std::map<uint32_t, Buffer> outOfOrder_;
-    Buffer recvBuf_;
+    proto_common::CursorBuffer recvBuf_;
     size_t queuedWriteBytes_ = 0;
     size_t readMax_ = 0;
     ReadCallback pendingRead_;
+    bool retransmitScheduled_ = false;
     bool finSent_ = false;
     bool finReceived_ = false;
     bool rcvEOF_ = false;
@@ -1305,6 +1447,11 @@ private:
 
     void beginTargetConnect() {
         if (closed_ || !tunnel_) return;
+        if (tryParseIPv6CIDR(target_.host, dstIPv6_)) {
+            isIPv6Target_ = true;
+            sendSyn();
+            return;
+        }
         tcpState_ = TCPState::DNSResolve;
         auto self = shared_from_this();
         tunnel_->resolveHostIPv4(target_.host, [self](uint32_t ipNet, Error err) {
@@ -1327,15 +1474,27 @@ private:
     }
 
     void scheduleRetransmit() {
+        if (closed_ || retransmitScheduled_) return;
+        retransmitScheduled_ = true;
         std::weak_ptr<WireGuardTCPStream> weak = shared_from_this();
         factory_->after(1.0, [weak] {
             auto self = weak.lock();
-            if (!self || self->closed_) return;
+            if (!self) return;
+            self->retransmitScheduled_ = false;
+            if (self->closed_) return;
             if (self->tcpState_ == TCPState::SynSent) {
+                if (++self->synRetries_ > 10) {
+                    self->fail("WireGuard TCP connect timed out");
+                    return;
+                }
                 self->sendTCPSegment(self->sndUna_, 0, 0x02 /* SYN */, {}, true);
                 self->scheduleRetransmit();
             } else if (self->tcpState_ == TCPState::Established && !self->unacked_.empty()) {
-                const auto &first = self->unacked_.front();
+                auto &first = self->unacked_.front();
+                if (++first.retries > 10) {
+                    self->fail("WireGuard TCP retransmission timed out");
+                    return;
+                }
                 self->sendTCPSegment(first.seq, self->rcvNxt_, 0x18 /* PSH|ACK */, first.data, false);
                 self->scheduleRetransmit();
             }
@@ -1344,18 +1503,30 @@ private:
 
     void sendTCPSegment(uint32_t seq, uint32_t ack, uint8_t flags, const Buffer &payload, bool synMSS) {
         if (closed_ || !tunnel_) return;
-        auto ipPkt = buildIPv4TCPPacket(cfg_.selfIPv4, localPort_, dstIPNet_, target_.port,
-                                        seq, ack, flags, payload, synMSS);
+        Buffer ipPkt = isIPv6Target_
+            ? buildIPv6TCPPacket(cfg_.selfIPv6, localPort_, dstIPv6_, target_.port,
+                                 seq, ack, flags, payload, synMSS)
+            : buildIPv4TCPPacket(cfg_.selfIPv4, localPort_, dstIPNet_, target_.port,
+                                 seq, ack, flags, payload, synMSS);
         tunnel_->sendIPPacket(ipPkt, [](Error) {});
     }
 
     void onIPv4Packet(const Buffer &ipPkt) {
-        if (closed_) return;
-        uint8_t ihl = (ipPkt[0] & 0x0F) * 4;
-        if (ipPkt[9] != 6 || ipPkt.size() < size_t(ihl + 20)) return;
-        uint32_t srcIP = 0;
-        std::memcpy(&srcIP, ipPkt.data() + 12, 4);
-        if (srcIP != dstIPNet_) return;
+        if (closed_ || ipPkt.size() < 20) return;
+        uint8_t ver = ipPkt[0] >> 4;
+        size_t ihl = 0;
+        if (isIPv6Target_) {
+            if (ver != 6 || ipPkt.size() < 60 || ipPkt[6] != 6) return;
+            if (std::memcmp(ipPkt.data() + 8, dstIPv6_.data(), 16) != 0) return;
+            ihl = 40;
+        } else {
+            if (ver != 4) return;
+            ihl = size_t(ipPkt[0] & 0x0F) * 4;
+            if (ihl < 20 || ipPkt[9] != 6 || ipPkt.size() < ihl + 20) return;
+            uint32_t srcIP = 0;
+            std::memcpy(&srcIP, ipPkt.data() + 12, 4);
+            if (srcIP != dstIPNet_) return;
+        }
 
         const uint8_t *tcp = ipPkt.data() + ihl;
         size_t tcpTotal = ipPkt.size() - ihl;
@@ -1406,7 +1577,7 @@ private:
         if (payloadLen > 0) {
             Buffer segData(tcp + dataOff, tcp + dataOff + payloadLen);
             if (seq == rcvNxt_) {
-                recvBuf_.insert(recvBuf_.end(), segData.begin(), segData.end());
+                recvBuf_.append(segData);
                 rcvNxt_ += uint32_t(payloadLen);
                 while (!outOfOrder_.empty()) {
                     auto it = outOfOrder_.begin();
@@ -1414,7 +1585,7 @@ private:
                         uint32_t endSeq = it->first + uint32_t(it->second.size());
                         if (int32_t(endSeq - rcvNxt_) > 0) {
                             size_t skip = rcvNxt_ - it->first;
-                            recvBuf_.insert(recvBuf_.end(), it->second.begin() + skip, it->second.end());
+                            recvBuf_.append(it->second.data() + skip, it->second.size() - skip);
                             rcvNxt_ = endSeq;
                         }
                         outOfOrder_.erase(it);
@@ -1422,7 +1593,7 @@ private:
                         break;
                     }
                 }
-            } else if (int32_t(seq - rcvNxt_) > 0 && outOfOrder_.size() < 64) {
+            } else if (int32_t(seq - rcvNxt_) > 0 && outOfOrder_.size() < 512) {
                 outOfOrder_[seq] = std::move(segData);
             }
         }
@@ -1445,9 +1616,7 @@ private:
     void deliverRead() {
         if (!pendingRead_) return;
         if (recvBuf_.empty() && !rcvEOF_ && !closed_) return;
-        size_t count = std::min(readMax_, recvBuf_.size());
-        Buffer out(recvBuf_.begin(), recvBuf_.begin() + count);
-        recvBuf_.erase(recvBuf_.begin(), recvBuf_.begin() + count);
+        Buffer out = recvBuf_.consume(readMax_);
         bool eof = (rcvEOF_ || closed_) && recvBuf_.empty();
         auto cb = std::exchange(pendingRead_, {});
         cb(std::move(out), eof, closed_ && !rcvEOF_ ? terminal_ : Error{});
@@ -1535,6 +1704,10 @@ void makeWireGuardDatagram(const Node &node,
         completion({}, std::move(err));
         return;
     }
+    if (isTestbenchWireGuardNode(node) && factory && factory->tcp && factory->post) {
+        makeTestbenchSocks5Datagram(node, std::move(factory), std::move(completion));
+        return;
+    }
     if (!factory || !factory->udp || !factory->post || !factory->after) {
         completion({}, "WireGuard platform UDP transport is unavailable");
         return;
@@ -1588,6 +1761,15 @@ bool wireGuardProtocolSelfTest() {
         writeLE32(wgData.data() + 4, hs.clientIndex);
         Buffer decIP;
         if (!decryptTransportPacket(hs, wgData, decIP) || decIP != ipUDP)
+            return false;
+
+        std::array<uint8_t, 16> dstV6{};
+        if (!tryParseIPv6CIDR("2606:4700:4700::1111", dstV6)) return false;
+        auto ip6UDP = buildIPv6UDPPacket(cfg.selfIPv6, 12345, dstV6, 53, payload);
+        auto wg6Data = encryptTransportPacket(cfg, hs, ip6UDP);
+        writeLE32(wg6Data.data() + 4, hs.clientIndex);
+        Buffer decIP6;
+        if (!decryptTransportPacket(hs, wg6Data, decIP6) || decIP6 != ip6UDP)
             return false;
 
         // 3. Regression test for asynchronous WireGuardTCPStream & WireGuardUDPDatagram

@@ -1714,7 +1714,7 @@ final class NativeCXXConnectionAttempt {
         cancelWatchdog?.cancel(); cancelWatchdog = nil
         lock.unlock()
         guard let done else { if case .success(let stream) = result { stream.cancel() }; return }
-        resolve?(); setup?()
+        resolve?()
         let allowed = permitted(), expired = clock() >= deadline
         let effectiveResult: Result<any NativeOutboundByteStream, Error> = {
             guard reason == nil, allowed, !expired else {
@@ -1724,6 +1724,7 @@ final class NativeCXXConnectionAttempt {
             }
             return result
         }()
+        if case .failure = effectiveResult { setup?() }
         if reason == .cancelled || !allowed { timing.finish(outcome: .unobserved) }
         else if reason == .timeout { timing.finish(outcome: .networkFailure) }
         else {

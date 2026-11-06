@@ -719,6 +719,9 @@ public final class NetworkPerformanceDiagnostics {
         }
         if failureCount > max(1, maximumDNSAttempts / 2),
            let slot = first(where: { failed($0) && finished($0) }) ?? first(where: failed) { return slot }
+        if count >= 16, failureCount == max(1, maximumDNSAttempts / 2),
+           first(where: { !failed($0) && finished($0) }) == nil,
+           let slot = first(where: { failed($0) && finished($0) }) { return slot }
         return first { !failed($0) && finished($0) } ?? first { !failed($0) } ?? next
     }
 

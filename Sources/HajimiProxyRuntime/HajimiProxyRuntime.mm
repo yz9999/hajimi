@@ -511,6 +511,13 @@ void FlushCachedRuntimeInterfaces() {
     nw_parameters_configure_protocol_block_t tlsConfiguration = NW_PARAMETERS_DISABLE_PROTOCOL;
     if (_tls) {
         NSString *name = _serverName.length ? _serverName : _host;
+        if ([name hasPrefix:@"["] && [name hasSuffix:@"]"] && name.length >= 2) {
+            name = [name substringWithRange:NSMakeRange(1, name.length - 2)];
+        }
+        if ([name containsString:@":"]) {
+            NSRange pct = [name rangeOfString:@"%"];
+            if (pct.location != NSNotFound) name = [name substringToIndex:pct.location];
+        }
         NSArray<NSString *> *protocols = _alpn;
         BOOL skip = _skipVerify;
         dispatch_queue_t queue = _queue;
@@ -595,7 +602,11 @@ void FlushCachedRuntimeInterfaces() {
 }
 - (void)dial {
     NSString *port = [NSString stringWithFormat:@"%u", _port];
-    nw_endpoint_t endpoint = nw_endpoint_create_host(_host.UTF8String, port.UTF8String);
+    NSString *dialHost = _host;
+    if ([dialHost hasPrefix:@"["] && [dialHost hasSuffix:@"]"] && dialHost.length >= 2) {
+        dialHost = [dialHost substringWithRange:NSMakeRange(1, dialHost.length - 2)];
+    }
+    nw_endpoint_t endpoint = nw_endpoint_create_host(dialHost.UTF8String, port.UTF8String);
     _connection = nw_connection_create(endpoint, _parameters);
     if (!_connection) {
         [self finish:nil error:RuntimeError(HJProxyRuntimeErrorInvalidArgument, @"Cannot create network connection")]; return;

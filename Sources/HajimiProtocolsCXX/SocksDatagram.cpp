@@ -1,4 +1,6 @@
 #include "BasicProtocols.hpp"
+#include "ProtocolStream.hpp"
+#include <arpa/inet.h>
 #include <cstdio>
 #include <deque>
 #include <stdexcept>
@@ -59,6 +61,15 @@ class SocksDatagrams final:public Datagram,public std::enable_shared_from_this<S
             if(self->closed_){if(control)control->close();return;}
             if(!error.empty() || !control){self->fail(error.empty()?"SOCKS5 UDP association failed":error);return;}
             if(!bound.port){control->close();self->fail("SOCKS5 server returned an invalid UDP relay");return;}
+            auto isIPv4Literal = [](const std::string &h) -> bool {
+                in_addr v4{};
+                return ::inet_pton(AF_INET, h.c_str(), &v4) == 1;
+            };
+            auto isIPv6Literal = [](const std::string &h) -> bool {
+                std::string clean = unbracketAndStripZone(h);
+                in6_addr v6{};
+                return ::inet_pton(AF_INET6, clean.c_str(), &v6) == 1;
+            };
             auto isPrivateOrLoopbackV4 = [](const std::string &h) -> bool {
                 unsigned a = 0, b = 0, c = 0, d = 0;
                 char tail = 0;
@@ -66,8 +77,27 @@ class SocksDatagrams final:public Datagram,public std::enable_shared_from_this<S
                 if (a > 255 || b > 255 || c > 255 || d > 255) return false;
                 return a == 0 || a == 10 || a == 127 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168);
             };
-            if (bound.host == "0.0.0.0" || bound.host == "::" || bound.host == "::1" ||
-                (isPrivateOrLoopbackV4(bound.host) && !isPrivateOrLoopbackV4(self->node_.dialHost()) && self->node_.dialHost() != "localhost" && self->node_.dialHost() != "::1")) {
+            auto isPrivateOrLoopbackV6 = [](const std::string &h) -> bool {
+                std::string clean = unbracketAndStripZone(h);
+                in6_addr v6{};
+                if (::inet_pton(AF_INET6, clean.c_str(), &v6) != 1) return false;
+                const uint8_t *b = reinterpret_cast<const uint8_t *>(&v6);
+                bool allZeroPrefix = true;
+                for (int i = 0; i < 15; ++i) if (b[i] != 0) allZeroPrefix = false;
+                if (allZeroPrefix && (b[15] == 0 || b[15] == 1)) return true; // :: or ::1
+                if ((b[0] & 0xfe) == 0xfc) return true; // fc00::/7 ULA
+                if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) return true; // fe80::/10 link-local
+                return false;
+            };
+            const std::string dialHost = self->node_.dialHost();
+            const bool dialV4 = isIPv4Literal(dialHost);
+            const bool dialV6 = isIPv6Literal(dialHost);
+            const bool boundV4 = isIPv4Literal(bound.host);
+            const bool boundV6 = isIPv6Literal(bound.host);
+            if (bound.host == "0.0.0.0" || bound.host == "::" || bound.host == "::0" || bound.host == "::1" ||
+                (isPrivateOrLoopbackV4(bound.host) && !isPrivateOrLoopbackV4(dialHost) && dialHost != "localhost" && dialHost != "::1") ||
+                (isPrivateOrLoopbackV6(bound.host) && !isPrivateOrLoopbackV6(dialHost) && dialHost != "localhost" && dialHost != "127.0.0.1") ||
+                (dialV6 && boundV4) || (dialV4 && boundV6)) {
                 bound.host = self->node_.host;
             }
             self->control_=std::move(control);self->relay_=bound;self->monitorControl();

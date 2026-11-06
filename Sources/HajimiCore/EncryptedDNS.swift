@@ -1527,7 +1527,9 @@ private final class EncryptedDNSRequest {
         let tls = NWProtocolTLS.Options()
         // Do not replace the authenticated identity with a bootstrap address.
         // The default platform verification checks both chain and identity.
-        dnsProtocol.serverName.withCString {
+        var cleanSNI = DoHEndpoint.unbracketed(dnsProtocol.serverName)
+        if cleanSNI.contains(":"), let pct = cleanSNI.firstIndex(of: "%") { cleanSNI = String(cleanSNI[..<pct]) }
+        cleanSNI.withCString {
             sec_protocol_options_set_tls_server_name(tls.securityProtocolOptions, $0)
         }
         for protocolName in dnsProtocol.alpn {

@@ -107,6 +107,7 @@ final class EnhancedModeManager {
     private var networkChangeGate = EnhancedNetworkChangeGate()
     private var latestNetworkPath: NWPath?
     private var startupNetworkSnapshot: EnhancedNetworkSnapshot?
+    private var cachedFallbackGateways: (interfaceName: String, addresses: [String], gateways: [String])?
     /// App-owned data plane. Lives only while enhanced mode is running.
     private var tunnel: NativeTunnel?
     private var router: NativePacketRouter?
@@ -1012,19 +1013,21 @@ final class EnhancedModeManager {
         if let boundInterface {
             physical = boundInterface
         } else {
-            let routeCandidate = (try? defaultInterface()).flatMap {
-                Self.isPhysicalInterfaceName($0) ? $0 : nil
-            }
-            let routeLocal = routeCandidate.map(Self.interfaceAddresses)
             let initial = preferred ?? pathCandidate
             let initialLocal = initial.map(Self.interfaceAddresses)
-            if let routeCandidate, let routeLocal, routeLocal.up, !routeLocal.addresses.isEmpty {
-                physical = routeCandidate
-            } else if let initial, let initialLocal, initialLocal.up, !initialLocal.addresses.isEmpty {
+            if let initial, let initialLocal, initialLocal.up, !initialLocal.addresses.isEmpty {
                 physical = initial
             } else {
                 let activeCandidate = Self.firstActivePhysicalInterface()
-                physical = routeCandidate ?? activeCandidate ?? initial ?? state?.physicalInterface ?? ""
+                let activeLocal = activeCandidate.map(Self.interfaceAddresses)
+                if let activeCandidate, let activeLocal, activeLocal.up, !activeLocal.addresses.isEmpty {
+                    physical = activeCandidate
+                } else {
+                    let routeCandidate = (try? defaultInterface()).flatMap {
+                        Self.isPhysicalInterfaceName($0) ? $0 : nil
+                    }
+                    physical = routeCandidate ?? activeCandidate ?? initial ?? state?.physicalInterface ?? ""
+                }
             }
         }
         let interfaceIndex = physical.withCString { if_nametoindex($0) }
@@ -1042,23 +1045,31 @@ final class EnhancedModeManager {
             if let address = value as? String, address.utf8.count <= 128 { gateways.append(address) }
         }
         if gateways.isEmpty, !physical.isEmpty, local.up, !local.addresses.isEmpty {
-            let process = Process(); let output = Pipe()
-            process.executableURL = URL(fileURLWithPath: "/sbin/route")
-            process.arguments = ["-n", "get", "-ifscope", physical, "default"]
-            process.standardOutput = output; process.standardError = FileHandle.nullDevice
-            if (try? process.run()) != nil {
-                process.waitUntilExit()
-                let routeText = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                for line in routeText.components(separatedBy: .newlines) {
-                    let pair = line.trimmingCharacters(in: .whitespaces)
-                        .split(separator: ":", maxSplits: 1).map(String.init)
-                    if pair.count == 2, pair[0] == "gateway" {
-                        let gw = pair[1].trimmingCharacters(in: .whitespaces)
-                        if !gw.isEmpty, !gw.hasPrefix("link#"), !gw.hasPrefix("198.18."), gw.utf8.count <= 128 {
-                            gateways.append(gw)
+            if let cached = cachedFallbackGateways,
+               cached.interfaceName == physical, cached.addresses == local.addresses {
+                gateways.append(contentsOf: cached.gateways)
+            } else {
+                var resolvedGateways: [String] = []
+                let process = Process(); let output = Pipe()
+                process.executableURL = URL(fileURLWithPath: "/sbin/route")
+                process.arguments = ["-n", "get", "-ifscope", physical, "default"]
+                process.standardOutput = output; process.standardError = FileHandle.nullDevice
+                if (try? process.run()) != nil {
+                    process.waitUntilExit()
+                    let routeText = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                    for line in routeText.components(separatedBy: .newlines) {
+                        let pair = line.trimmingCharacters(in: .whitespaces)
+                            .split(separator: ":", maxSplits: 1).map(String.init)
+                        if pair.count == 2, pair[0] == "gateway" {
+                            let gw = pair[1].trimmingCharacters(in: .whitespaces)
+                            if !gw.isEmpty, !gw.hasPrefix("link#"), !gw.hasPrefix("198.18."), gw.utf8.count <= 128 {
+                                resolvedGateways.append(gw)
+                            }
                         }
                     }
                 }
+                cachedFallbackGateways = (physical, local.addresses, resolvedGateways)
+                gateways.append(contentsOf: resolvedGateways)
             }
         }
         let link = networkState("State:/Network/Interface/\(physical)/Link")

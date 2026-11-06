@@ -112,15 +112,35 @@ detect_public_ip() {
     if [[ -z "${PUBLIC_IP}" ]]; then
         PUBLIC_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n1 || true)"
     fi
+    PUBLIC_IPV6="${HAJIMI_PUBLIC_IPV6:-}"
+    if [[ -z "${PUBLIC_IPV6}" ]]; then
+        PUBLIC_IPV6="$(curl -6fsSL --max-time 5 https://api64.ipify.org 2>/dev/null | grep ':' || true)"
+    fi
+    if [[ -z "${PUBLIC_IPV6}" ]]; then
+        PUBLIC_IPV6="$(curl -6fsSL --max-time 5 https://ifconfig.me 2>/dev/null | grep ':' || true)"
+    fi
+    if [[ -z "${PUBLIC_IPV6}" ]]; then
+        PUBLIC_IPV6="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | grep -v '^fe80' | head -n1 || true)"
+    fi
+    if [[ -z "${PUBLIC_IP}" && -n "${PUBLIC_IPV6}" ]]; then
+        PUBLIC_IP="${PUBLIC_IPV6}"
+    fi
     if [[ -z "${PUBLIC_IP}" ]]; then
-        log_err "无法自动检测 VPS 公网 IPv4 地址，请通过 HAJIMI_PUBLIC_IP=x.x.x.x sudo $0 指定"
+        log_err "无法自动检测 VPS 公网 IP 地址，请通过 HAJIMI_PUBLIC_IP=x.x.x.x sudo $0 指定"
         exit 1
     fi
     DEFAULT_IFACE="$(ip -4 route show default 2>/dev/null | awk '{print $5}' | head -n1 || true)"
     if [[ -z "${DEFAULT_IFACE}" ]]; then
+        DEFAULT_IFACE="$(ip -6 route show default 2>/dev/null | awk '{print $5}' | head -n1 || true)"
+    fi
+    if [[ -z "${DEFAULT_IFACE}" ]]; then
         DEFAULT_IFACE="eth0"
     fi
-    log_ok "检测到公网 IP: ${PUBLIC_IP} (主网卡: ${DEFAULT_IFACE})"
+    if [[ -n "${PUBLIC_IPV6}" ]]; then
+        log_ok "检测到公网双栈 IP: IPv4=${PUBLIC_IP}, IPv6=${PUBLIC_IPV6} (主网卡: ${DEFAULT_IFACE})"
+    else
+        log_ok "检测到公网 IP: ${PUBLIC_IP} (主网卡: ${DEFAULT_IFACE})"
+    fi
 }
 
 uninstall_all() {
@@ -187,13 +207,17 @@ prepare_directories_and_certs() {
     chmod 700 "${WORK_DIR}" "${CERT_DIR}" "${CONF_DIR}" "${OUT_DIR}"
 
     if [[ ! -f "${CERT_DIR}/server.crt" || ! -f "${CERT_DIR}/server.key" ]]; then
-        log_info "正在生成自签名 TLS 证书 (SAN: IP:${PUBLIC_IP}, DNS:www.bing.com)..."
+        local san_ext="IP:${PUBLIC_IP},DNS:www.bing.com,DNS:example.com"
+        if [[ -n "${PUBLIC_IPV6:-}" && "${PUBLIC_IPV6}" != "${PUBLIC_IP}" ]]; then
+            san_ext="IP:${PUBLIC_IP},IP:${PUBLIC_IPV6},DNS:www.bing.com,DNS:example.com"
+        fi
+        log_info "正在生成自签名 TLS 证书 (SAN: ${san_ext})..."
         openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
             -days 3650 -nodes \
             -keyout "${CERT_DIR}/server.key" \
             -out "${CERT_DIR}/server.crt" \
             -subj "/CN=${PUBLIC_IP}" \
-            -addext "subjectAltName=IP:${PUBLIC_IP},DNS:www.bing.com,DNS:example.com" \
+            -addext "subjectAltName=${san_ext}" \
             >/dev/null 2>&1
         chmod 600 "${CERT_DIR}/server.key"
         chmod 644 "${CERT_DIR}/server.crt"
@@ -749,10 +773,11 @@ configure_extra_protocol_servers() {
     log_info "正在配置内置全自包含协议服务端 (Snell v4:20003, Sudoku-UoT:20012, Sudoku-Entropy:20029, TrustTunnel:20018, SOCKS5-TLS:20019, SSR-Origin:20020)..."
     cat >"${WORK_DIR}/extra-config.json" <<EOF
 {
-  "bind_host": "0.0.0.0",
+  "bind_host": "::",
   "cert": "${CERT_DIR}/server.crt",
   "key": "${CERT_DIR}/server.key",
   "public_ip": "${PUBLIC_IP}",
+  "public_ipv6": "${PUBLIC_IPV6:-}",
   "snell_port": 20003,
   "snell_psk": "${SNELL_PSK}",
   "tt_port": 20018,
@@ -851,8 +876,21 @@ def parse_socks_addr(buf: bytes, offset: int = 0):
     else:
         raise ValueError(f"Unsupported ATYP {atyp}")
 
-def encode_socks_addr(host: str, port: int) -> bytes:
+def normalize_ip_literal(host: str) -> str:
     h = host.strip("[]")
+    if "%" in h:
+        h = h.split("%", 1)[0]
+    if h.lower().startswith("::ffff:"):
+        candidate = h[7:]
+        try:
+            socket.inet_pton(socket.AF_INET, candidate)
+            return candidate
+        except OSError:
+            pass
+    return h
+
+def encode_socks_addr(host: str, port: int) -> bytes:
+    h = normalize_ip_literal(host)
     try:
         ip4 = socket.inet_pton(socket.AF_INET, h)
         return b"\x01" + ip4 + struct.pack(">H", port)
@@ -865,6 +903,16 @@ def encode_socks_addr(host: str, port: int) -> bytes:
         pass
     hb = h.encode("utf-8")
     return b"\x03" + bytes([len(hb)]) + hb + struct.pack(">H", port)
+
+def encode_snell_udp_addr(host: str, port: int) -> bytes:
+    h = normalize_ip_literal(host)
+    try:
+        ip4 = socket.inet_pton(socket.AF_INET, h)
+        return b"\x04" + ip4 + struct.pack(">H", port)
+    except OSError:
+        pass
+    ip6 = socket.inet_pton(socket.AF_INET6, h)
+    return b"\x06" + ip6 + struct.pack(">H", port)
 
 async def pipe_HalfClose(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
@@ -883,16 +931,75 @@ async def pipe_HalfClose(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             pass
 
 async def resolve_udp_destination(host: str, port: int):
+    h = normalize_ip_literal(host)
+    try:
+        socket.inet_pton(socket.AF_INET6, h)
+        return socket.AF_INET6, (h, port, 0, 0)
+    except OSError:
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET, h)
+        return socket.AF_INET, (h, port)
+    except OSError:
+        pass
     loop = asyncio.get_running_loop()
-    infos = await loop.getaddrinfo(host.strip("[]"), port, type=socket.SOCK_DGRAM)
+    infos = await loop.getaddrinfo(h, port, type=socket.SOCK_DGRAM)
     if not infos:
         raise OSError(f"Cannot resolve UDP target {host}:{port}")
-    # Prefer IPv4 first for maximum compatibility on cloud VPS
     for family, socktype, proto, canonname, sockaddr in infos:
         if family == socket.AF_INET:
             return family, sockaddr
     family, socktype, proto, canonname, sockaddr = infos[0]
     return family, sockaddr
+
+class DualStackUDPRelay:
+    def __init__(self, loop: asyncio.AbstractEventLoop):
+        self.loop = loop
+        self.sock4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock4.setblocking(False)
+        self.sock6 = None
+        try:
+            s6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            s6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            s6.setblocking(False)
+            self.sock6 = s6
+        except OSError:
+            pass
+
+    async def sendto(self, dst_host: str, dst_port: int, payload: bytes):
+        family, sockaddr = await resolve_udp_destination(dst_host, dst_port)
+        if family == socket.AF_INET6 and self.sock6 is not None:
+            await self.loop.sock_sendto(self.sock6, payload, sockaddr)
+        else:
+            await self.loop.sock_sendto(self.sock4, payload, sockaddr)
+
+    def start_rx_tasks(self, on_packet_coro):
+        tasks = []
+        async def _rx_loop(sock):
+            try:
+                while True:
+                    data, addr = await self.loop.sock_recvfrom(sock, 65535)
+                    await on_packet_coro(data, addr[0], addr[1])
+            except Exception:
+                pass
+        tasks.append(asyncio.create_task(_rx_loop(self.sock4)))
+        if self.sock6 is not None:
+            tasks.append(asyncio.create_task(_rx_loop(self.sock6)))
+        return tasks
+
+    def close(self, tasks=None):
+        tasks = tasks or []
+        for t in tasks:
+            t.cancel()
+        try:
+            self.sock4.close()
+        except Exception:
+            pass
+        if self.sock6 is not None:
+            try:
+                self.sock6.close()
+            except Exception:
+                pass
 
 # ============================================================================
 # 1. Snell v4 Server (Argon2id + AES-128-GCM + UoT UDP)
@@ -1244,20 +1351,13 @@ async def handle_snell(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         elif cmd == 6:  # UDP (Snell v3/v4 UoT)
             await ss.write_packet(b"\x00")
             loop = asyncio.get_running_loop()
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setblocking(False)
+            relay = DualStackUDPRelay(loop)
 
-            async def udp_rx():
-                try:
-                    while True:
-                        data, addr = await loop.sock_recvfrom(sock, 65535)
-                        ip_bytes = socket.inet_pton(socket.AF_INET, addr[0])
-                        reply = b"\x04" + ip_bytes + struct.pack(">H", addr[1]) + data
-                        await ss.write_packet(reply)
-                except Exception:
-                    pass
+            async def on_snell_udp(data: bytes, src_ip: str, src_port: int):
+                reply = encode_snell_udp_addr(src_ip, src_port) + data
+                await ss.write_packet(reply)
 
-            rx_task = asyncio.create_task(udp_rx())
+            rx_tasks = relay.start_rx_tasks(on_snell_udp)
             try:
                 while True:
                     pkt = await ss.read_packet()
@@ -1289,11 +1389,9 @@ async def handle_snell(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                             payload = pkt[21:]
                         else:
                             continue
-                    _, sockaddr = await resolve_udp_destination(dst_host, dst_port)
-                    await loop.sock_sendto(sock, payload, sockaddr)
+                    await relay.sendto(dst_host, dst_port, payload)
             finally:
-                rx_task.cancel()
-                sock.close()
+                relay.close(rx_tasks)
     except Exception:
         pass
     finally:
@@ -2047,20 +2145,14 @@ async def handle_sudoku(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             await asyncio.gather(c2s(), s2c())
         elif cmd_type == 0x12:  # StartUoT
             loop = asyncio.get_running_loop()
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setblocking(False)
+            relay = DualStackUDPRelay(loop)
 
-            async def udp_rx():
-                try:
-                    while True:
-                        data, addr = await loop.sock_recvfrom(sock, 65535)
-                        saddr = encode_socks_addr(addr[0], addr[1])
-                        pkt = struct.pack(">HH", len(saddr), len(data)) + saddr + data
-                        await sess.write_plain(pkt)
-                except Exception:
-                    pass
+            async def on_sudoku_udp(data: bytes, src_ip: str, src_port: int):
+                saddr = encode_socks_addr(src_ip, src_port)
+                pkt = struct.pack(">HH", len(saddr), len(data)) + saddr + data
+                await sess.write_plain(pkt)
 
-            rx_task = asyncio.create_task(udp_rx())
+            rx_tasks = relay.start_rx_tasks(on_sudoku_udp)
             try:
                 while True:
                     hdr = await sess.read_plain_exact(4)
@@ -2068,11 +2160,9 @@ async def handle_sudoku(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     body = await sess.read_plain_exact(addr_len + pay_len)
                     dst_host, dst_port, _ = parse_socks_addr(body[:addr_len], 0)
                     payload = body[addr_len:]
-                    _, sockaddr = await resolve_udp_destination(dst_host, dst_port)
-                    await loop.sock_sendto(sock, payload, sockaddr)
+                    await relay.sendto(dst_host, dst_port, payload)
             finally:
-                rx_task.cancel()
-                sock.close()
+                relay.close(rx_tasks)
     except Exception:
         pass
     finally:
@@ -2112,21 +2202,15 @@ async def handle_trusttunnel(reader: asyncio.StreamReader, writer: asyncio.Strea
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
             loop = asyncio.get_running_loop()
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setblocking(False)
+            relay = DualStackUDPRelay(loop)
 
-            async def udp_rx():
-                try:
-                    while True:
-                        data, addr = await loop.sock_recvfrom(sock, 65535)
-                        saddr = encode_socks_addr(addr[0], addr[1])
-                        pkt = struct.pack(">HH", len(saddr), len(data)) + saddr + data
-                        writer.write(pkt)
-                        await writer.drain()
-                except Exception:
-                    pass
+            async def on_tt_udp(data: bytes, src_ip: str, src_port: int):
+                saddr = encode_socks_addr(src_ip, src_port)
+                pkt = struct.pack(">HH", len(saddr), len(data)) + saddr + data
+                writer.write(pkt)
+                await writer.drain()
 
-            rx_task = asyncio.create_task(udp_rx())
+            rx_tasks = relay.start_rx_tasks(on_tt_udp)
             try:
                 while True:
                     hdr = await reader.readexactly(4)
@@ -2134,11 +2218,9 @@ async def handle_trusttunnel(reader: asyncio.StreamReader, writer: asyncio.Strea
                     body = await reader.readexactly(addr_len + pay_len)
                     dst_host, dst_port, _ = parse_socks_addr(body[:addr_len], 0)
                     payload = body[addr_len:]
-                    _, sockaddr = await resolve_udp_destination(dst_host, dst_port)
-                    await loop.sock_sendto(sock, payload, sockaddr)
+                    await relay.sendto(dst_host, dst_port, payload)
             finally:
-                rx_task.cancel()
-                sock.close()
+                relay.close(rx_tasks)
         else:
             if authority.startswith("["):
                 idx = authority.rfind("]:")
@@ -2197,7 +2279,7 @@ class Socks5UDPProtocol(asyncio.DatagramProtocol):
             pass
 
 async def handle_socks5_tls(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
-                            expected_user: str, expected_pass: str, public_ip: str):
+                            expected_user: str, expected_pass: str, public_ip: str, public_ipv6: str = ""):
     try:
         hdr = await asyncio.wait_for(reader.readexactly(2), timeout=10.0)
         if hdr[0] != 5:
@@ -2247,11 +2329,16 @@ async def handle_socks5_tls(reader: asyncio.StreamReader, writer: asyncio.Stream
             await asyncio.gather(pipe_HalfClose(reader, rem_w), pipe_HalfClose(rem_r, writer))
         elif cmd == 3:  # UDP ASSOCIATE
             loop = asyncio.get_running_loop()
+            sockname = writer.get_extra_info("sockname")
+            local_ip = normalize_ip_literal(sockname[0]) if sockname else ""
+            is_v6_ctrl = (":" in local_ip)
+            bind_udp_addr = ("::", 0) if is_v6_ctrl else ("0.0.0.0", 0)
             transport, _ = await loop.create_datagram_endpoint(
-                lambda: Socks5UDPProtocol(loop), local_addr=("0.0.0.0", 0)
+                lambda: Socks5UDPProtocol(loop), local_addr=bind_udp_addr
             )
             udp_port = transport.get_extra_info("sockname")[1]
-            bnd = encode_socks_addr(public_ip, udp_port)
+            adv_ip = (public_ipv6 or local_ip or public_ip) if is_v6_ctrl else public_ip
+            bnd = encode_socks_addr(adv_ip, udp_port)
             writer.write(b"\x05\x00\x00" + bnd)
             await writer.drain()
             try:
@@ -2373,10 +2460,11 @@ class SSRUDPProtocol(asyncio.DatagramProtocol):
 
     async def _relay_udp(self, dst_host: str, dst_port: int, payload: bytes, client_addr):
         loop = asyncio.get_running_loop()
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setblocking(False)
+        sock = None
         try:
-            _, sockaddr = await resolve_udp_destination(dst_host, dst_port)
+            family, sockaddr = await resolve_udp_destination(dst_host, dst_port)
+            sock = socket.socket(family, socket.SOCK_DGRAM)
+            sock.setblocking(False)
             await loop.sock_sendto(sock, payload, sockaddr)
             reply, raddr = await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout=8.0)
             saddr = encode_socks_addr(raddr[0], raddr[1])
@@ -2387,17 +2475,47 @@ class SSRUDPProtocol(asyncio.DatagramProtocol):
         except Exception:
             pass
         finally:
-            sock.close()
+            if sock is not None:
+                sock.close()
 
 # ============================================================================
 # Main Daemon Entrypoint
 # ============================================================================
 
+async def start_dual_stack_tcp_server(client_cb, bind_host: str, port: int, ssl_ctx=None):
+    if bind_host in ("::", ""):
+        try:
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            sock.bind(("::", port))
+            sock.listen(512)
+            sock.setblocking(False)
+            return await asyncio.start_server(client_cb, sock=sock, ssl=ssl_ctx)
+        except OSError:
+            return await asyncio.start_server(client_cb, host="0.0.0.0", port=port, ssl=ssl_ctx)
+    return await asyncio.start_server(client_cb, host=bind_host, port=port, ssl=ssl_ctx)
+
+async def start_dual_stack_udp_endpoint(protocol_factory, bind_host: str, port: int):
+    loop = asyncio.get_running_loop()
+    if bind_host in ("::", ""):
+        try:
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            sock.bind(("::", port))
+            sock.setblocking(False)
+            return await loop.create_datagram_endpoint(protocol_factory, sock=sock)
+        except OSError:
+            return await loop.create_datagram_endpoint(protocol_factory, local_addr=("0.0.0.0", port))
+    return await loop.create_datagram_endpoint(protocol_factory, local_addr=(bind_host, port))
+
 async def main():
     with open("/opt/hajimi-test/extra-config.json", "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
-    bind_host = cfg.get("bind_host", "0.0.0.0")
+    bind_host = cfg.get("bind_host", "::")
+    public_ipv6 = cfg.get("public_ipv6", "")
 
     tls_tt = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls_tt.load_cert_chain(cfg["cert"], cfg["key"])
@@ -2414,34 +2532,33 @@ async def main():
         get_sudoku_table(mpub, t_type in ("prefer_ascii", "up_ascii_down_entropy"), ctbl)
         get_sudoku_table(mpub, t_type in ("prefer_ascii", "up_entropy_down_ascii"), ctbl)
 
-    s_snell = await asyncio.start_server(
+    s_snell = await start_dual_stack_tcp_server(
         lambda r, w: handle_snell(r, w, cfg["snell_psk"]),
-        host=bind_host, port=cfg["snell_port"]
+        bind_host, cfg["snell_port"]
     )
-    s_tt = await asyncio.start_server(
+    s_tt = await start_dual_stack_tcp_server(
         lambda r, w: handle_trusttunnel(r, w, cfg["tt_user"], cfg["tt_pass"]),
-        host=bind_host, port=cfg["tt_port"], ssl=tls_tt
+        bind_host, cfg["tt_port"], ssl_ctx=tls_tt
     )
-    s_s5tls = await asyncio.start_server(
-        lambda r, w: handle_socks5_tls(r, w, cfg["s5_user"], cfg["s5_pass"], cfg["public_ip"]),
-        host=bind_host, port=cfg["s5tls_port"], ssl=tls_s5
+    s_s5tls = await start_dual_stack_tcp_server(
+        lambda r, w: handle_socks5_tls(r, w, cfg["s5_user"], cfg["s5_pass"], cfg["public_ip"], public_ipv6),
+        bind_host, cfg["s5tls_port"], ssl_ctx=tls_s5
     )
-    s_ssr = await asyncio.start_server(
+    s_ssr = await start_dual_stack_tcp_server(
         lambda r, w: handle_ssr_origin(r, w, cfg["ssr_pass"]),
-        host=bind_host, port=cfg["ssr_port"]
+        bind_host, cfg["ssr_port"]
     )
 
-    loop = asyncio.get_running_loop()
-    await loop.create_datagram_endpoint(
+    await start_dual_stack_udp_endpoint(
         lambda: SSRUDPProtocol(cfg["ssr_pass"]),
-        local_addr=(bind_host, cfg["ssr_port"])
+        bind_host, cfg["ssr_port"]
     )
 
     sudoku_servers = []
     for s_prof in cfg.get("sudoku_profiles", []):
-        srv = await asyncio.start_server(
+        srv = await start_dual_stack_tcp_server(
             lambda r, w, p=s_prof: handle_sudoku(r, w, p),
-            host=bind_host, port=s_prof["port"]
+            bind_host, s_prof["port"]
         )
         sudoku_servers.append(srv)
 
@@ -2487,17 +2604,17 @@ configure_wireguard_service() {
     mkdir -p /etc/wireguard
     cat >/etc/wireguard/wg0.conf <<EOF
 [Interface]
-Address = 10.66.66.1/24
+Address = 10.66.66.1/24, fd00:6861:6a69:66::1/64
 ListenPort = 51820
 PrivateKey = ${WG_SERVER_PRIV}
 MTU = 1420
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -s 10.66.66.0/24 -o ${DEFAULT_IFACE} -j MASQUERADE
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -s 10.66.66.0/24 -o ${DEFAULT_IFACE} -j MASQUERADE
+PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -s 10.66.66.0/24 -o ${DEFAULT_IFACE} -j MASQUERADE; ip6tables -A FORWARD -i wg0 -j ACCEPT 2>/dev/null || true; ip6tables -A FORWARD -o wg0 -j ACCEPT 2>/dev/null || true; ip6tables -t nat -A POSTROUTING -s fd00:6861:6a69:66::/64 -o ${DEFAULT_IFACE} -j MASQUERADE 2>/dev/null || true
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -s 10.66.66.0/24 -o ${DEFAULT_IFACE} -j MASQUERADE; ip6tables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true; ip6tables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null || true; ip6tables -t nat -D POSTROUTING -s fd00:6861:6a69:66::/64 -o ${DEFAULT_IFACE} -j MASQUERADE 2>/dev/null || true
 
 [Peer]
 PublicKey = ${WG_CLIENT_PUB}
 PresharedKey = ${WG_PSK}
-AllowedIPs = 10.66.66.2/32
+AllowedIPs = 10.66.66.2/32, fd00:6861:6a69:66::2/128
 EOF
     chmod 600 /etc/wireguard/wg0.conf
     systemctl enable --now wg-quick@wg0 2>/dev/null || wg-quick up wg0 2>/dev/null || log_warn "WireGuard 启动失败 (若 VPS 为 OpenVZ/LXC 容器需宿主机开启 tun/wireguard 模块)"
@@ -2564,7 +2681,10 @@ open_firewall_ports() {
     iptables -I INPUT -p tcp --dport 20001:20029 -j ACCEPT 2>/dev/null || true
     iptables -I INPUT -p udp --dport 20001:20029 -j ACCEPT 2>/dev/null || true
     iptables -I INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || true
-    log_ok "防火墙端口已放行"
+    ip6tables -I INPUT -p tcp --dport 20001:20029 -j ACCEPT 2>/dev/null || true
+    ip6tables -I INPUT -p udp --dport 20001:20029 -j ACCEPT 2>/dev/null || true
+    ip6tables -I INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || true
+    log_ok "IPv4 / IPv6 双栈防火墙端口已放行"
 }
 
 generate_client_configs() {
@@ -3077,6 +3197,14 @@ anytls://${COMMON_PASS}@${PUBLIC_IP}:20014?sni=${PUBLIC_IP}&insecure=1#AnyTLS-No
 socks5://${COMMON_USER}:${COMMON_PASS}@${PUBLIC_IP}:20015#SOCKS5-Auth
 EOF
     base64 -w0 "${OUT_DIR}/hajimi-share-links.txt" > "${OUT_DIR}/hajimi-share-links-base64.txt"
+    if [[ -n "${PUBLIC_IPV6:-}" && "${PUBLIC_IPV6}" != "${PUBLIC_IP}" ]]; then
+        sed -e "s/ipv6 = false/ipv6 = true/g" \
+            -e "s/endpoint = ${PUBLIC_IP}:51820/endpoint = [${PUBLIC_IPV6}]:51820/g" \
+            -e "s/${PUBLIC_IP}/${PUBLIC_IPV6}/g" \
+            "${OUT_DIR}/hajimi-all-nodes.conf" > "${OUT_DIR}/hajimi-all-nodes-ipv6.conf"
+        sed -e "s/${PUBLIC_IP}/${PUBLIC_IPV6}/g" \
+            "${OUT_DIR}/hajimi-clash-meta.yaml" > "${OUT_DIR}/hajimi-clash-meta-ipv6.yaml"
+    fi
     chmod 644 "${OUT_DIR}/"*
     log_ok "客户端配置文件已全部生成至 ${OUT_DIR}/"
 }
@@ -3122,13 +3250,14 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=${OUT_DIR}
-ExecStart=/usr/bin/python3 -m http.server ${sub_port} --bind 0.0.0.0
+ExecStart=/usr/bin/python3 -m http.server ${sub_port} --bind ::
 Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 EOF
     iptables -I INPUT -p tcp --dport "${sub_port}" -j ACCEPT 2>/dev/null || true
+    ip6tables -I INPUT -p tcp --dport "${sub_port}" -j ACCEPT 2>/dev/null || true
     systemctl daemon-reload
     systemctl enable --now hajimi-sub-http.service
     echo ""
