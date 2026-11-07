@@ -36,10 +36,6 @@ void connectBasicProtocol(
         connectVMessProtocol(node, target, std::move(factory), std::move(completion));
         return;
     }
-    if (!target.udp && isTestbenchSocks5TLSNode(node)) {
-        connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
-        return;
-    }
     bool tlsDefault = node.type == "https" || node.type == "socks5-tls" || node.type == "trojan";
     auto tls = tlsOptions(node, tlsDefault);
     if ((node.type == "http" || node.type == "https") && tls.enabled && tls.alpn.empty())

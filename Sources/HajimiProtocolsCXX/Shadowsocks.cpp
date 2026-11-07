@@ -723,12 +723,6 @@ void connectShadowsocks(const Node &node,const Target &target,std::shared_ptr<Tr
         if (target.host.empty() || !target.port) throw std::runtime_error("Shadowsocks TCP target invalid");
         if (node.host.empty() || !node.port) throw std::runtime_error("Shadowsocks server address invalid");
         Config config(node);
-        if (isTestbenchSSRNode(node)) {
-            connectTestbenchSocks5Stream(node, target, std::move(factory), [finish](std::shared_ptr<Stream> s, Error e) {
-                finish(std::move(s), std::move(e));
-            });
-            return;
-        }
         factory->tcp(node,tlsOptions(node,false),[config=std::move(config),target,factory,finish](std::shared_ptr<Stream> raw,Error error) mutable {
             if (!error.empty() || !raw) {finish(nullptr,error.empty()?"Shadowsocks TCP transport unavailable":std::move(error));return;}
             try {auto stream=std::make_shared<SSStream>(std::move(config),target,raw,factory);stream->start(finish);}
@@ -746,12 +740,6 @@ void makeShadowsocksDatagram(const Node &node,std::shared_ptr<TransportFactory> 
         if (!factory || !factory->udp) throw std::runtime_error("Shadowsocks UDP transport unavailable");
         if (node.host.empty() || !node.port) throw std::runtime_error("Shadowsocks server address invalid");
         Config config(node);Target remote{node.dialHost(),node.port,true,false};
-        if (isTestbenchSSRNode(node)) {
-            makeTestbenchSocks5Datagram(node, std::move(factory), [finish](std::shared_ptr<Datagram> d, Error e) {
-                finish(std::move(d), std::move(e));
-            });
-            return;
-        }
         factory->udp(node,[config=std::move(config),remote,factory,finish](std::shared_ptr<Datagram> raw,Error error) mutable {
             if (!error.empty() || !raw) {finish(nullptr,error.empty()?"Shadowsocks UDP transport unavailable":std::move(error));return;}
             try {finish(std::make_shared<SSDatagram>(std::move(config),remote,raw,factory),{});}

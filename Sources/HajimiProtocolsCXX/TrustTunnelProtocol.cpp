@@ -223,10 +223,6 @@ void connectTrustTunnel(const Node &node, const Target &target,
     std::string username, password;
     auto err = parseTrustTunnelConfig(node, username, password);
     if (!err.empty()) { completion(nullptr, err); return; }
-    if (!target.udp && isTestbenchTrustTunnelNode(node)) {
-        connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
-        return;
-    }
 
     auto tls = tlsOptions(node, true);
     if (tls.alpn.empty()) {
@@ -312,10 +308,6 @@ void makeTrustTunnelDatagram(const Node &node, std::shared_ptr<TransportFactory>
                              DatagramCallback completion) {
     auto err = validateTrustTunnel(node, true);
     if (!err.empty()) { completion(nullptr, err); return; }
-    if (isTestbenchTrustTunnelNode(node)) {
-        makeTestbenchSocks5Datagram(node, std::move(factory), std::move(completion));
-        return;
-    }
     completion(std::make_shared<StreamPacketDatagram>(node, std::move(factory), connectTrustTunnel), {});
 }
 

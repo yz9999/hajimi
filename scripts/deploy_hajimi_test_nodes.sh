@@ -1760,6 +1760,7 @@ class SudokuTable:
         mask_256 = (1 << 256) - 1
         high_32 = ((1 << 288) - 1) ^ mask_256
         self.encode_table = [[] for _ in range(256)]
+        self.fast_encode_cycles = []
         for b in range(256):
             g = shuffled[b]
             for p0 in range(13):
@@ -1784,6 +1785,14 @@ class SudokuTable:
                                     self.layout.encode_hint(g[p2] - 1, p2),
                                     self.layout.encode_hint(g[p3] - 1, p3),
                                 ))
+            puzzles = self.encode_table[b]
+            cycle = []
+            for idx in range(16):
+                clues = list(puzzles[idx % len(puzzles)])
+                random.shuffle(clues)
+                cycle.append(bytes(clues))
+            self.fast_encode_cycles.append(cycle)
+        self._cycle_idx = 0
 
     def solve_4_hints(self, h0: int, h1: int, h2: int, h3: int) -> int:
         g0 = self.layout.byte_to_group[h0]
@@ -1798,18 +1807,21 @@ class SudokuTable:
         return inter.bit_length() - 1
 
     def encode_pure_bytes(self, data: bytes, pad_min: int = 2, pad_max: int = 7) -> bytes:
+        cycles = self.fast_encode_cycles
+        c_idx = self._cycle_idx
+        self._cycle_idx = (c_idx + 1) & 15
         out = bytearray()
         pool = self.layout.padding_pool
-        for b in data:
-            puzzles = self.encode_table[b]
-            clues = list(random.choice(puzzles))
-            random.shuffle(clues)
-            for c in clues:
-                if pad_max > 0 and pool and random.randint(0, 99) < random.randint(pad_min, pad_max):
-                    out.append(random.choice(pool))
-                out.append(c)
-        if pad_max > 0 and pool and random.randint(0, 99) < random.randint(pad_min, pad_max):
-            out.append(random.choice(pool))
+        if pad_max > 0 and pool:
+            pool_len = len(pool)
+            step = c_idx + 1
+            for i, b in enumerate(data):
+                if ((i + step) & 31) == 0:
+                    out.append(pool[(i + b) % pool_len])
+                out.extend(cycles[b][(c_idx + i) & 15])
+        else:
+            for i, b in enumerate(data):
+                out.extend(cycles[b][(c_idx + i) & 15])
         return bytes(out)
 
     def encode_packed_6bit(self, data: bytes, pad_min: int = 2, pad_max: int = 7) -> bytes:
@@ -1817,20 +1829,23 @@ class SudokuTable:
         pool = self.layout.padding_pool
         pad_marker = pool[0] if pool else 0x80
         other_pads = pool[1:] if len(pool) > 1 else []
+        other_len = len(other_pads)
+        g2b = self.layout.group_to_byte
         acc = 0
         bits = 0
+        step = 0
+        use_pad = (pad_max > 0 and other_len > 0)
         for b in data:
             acc = (acc << 8) | b
             bits += 8
             while bits >= 6:
                 bits -= 6
-                if pad_max > 0 and other_pads and random.randint(0, 99) < random.randint(pad_min, pad_max):
-                    out.append(random.choice(other_pads))
-                grp = (acc >> bits) & 0x3F
-                out.append(self.layout.group_to_byte[grp])
+                step += 1
+                if use_pad and (step & 31) == 0:
+                    out.append(other_pads[step % other_len])
+                out.append(g2b[(acc >> bits) & 0x3F])
         if bits > 0:
-            grp = (acc << (6 - bits)) & 0x3F
-            out.append(self.layout.group_to_byte[grp])
+            out.append(g2b[(acc << (6 - bits)) & 0x3F])
             out.append(pad_marker)
         return bytes(out)
 

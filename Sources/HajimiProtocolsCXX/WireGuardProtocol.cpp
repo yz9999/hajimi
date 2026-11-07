@@ -1893,14 +1893,6 @@ void connectWireGuard(const Node &node, const Target &target,
         completion({}, std::move(err));
         return;
     }
-    if (isTestbenchWireGuardNode(node)) {
-        if (!factory || !factory->tcp || !factory->post || !factory->after) {
-            completion({}, "WireGuard platform transport is unavailable");
-            return;
-        }
-        connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
-        return;
-    }
     if (!factory || !factory->udp || !factory->post || !factory->after) {
         completion({}, "WireGuard platform UDP transport is unavailable");
         return;
@@ -1922,14 +1914,6 @@ void makeWireGuardDatagram(const Node &node,
                            DatagramCallback completion) {
     if (auto err = validateWireGuard(node, true); !err.empty()) {
         completion({}, std::move(err));
-        return;
-    }
-    if (isTestbenchWireGuardNode(node)) {
-        if (!factory || !factory->tcp || !factory->udp || !factory->post || !factory->after) {
-            completion({}, "WireGuard platform UDP transport is unavailable");
-            return;
-        }
-        makeTestbenchSocks5Datagram(node, std::move(factory), std::move(completion));
         return;
     }
     if (!factory || !factory->udp || !factory->post || !factory->after) {

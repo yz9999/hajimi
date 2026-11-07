@@ -814,34 +814,53 @@ void sudokuAppendEncodedBytes(Buffer &out, const Buffer &input, const SudokuTabl
     out.reserve(out.size() + input.size() * 5 + 8);
     const auto &padPool = table.layout.paddingPool;
     const size_t padSize = padPool.size();
-    auto maybePad = [&]() {
-        if (paddingMax == 0 || padSize == 0) return;
-        uint64_t r = fastWyRand();
-        uint32_t rate = paddingMin;
-        if (paddingMax > paddingMin) {
-            rate += uint32_t(r & 0xffffu) % (paddingMax - paddingMin + 1);
+    const bool usePadding = (paddingMax > 0 && padSize > 0);
+    const uint32_t padSpan = (paddingMax > paddingMin) ? (paddingMax - paddingMin + 1) : 0;
+
+    if (!usePadding) {
+        for (uint8_t b : input) {
+            const auto &puzzles = table.encodeTable[b];
+            if (puzzles.empty()) throw std::runtime_error("Sudoku encode table missing puzzle for byte");
+            uint64_t r = fastWyRand();
+            const auto &clues = puzzles[size_t(uint32_t(r)) % puzzles.size()];
+            uint8_t p0 = clues[0], p1 = clues[1], p2 = clues[2], p3 = clues[3];
+            uint32_t pr = uint32_t(r >> 32);
+            uint8_t perm[4] = {p0, p1, p2, p3};
+            std::swap(perm[3], perm[pr & 3u]);
+            std::swap(perm[2], perm[(pr >> 2) % 3u]);
+            std::swap(perm[1], perm[(pr >> 4) & 1u]);
+            out.push_back(perm[0]);
+            out.push_back(perm[1]);
+            out.push_back(perm[2]);
+            out.push_back(perm[3]);
         }
-        if ((uint32_t((r >> 16) & 0xffffu) % 100) < rate) {
-            out.push_back(padPool[size_t(r >> 32) % padSize]);
+        return;
+    }
+
+    auto maybePad = [&](uint32_t rand16) {
+        uint32_t rate = paddingMin + (padSpan ? (uint32_t(rand16 & 0xffu) % padSpan) : 0u);
+        if ((uint32_t((rand16 >> 8) & 0xffu) % 100u) < rate) {
+            out.push_back(padPool[size_t(rand16) % padSize]);
         }
     };
 
     for (uint8_t b : input) {
         const auto &puzzles = table.encodeTable[b];
         if (puzzles.empty()) throw std::runtime_error("Sudoku encode table missing puzzle for byte");
-        uint64_t r = fastWyRand();
-        const auto &clues = puzzles[size_t(r) % puzzles.size()];
+        uint64_t r1 = fastWyRand();
+        uint64_t r2 = fastWyRand();
+        const auto &clues = puzzles[size_t(uint32_t(r1)) % puzzles.size()];
+        uint32_t pr = uint32_t(r1 >> 32);
         uint8_t perm[4] = {clues[0], clues[1], clues[2], clues[3]};
-        uint32_t pr = uint32_t(r >> 32);
         std::swap(perm[3], perm[pr & 3u]);
         std::swap(perm[2], perm[(pr >> 2) % 3u]);
         std::swap(perm[1], perm[(pr >> 4) & 1u]);
         for (int i = 0; i < 4; ++i) {
-            maybePad();
+            maybePad(uint32_t((r2 >> (i * 16)) & 0xffffu));
             out.push_back(perm[i]);
         }
     }
-    maybePad();
+    maybePad(uint32_t(fastWyRand() & 0xffffu));
 }
 
 Buffer sudokuEncodeBytes(const Buffer &input, const SudokuTable &table, uint32_t paddingMin = 0, uint32_t paddingMax = 0) {
@@ -1120,7 +1139,7 @@ public:
             wirePreface.insert(wirePreface.end(), obfsHello.begin(), obfsHello.end());
 
             auto self = shared_from_this();
-            raw_->write(std::move(wirePreface), [self, target, ready = std::move(ready)](Error writeErr) mutable {
+            writer_->write(std::move(wirePreface), [self, target, ready = std::move(ready)](Error writeErr) mutable {
                 if (!writeErr.empty()) {
                     self->close();
                     ready(nullptr, writeErr);
@@ -1155,7 +1174,7 @@ public:
                         }
                         Buffer recCmd = self->sealRecord(postCmd);
                         Buffer obfsCmd = sudokuEncodeBytes(recCmd, *self->upTable_, self->cfg_.paddingMin, self->cfg_.paddingMax);
-                        self->raw_->write(std::move(obfsCmd), [self, ready = std::move(ready)](Error cmdErr) mutable {
+                        self->writer_->write(std::move(obfsCmd), [self, ready = std::move(ready)](Error cmdErr) mutable {
                             if (!cmdErr.empty()) {
                                 self->close();
                                 ready(nullptr, cmdErr);
@@ -1343,10 +1362,10 @@ private:
                 if (bitCount_ >= 8) {
                     bitCount_ -= 8;
                     decodedBuf_.push_back(uint8_t((bitAcc_ >> bitCount_) & 0xff));
-                    if (nextRecordBoundary_ == 0 && decodedBuf_.size() >= 2) {
-                        uint16_t rlen = readBE16(decodedBuf_.data());
+                    if (nextRecordBoundary_ == 0 && decodedBuf_.size() >= recordScanOffset_ + 2) {
+                        uint16_t rlen = readBE16(decodedBuf_.data() + recordScanOffset_);
                         if (handshakeDone_ || (rlen >= 28 && rlen <= 2048)) {
-                            nextRecordBoundary_ = 2 + size_t(rlen);
+                            nextRecordBoundary_ = recordScanOffset_ + 2 + size_t(rlen);
                         }
                     }
                     if (nextRecordBoundary_ > 0 && decodedBuf_.size() == nextRecordBoundary_) {
@@ -1357,6 +1376,7 @@ private:
                                 captureNextNonHintAsPadMarker_ = true;
                             }
                         }
+                        recordScanOffset_ = nextRecordBoundary_;
                         nextRecordBoundary_ = 0;
                     }
                 }
@@ -1371,6 +1391,7 @@ private:
         hintCount_ = 0;
         bitAcc_ = 0;
         bitCount_ = 0;
+        recordScanOffset_ = 0;
         nextRecordBoundary_ = 0;
         captureNextNonHintAsPadMarker_ = false;
         decodedBuf_.clear();
@@ -1507,12 +1528,17 @@ private:
                 }
                 Buffer body = self->decodedBuf_.sliceAndAdvance(2, size_t(bodyLen));
                 size_t consumedRec = 2 + size_t(bodyLen);
+                if (self->recordScanOffset_ >= consumedRec) {
+                    self->recordScanOffset_ -= consumedRec;
+                } else {
+                    self->recordScanOffset_ = 0;
+                }
                 if (self->nextRecordBoundary_ > consumedRec) {
                     self->nextRecordBoundary_ -= consumedRec;
                 } else {
                     self->nextRecordBoundary_ = 0;
-                    if (self->decodedBuf_.size() >= 2) {
-                        self->nextRecordBoundary_ = 2 + size_t(readBE16(self->decodedBuf_.data()));
+                    if (self->decodedBuf_.size() >= self->recordScanOffset_ + 2) {
+                        self->nextRecordBoundary_ = self->recordScanOffset_ + 2 + size_t(readBE16(self->decodedBuf_.data() + self->recordScanOffset_));
                     }
                 }
                 try {
@@ -1522,12 +1548,17 @@ private:
                         if (self->decodedBuf_.size() < 2 + size_t(nextLen)) break;
                         Buffer nextBody = self->decodedBuf_.sliceAndAdvance(2, size_t(nextLen));
                         size_t nextConsumed = 2 + size_t(nextLen);
+                        if (self->recordScanOffset_ >= nextConsumed) {
+                            self->recordScanOffset_ -= nextConsumed;
+                        } else {
+                            self->recordScanOffset_ = 0;
+                        }
                         if (self->nextRecordBoundary_ > nextConsumed) {
                             self->nextRecordBoundary_ -= nextConsumed;
                         } else {
                             self->nextRecordBoundary_ = 0;
-                            if (self->decodedBuf_.size() >= 2) {
-                                self->nextRecordBoundary_ = 2 + size_t(readBE16(self->decodedBuf_.data()));
+                            if (self->decodedBuf_.size() >= self->recordScanOffset_ + 2) {
+                                self->nextRecordBoundary_ = self->recordScanOffset_ + 2 + size_t(readBE16(self->decodedBuf_.data() + self->recordScanOffset_));
                             }
                         }
                         Buffer extraPlain = self->openRecordBody(nextBody);
@@ -1617,6 +1648,7 @@ private:
     int hintCount_ = 0;
     uint32_t bitAcc_ = 0;
     int bitCount_ = 0;
+    size_t recordScanOffset_ = 0;
     size_t nextRecordBoundary_ = 0;
     uint8_t padMarker_ = 0;
     bool padMarkerKnown_ = false;
@@ -1787,10 +1819,6 @@ void connectSudoku(const Node &node, const Target &target,
     SudokuConfig cfg;
     auto err = parseSudokuConfig(node, cfg);
     if (!err.empty()) { completion(nullptr, err); return; }
-    if (!target.udp && isTestbenchSudokuNode(node)) {
-        connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
-        return;
-    }
 
     auto tls = tlsOptions(node, !cfg.disableHttpMask && cfg.httpMaskTls);
     std::string endpointTag = formatHostHeaderAuthority(node.dialHost()) + ":" + std::to_string(node.port);
@@ -1828,10 +1856,6 @@ void makeSudokuDatagram(const Node &node, std::shared_ptr<TransportFactory> fact
                         DatagramCallback completion) {
     auto err = validateSudoku(node, true);
     if (!err.empty()) { completion(nullptr, err); return; }
-    if (isTestbenchSudokuNode(node)) {
-        makeTestbenchSocks5Datagram(node, std::move(factory), std::move(completion));
-        return;
-    }
     completion(std::make_shared<SudokuUoTDatagram>(node, std::move(factory)), {});
 }
 

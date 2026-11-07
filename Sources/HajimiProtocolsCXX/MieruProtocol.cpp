@@ -176,7 +176,8 @@ Buffer mieruMakeNonce(const std::string &username, const Buffer &randomPrefix20)
 }
 
 Buffer sealMieruUDPSegmentWithKey(const std::string &username, const Buffer &key,
-                                  const Buffer &meta32, const Buffer &payload) {
+                                  const Buffer &meta32, const Buffer &payload,
+                                  bool incrementNonceForPayload = false) {
     Buffer nonce = mieruMakeNonce(username, crypto::randomBytes(20));
     Buffer wire;
     wire.reserve(24 + 48 + (payload.empty() ? 0 : payload.size() + 16));
@@ -184,7 +185,11 @@ Buffer sealMieruUDPSegmentWithKey(const std::string &username, const Buffer &key
     Buffer sealedMeta = crypto::seal(crypto::AEAD::XChaCha20Poly1305, key, nonce, meta32);
     wire.insert(wire.end(), sealedMeta.begin(), sealedMeta.end());
     if (!payload.empty()) {
-        Buffer sealedPayload = crypto::seal(crypto::AEAD::XChaCha20Poly1305, key, nonce, payload);
+        Buffer payloadNonce = nonce;
+        if (incrementNonceForPayload) {
+            incrementNonceBE(payloadNonce);
+        }
+        Buffer sealedPayload = crypto::seal(crypto::AEAD::XChaCha20Poly1305, key, payloadNonce, payload);
         wire.insert(wire.end(), sealedPayload.begin(), sealedPayload.end());
     }
     return wire;
@@ -368,6 +373,11 @@ public:
           candidateKeys_(std::move(candidateKeys)), txKey_(candidateKeys_.front()),
           rxKey_(candidateKeys_.front()), txNonce_(std::move(txNonce)),
           sessionID_(sessionID), txSeq_(initialTxSeq) {}
+
+    void writeInitialHandshake(Buffer wire, WriteCallback completion) {
+        if (closed_) { completion("Stream closed"); return; }
+        writer_->write(std::move(wire), std::move(completion));
+    }
 
     void write(Buffer data, WriteCallback completion) override {
         if (closed_) { completion("Stream closed"); return; }
@@ -1017,14 +1027,16 @@ private:
         });
     }
 
-    void sendOpenSessionPacketForSid(uint32_t sid) {
+    void sendOpenSessionPacketForSid(uint32_t sid, bool incrementPayloadNonce = false) {
         if (closed_ || sessionOpened_ || !raw_) return;
         try {
             lastTxMs_ = monotonicMillis();
-            Buffer openPkt = sealSegment(
+            refreshKeysIfNeeded();
+            Buffer openPkt = sealMieruUDPSegmentWithKey(
+                cfg_.username, txKey_,
                 buildMieruSessionMetadata(kMieruOpenSessionReq, sid, 0, 0,
                                           uint16_t(initialSocksReq_.size()), 0),
-                initialSocksReq_);
+                initialSocksReq_, incrementPayloadNonce);
             auto self = shared_from_this();
             raw_->send(serverTarget_, std::move(openPkt), [self](Error err) {
                 if (!err.empty() && !self->sessionOpened_) {
@@ -1037,13 +1049,13 @@ private:
     }
 
     void sendOpenSessionPacket() {
-        sendOpenSessionPacketForSid(sessionID_);
+        sendOpenSessionPacketForSid(sessionID_, false);
     }
 
     void rotateUnderlyingSocketAndSendOpen() {
         if (closed_ || sessionOpened_ || !factory_ || !factory_->udp) {
             sessionID_ = allocateFreshSessionID();
-            sendOpenSessionPacketForSid(sessionID_);
+            sendOpenSessionPacketForSid(sessionID_, false);
             return;
         }
         Node nextNode = dialNode_;
@@ -1061,7 +1073,7 @@ private:
             }
             if (!err.empty() || !freshDgram) {
                 self->sessionID_ = self->allocateFreshSessionID();
-                self->sendOpenSessionPacketForSid(self->sessionID_);
+                self->sendOpenSessionPacketForSid(self->sessionID_, false);
                 return;
             }
             // Keep previous handshake sockets open in handshakeSockets_ until sessionOpened_
@@ -1095,7 +1107,7 @@ private:
                 self->failAll(sockErr.empty() ? Error("Mieru UDP socket error") : sockErr);
             });
             self->sessionID_ = self->allocateFreshSessionID();
-            self->sendOpenSessionPacketForSid(self->sessionID_);
+            self->sendOpenSessionPacketForSid(self->sessionID_, false);
         });
     }
 
@@ -1137,7 +1149,7 @@ private:
             if (attempt == 1) {
                 // First fast retry: re-send original sessionID_ in case the
                 // initial uplink UDP datagram was dropped.
-                self->sendOpenSessionPacketForSid(self->initialSessionID_);
+                self->sendOpenSessionPacketForSid(self->initialSessionID_, false);
             } else if (attempt == 2 || attempt == 4) {
                 // Add a fresh ephemeral UDP socket in parallel (while keeping earlier
                 // handshake sockets open) to escape ISP UDP 5-tuple QoS blackholes without
@@ -1148,7 +1160,7 @@ private:
                 // the server and its downlink openSessionResp was lost during a burst,
                 // the server's KnownSession anti-replay filter will not reject our retry.
                 self->sessionID_ = self->allocateFreshSessionID();
-                self->sendOpenSessionPacketForSid(self->sessionID_);
+                self->sendOpenSessionPacketForSid(self->sessionID_, (attempt % 2) == 1);
             }
             // If within ±20s of a 2-minute bucket boundary on attempt >= 3, send an
             // additional probe packet encrypted with the adjacent bucket key without
@@ -1160,7 +1172,7 @@ private:
                     Buffer openMeta = buildMieruSessionMetadata(
                         kMieruOpenSessionReq, self->sessionID_, 0, 0, uint16_t(self->initialSocksReq_.size()), 0);
                     Buffer adjPkt = sealMieruUDPSegmentWithKey(
-                        self->cfg_.username, self->candidateKeys_[adjIdx], openMeta, self->initialSocksReq_);
+                        self->cfg_.username, self->candidateKeys_[adjIdx], openMeta, self->initialSocksReq_, false);
                     self->raw_->send(self->serverTarget_, std::move(adjPkt), {});
                 } catch (...) {}
             }
@@ -1667,10 +1679,6 @@ void connectMieru(const Node &node, const Target &target,
     MieruConfig cfg;
     auto err = parseMieruConfig(node, cfg);
     if (!err.empty()) { completion(nullptr, err); return; }
-    if (!target.udp && isTestbenchMieruNode(node)) {
-        connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
-        return;
-    }
 
     Node dialNode = node;
     if (cfg.portStart > 0 && cfg.portEnd >= cfg.portStart) {
@@ -1757,7 +1765,7 @@ void connectMieru(const Node &node, const Target &target,
 
             auto mieruStream = std::make_shared<MieruTCPStream>(
                 raw, std::move(candKeys), std::move(nextNonce), sessionID, 1);
-            raw->write(std::move(wire), [mieruStream, completion = std::move(completion)](Error writeErr) mutable {
+            mieruStream->writeInitialHandshake(std::move(wire), [mieruStream, completion = std::move(completion)](Error writeErr) mutable {
                 if (!writeErr.empty()) {
                     mieruStream->close();
                     completion(nullptr, writeErr);
@@ -1776,10 +1784,6 @@ void makeMieruDatagram(const Node &node, std::shared_ptr<TransportFactory> facto
                        DatagramCallback completion) {
     auto err = validateMieru(node, true);
     if (!err.empty()) { completion(nullptr, err); return; }
-    if (isTestbenchMieruNode(node)) {
-        makeTestbenchSocks5Datagram(node, std::move(factory), std::move(completion));
-        return;
-    }
     completion(std::make_shared<MieruUDPAssociateDatagram>(node, std::move(factory)), {});
 }
 

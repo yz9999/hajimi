@@ -892,10 +892,6 @@ void connectSSH(const Node &node, const Target &target, std::shared_ptr<Transpor
         completion({}, "SSH connection cancelled");
         return;
     }
-    if (isTestbenchSSHNode(node)) {
-        connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
-        return;
-    }
     factory->post([node, target, factory, completion = std::move(completion)]() mutable {
         if (factory->cancelled && factory->cancelled()) {
             completion({}, "SSH connection cancelled");
