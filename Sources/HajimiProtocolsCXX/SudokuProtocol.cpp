@@ -1222,6 +1222,36 @@ public:
     void read(size_t maximum, ReadCallback completion) override {
         if (closed_) { completion({}, true, "Stream closed"); return; }
         if (!pendingPlain_.empty()) {
+            if (pendingPlain_.size() < maximum && handshakeDone_) {
+                try {
+                    while (decodedBuf_.size() >= 2 && pendingPlain_.size() < maximum) {
+                        uint16_t nextLen = readBE16(decodedBuf_.data());
+                        if (decodedBuf_.size() < 2 + size_t(nextLen)) break;
+                        Buffer nextBody = decodedBuf_.sliceAndAdvance(2, size_t(nextLen));
+                        size_t nextConsumed = 2 + size_t(nextLen);
+                        if (recordScanOffset_ >= nextConsumed) {
+                            recordScanOffset_ -= nextConsumed;
+                        } else {
+                            recordScanOffset_ = 0;
+                        }
+                        if (nextRecordBoundary_ > nextConsumed) {
+                            nextRecordBoundary_ -= nextConsumed;
+                        } else {
+                            nextRecordBoundary_ = 0;
+                            if (decodedBuf_.size() >= recordScanOffset_ + 2) {
+                                nextRecordBoundary_ = recordScanOffset_ + 2 + size_t(readBE16(decodedBuf_.data() + recordScanOffset_));
+                            }
+                        }
+                        Buffer extraPlain = openRecordBody(nextBody);
+                        if (!extraPlain.empty()) {
+                            pendingPlain_.append(extraPlain.data(), extraPlain.size());
+                        }
+                    }
+                } catch (const std::exception &e) {
+                    completion({}, true, e.what());
+                    return;
+                }
+            }
             completion(pendingPlain_.consume(maximum), false, {});
             return;
         }
@@ -1464,7 +1494,7 @@ private:
             return;
         }
         auto self = shared_from_this();
-        raw_->read(65536, [self, needed, completion = std::move(completion)](Buffer chunk, bool eof, Error err) mutable {
+        raw_->read(262144, [self, needed, completion = std::move(completion)](Buffer chunk, bool eof, Error err) mutable {
             if (!err.empty()) { completion(err); return; }
             if (!chunk.empty()) {
                 if (!self->stripHttpMaskIfNeeded(chunk)) {

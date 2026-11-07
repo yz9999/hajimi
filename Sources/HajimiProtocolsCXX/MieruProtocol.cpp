@@ -176,8 +176,7 @@ Buffer mieruMakeNonce(const std::string &username, const Buffer &randomPrefix20)
 }
 
 Buffer sealMieruUDPSegmentWithKey(const std::string &username, const Buffer &key,
-                                  const Buffer &meta32, const Buffer &payload,
-                                  bool incrementNonceForPayload = false) {
+                                  const Buffer &meta32, const Buffer &payload) {
     Buffer nonce = mieruMakeNonce(username, crypto::randomBytes(20));
     Buffer wire;
     wire.reserve(24 + 48 + (payload.empty() ? 0 : payload.size() + 16));
@@ -185,11 +184,7 @@ Buffer sealMieruUDPSegmentWithKey(const std::string &username, const Buffer &key
     Buffer sealedMeta = crypto::seal(crypto::AEAD::XChaCha20Poly1305, key, nonce, meta32);
     wire.insert(wire.end(), sealedMeta.begin(), sealedMeta.end());
     if (!payload.empty()) {
-        Buffer payloadNonce = nonce;
-        if (incrementNonceForPayload) {
-            incrementNonceBE(payloadNonce);
-        }
-        Buffer sealedPayload = crypto::seal(crypto::AEAD::XChaCha20Poly1305, key, payloadNonce, payload);
+        Buffer sealedPayload = crypto::seal(crypto::AEAD::XChaCha20Poly1305, key, nonce, payload);
         wire.insert(wire.end(), sealedPayload.begin(), sealedPayload.end());
     }
     return wire;
@@ -1027,7 +1022,7 @@ private:
         });
     }
 
-    void sendOpenSessionPacketForSid(uint32_t sid, bool incrementPayloadNonce = false) {
+    void sendOpenSessionPacketForSid(uint32_t sid) {
         if (closed_ || sessionOpened_ || !raw_) return;
         try {
             lastTxMs_ = monotonicMillis();
@@ -1036,7 +1031,7 @@ private:
                 cfg_.username, txKey_,
                 buildMieruSessionMetadata(kMieruOpenSessionReq, sid, 0, 0,
                                           uint16_t(initialSocksReq_.size()), 0),
-                initialSocksReq_, incrementPayloadNonce);
+                initialSocksReq_);
             auto self = shared_from_this();
             raw_->send(serverTarget_, std::move(openPkt), [self](Error err) {
                 if (!err.empty() && !self->sessionOpened_) {
@@ -1049,13 +1044,13 @@ private:
     }
 
     void sendOpenSessionPacket() {
-        sendOpenSessionPacketForSid(sessionID_, false);
+        sendOpenSessionPacketForSid(sessionID_);
     }
 
     void rotateUnderlyingSocketAndSendOpen() {
         if (closed_ || sessionOpened_ || !factory_ || !factory_->udp) {
             sessionID_ = allocateFreshSessionID();
-            sendOpenSessionPacketForSid(sessionID_, false);
+            sendOpenSessionPacketForSid(sessionID_);
             return;
         }
         Node nextNode = dialNode_;
@@ -1073,7 +1068,7 @@ private:
             }
             if (!err.empty() || !freshDgram) {
                 self->sessionID_ = self->allocateFreshSessionID();
-                self->sendOpenSessionPacketForSid(self->sessionID_, false);
+                self->sendOpenSessionPacketForSid(self->sessionID_);
                 return;
             }
             // Keep previous handshake sockets open in handshakeSockets_ until sessionOpened_
@@ -1107,7 +1102,7 @@ private:
                 self->failAll(sockErr.empty() ? Error("Mieru UDP socket error") : sockErr);
             });
             self->sessionID_ = self->allocateFreshSessionID();
-            self->sendOpenSessionPacketForSid(self->sessionID_, false);
+            self->sendOpenSessionPacketForSid(self->sessionID_);
         });
     }
 
@@ -1149,7 +1144,7 @@ private:
             if (attempt == 1) {
                 // First fast retry: re-send original sessionID_ in case the
                 // initial uplink UDP datagram was dropped.
-                self->sendOpenSessionPacketForSid(self->initialSessionID_, false);
+                self->sendOpenSessionPacketForSid(self->initialSessionID_);
             } else if (attempt == 2 || attempt == 4) {
                 // Add a fresh ephemeral UDP socket in parallel (while keeping earlier
                 // handshake sockets open) to escape ISP UDP 5-tuple QoS blackholes without
@@ -1160,7 +1155,7 @@ private:
                 // the server and its downlink openSessionResp was lost during a burst,
                 // the server's KnownSession anti-replay filter will not reject our retry.
                 self->sessionID_ = self->allocateFreshSessionID();
-                self->sendOpenSessionPacketForSid(self->sessionID_, (attempt % 2) == 1);
+                self->sendOpenSessionPacketForSid(self->sessionID_);
             }
             // If within ±20s of a 2-minute bucket boundary on attempt >= 3, send an
             // additional probe packet encrypted with the adjacent bucket key without
@@ -1172,7 +1167,7 @@ private:
                     Buffer openMeta = buildMieruSessionMetadata(
                         kMieruOpenSessionReq, self->sessionID_, 0, 0, uint16_t(self->initialSocksReq_.size()), 0);
                     Buffer adjPkt = sealMieruUDPSegmentWithKey(
-                        self->cfg_.username, self->candidateKeys_[adjIdx], openMeta, self->initialSocksReq_, false);
+                        self->cfg_.username, self->candidateKeys_[adjIdx], openMeta, self->initialSocksReq_);
                     self->raw_->send(self->serverTarget_, std::move(adjPkt), {});
                 } catch (...) {}
             }

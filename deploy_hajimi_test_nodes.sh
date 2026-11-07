@@ -155,6 +155,7 @@ uninstall_all() {
           /etc/systemd/system/hajimi-sub-http.service
     systemctl daemon-reload
     rm -f /etc/wireguard/wg0.conf
+    rm -rf /etc/mita /var/lib/mita /var/run/mita
     if id "hajimisshtest" &>/dev/null; then
         userdel -r hajimisshtest 2>/dev/null || true
     fi
@@ -275,8 +276,8 @@ generate_or_load_credentials() {
         log_ok "已加载现有节点密钥配置 (${STATE_ENV})"
     fi
 
-    COMMON_PASS="${COMMON_PASS:-HajimiTestPass2026}"
-    COMMON_USER="${COMMON_USER:-hajimi}"
+    COMMON_PASS="HajimiTestPass2026"
+    COMMON_USER="hajimi"
     UUID_V4="${UUID_V4:-$(cat /proc/sys/kernel/random/uuid)}"
     SS2022_AES128_KEY="${SS2022_AES128_KEY:-$(openssl rand -base64 16)}"
     SS2022_CHACHA_KEY="${SS2022_CHACHA_KEY:-$(openssl rand -base64 32)}"
@@ -740,6 +741,8 @@ configure_mieru_service() {
         return
     fi
     log_info "正在配置 Mieru 服务端 (TCP:20011, UDP:20017)..."
+    systemctl stop mita 2>/dev/null || true
+    rm -f /etc/mita/server.conf.pb
     mkdir -p /etc/mita
     cat >/etc/mita/server.json <<EOF
 {
@@ -763,10 +766,25 @@ configure_mieru_service() {
   "mtu": 1400
 }
 EOF
-    systemctl enable --now mita 2>/dev/null || true
-    mita apply config /etc/mita/server.json 2>/dev/null || true
-    mita start 2>/dev/null || systemctl restart mita 2>/dev/null || true
-    log_ok "Mieru (mita) 已启动 (TCP: 20011, UDP: 20017)"
+    chown -R mita:mita /etc/mita 2>/dev/null || true
+    systemctl enable mita 2>/dev/null || true
+    systemctl restart mita 2>/dev/null || true
+    for _ in $(seq 1 30); do
+        if mita status >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.2
+    done
+    mita apply config /etc/mita/server.json >/dev/null 2>&1 || true
+    systemctl restart mita 2>/dev/null || true
+    for _ in $(seq 1 30); do
+        if mita status >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.2
+    done
+    mita start >/dev/null 2>&1 || true
+    log_ok "Mieru (mita) 已启动并完成配置热重载 (TCP: 20011, UDP: 20017)"
 }
 
 configure_extra_protocol_servers() {
@@ -1793,6 +1811,32 @@ class SudokuTable:
                 cycle.append(bytes(clues))
             self.fast_encode_cycles.append(cycle)
         self._cycle_idx = 0
+        pool = self.layout.padding_pool
+        self._pure_lut_no_pad = [
+            [self.fast_encode_cycles[b][(c_idx + b) & 15] for b in range(256)]
+            for c_idx in range(16)
+        ]
+        if pool:
+            pool_len = len(pool)
+            self._pure_lut_padded = [
+                [
+                    (bytes([pool[(b + c_idx) % pool_len]]) + self.fast_encode_cycles[b][(c_idx + b) & 15])
+                    if ((b + c_idx) & 7) == 0 else self.fast_encode_cycles[b][(c_idx + b) & 15]
+                    for b in range(256)
+                ]
+                for c_idx in range(16)
+            ]
+        else:
+            self._pure_lut_padded = self._pure_lut_no_pad
+
+        b64_alpha = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        pad_marker = pool[0] if pool else 0x80
+        self._pad_marker_byte = bytes([pad_marker])
+        trans = bytearray(range(256))
+        for i, ch in enumerate(b64_alpha):
+            trans[ch] = self.layout.group_to_byte[i]
+        trans[ord("=")] = pad_marker
+        self._b64_trans = bytes(trans)
 
     def solve_4_hints(self, h0: int, h1: int, h2: int, h3: int) -> int:
         g0 = self.layout.byte_to_group[h0]
@@ -1807,47 +1851,18 @@ class SudokuTable:
         return inter.bit_length() - 1
 
     def encode_pure_bytes(self, data: bytes, pad_min: int = 2, pad_max: int = 7) -> bytes:
-        cycles = self.fast_encode_cycles
         c_idx = self._cycle_idx
         self._cycle_idx = (c_idx + 1) & 15
-        out = bytearray()
-        pool = self.layout.padding_pool
-        if pad_max > 0 and pool:
-            pool_len = len(pool)
-            step = c_idx + 1
-            for i, b in enumerate(data):
-                if ((i + step) & 31) == 0:
-                    out.append(pool[(i + b) % pool_len])
-                out.extend(cycles[b][(c_idx + i) & 15])
-        else:
-            for i, b in enumerate(data):
-                out.extend(cycles[b][(c_idx + i) & 15])
-        return bytes(out)
+        lut = self._pure_lut_padded[c_idx] if pad_max > 0 else self._pure_lut_no_pad[c_idx]
+        return b"".join(map(lut.__getitem__, data))
 
     def encode_packed_6bit(self, data: bytes, pad_min: int = 2, pad_max: int = 7) -> bytes:
-        out = bytearray()
-        pool = self.layout.padding_pool
-        pad_marker = pool[0] if pool else 0x80
-        other_pads = pool[1:] if len(pool) > 1 else []
-        other_len = len(other_pads)
-        g2b = self.layout.group_to_byte
-        acc = 0
-        bits = 0
-        step = 0
-        use_pad = (pad_max > 0 and other_len > 0)
-        for b in data:
-            acc = (acc << 8) | b
-            bits += 8
-            while bits >= 6:
-                bits -= 6
-                step += 1
-                if use_pad and (step & 31) == 0:
-                    out.append(other_pads[step % other_len])
-                out.append(g2b[(acc >> bits) & 0x3F])
-        if bits > 0:
-            out.append(g2b[(acc << (6 - bits)) & 0x3F])
-            out.append(pad_marker)
-        return bytes(out)
+        if not data:
+            return b""
+        encoded = base64.b64encode(data).translate(self._b64_trans)
+        if len(data) % 3 == 1:
+            return encoded[:-1]
+        return encoded
 
 _SUDOKU_TABLE_CACHE = {}
 
@@ -1955,6 +1970,10 @@ class SudokuServerSession:
         self.tx_base = hkdf_expand_sha256(sum_key, b"sudoku-psk-s2c", 32)
         self.send_epoch = 1
         self.send_seq = 1
+        self._cached_rx_epoch = None
+        self._cached_rx_cipher = None
+        self._cached_tx_epoch = None
+        self._cached_tx_cipher = None
         self.http_mask_stripped = False
         self.raw_buf = bytearray()
         self.hint_buf = []
@@ -1968,10 +1987,14 @@ class SudokuServerSession:
         self.tx_base = hkdf_sha256(ikm, salt, b"sudoku-session-s2c", 32)
         self.send_epoch = 2
         self.send_seq = 1
+        self._cached_rx_epoch = None
+        self._cached_rx_cipher = None
+        self._cached_tx_epoch = None
+        self._cached_tx_cipher = None
 
     async def _ensure_decoded(self, needed: int):
         while len(self.decoded_buf) < needed:
-            chunk = await self.reader.read(16384)
+            chunk = await self.reader.read(65536)
             if not chunk:
                 raise EOFError("Sudoku client closed connection")
             if not self.http_mask_stripped:
@@ -2016,10 +2039,11 @@ class SudokuServerSession:
         hdr = body[:12]
         cipher = body[12:]
         epoch = struct.unpack(">I", hdr[:4])[0]
-        key = derive_sudoku_epoch_key(self.rx_base, self.aead_method, epoch)
-        if self.aead_method == "aes-128-gcm":
-            return AESGCM(key).decrypt(hdr, cipher, hdr)
-        return ChaCha20Poly1305(key).decrypt(hdr, cipher, hdr)
+        if self._cached_rx_epoch != epoch or self._cached_rx_cipher is None:
+            key = derive_sudoku_epoch_key(self.rx_base, self.aead_method, epoch)
+            self._cached_rx_cipher = AESGCM(key) if self.aead_method == "aes-128-gcm" else ChaCha20Poly1305(key)
+            self._cached_rx_epoch = epoch
+        return self._cached_rx_cipher.decrypt(hdr, cipher, hdr)
 
     async def ensure_plain(self, needed: int):
         while len(self.plain_buf) < needed:
@@ -2059,26 +2083,26 @@ class SudokuServerSession:
         seq = self.send_seq
         self.send_seq += 1
         hdr = struct.pack(">IQ", epoch, seq)
-        key = derive_sudoku_epoch_key(self.tx_base, self.aead_method, epoch)
-        if self.aead_method == "aes-128-gcm":
-            cipher = AESGCM(key).encrypt(hdr, plain, hdr)
-        else:
-            cipher = ChaCha20Poly1305(key).encrypt(hdr, plain, hdr)
+        if self._cached_tx_epoch != epoch or self._cached_tx_cipher is None:
+            key = derive_sudoku_epoch_key(self.tx_base, self.aead_method, epoch)
+            self._cached_tx_cipher = AESGCM(key) if self.aead_method == "aes-128-gcm" else ChaCha20Poly1305(key)
+            self._cached_tx_epoch = epoch
+        cipher = self._cached_tx_cipher.encrypt(hdr, plain, hdr)
         body = hdr + cipher
         return struct.pack(">H", len(body)) + body
 
     async def write_plain(self, data: bytes):
-        out = bytearray()
+        chunks = []
         offset = 0
         while offset < len(data):
             chunk = data[offset:offset + 16384]
             offset += len(chunk)
             rec = self._seal_record(chunk)
             if self.pure_downlink:
-                out.extend(self.down_table.encode_pure_bytes(rec, self.pad_min, self.pad_max))
+                chunks.append(self.down_table.encode_pure_bytes(rec, self.pad_min, self.pad_max))
             else:
-                out.extend(self.down_table.encode_packed_6bit(rec, self.pad_min, self.pad_max))
-        self.writer.write(bytes(out))
+                chunks.append(self.down_table.encode_packed_6bit(rec, self.pad_min, self.pad_max))
+        self.writer.write(b"".join(chunks))
         await self.writer.drain()
 
 async def handle_sudoku(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, profile: dict):
@@ -2145,7 +2169,7 @@ async def handle_sudoku(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             async def s2c():
                 try:
                     while True:
-                        data = await rem_r.read(16384)
+                        data = await rem_r.read(65536)
                         if not data:
                             break
                         await sess.write_plain(data)
