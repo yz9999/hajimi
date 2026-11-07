@@ -382,11 +382,60 @@ bool constantTimeEqual(const Buffer &a, const Buffer &b) {
 }
 
 struct CipherStream::Impl {
+    enum class Mode { EVP, RC4, ChaCha20Legacy, Passthrough };
+    Mode mode = Mode::EVP;
     CipherContext context{EVP_CIPHER_CTX_new(),EVP_CIPHER_CTX_free};
     std::unique_ptr<EVP_CIPHER, decltype(&EVP_CIPHER_free)> algorithm{nullptr,EVP_CIPHER_free};
+    std::array<uint8_t, 256> rc4S{};
+    uint8_t rc4I = 0;
+    uint8_t rc4J = 0;
+    std::array<uint8_t, 32> chachaKey{};
+    std::array<uint8_t, 8> chachaNonce{};
+    uint64_t chachaCounter = 0;
+    std::array<uint8_t, 64> chachaBlock{};
+    size_t chachaOffset = 64;
 };
 CipherStream::CipherStream(const std::string &name,const Buffer &key,const Buffer &iv,bool encrypt)
     : impl_(std::make_unique<Impl>()) {
+    if (name == "NONE" || name == "none" || name == "table") {
+        impl_->mode = Impl::Mode::Passthrough;
+        return;
+    }
+    if (name == "RC4" || name == "rc4" || name == "RC4-MD5" || name == "rc4-md5") {
+        impl_->mode = Impl::Mode::RC4;
+        Buffer actualKey = key;
+        if (name == "RC4-MD5" || name == "rc4-md5") {
+            require(!key.empty() && !iv.empty(), "RC4-MD5 key or IV empty");
+            Buffer material = key;
+            material.insert(material.end(), iv.begin(), iv.end());
+            actualKey = digest("MD5", material);
+        }
+        require(!actualKey.empty(), "RC4 key empty");
+        for (size_t i = 0; i < 256; ++i) impl_->rc4S[i] = static_cast<uint8_t>(i);
+        uint8_t j = 0;
+        for (size_t i = 0; i < 256; ++i) {
+            j = static_cast<uint8_t>(j + impl_->rc4S[i] + actualKey[i % actualKey.size()]);
+            std::swap(impl_->rc4S[i], impl_->rc4S[j]);
+        }
+        return;
+    }
+    if (name == "CHACHA20" || name == "chacha20") {
+        require(key.size() == 32 && iv.size() == 8, "ChaCha20 key or IV length invalid");
+        impl_->mode = Impl::Mode::ChaCha20Legacy;
+        std::memcpy(impl_->chachaKey.data(), key.data(), 32);
+        std::memcpy(impl_->chachaNonce.data(), iv.data(), 8);
+        return;
+    }
+    if (name == "CHACHA20-IETF" || name == "chacha20-ietf") {
+        require(key.size() == 32 && iv.size() == 12, "ChaCha20-IETF key or IV length invalid");
+        Buffer osslIv(16, 0);
+        std::memcpy(osslIv.data() + 4, iv.data(), 12);
+        impl_->algorithm.reset(EVP_CIPHER_fetch(nullptr, "ChaCha20", nullptr));
+        require(impl_->context != nullptr && impl_->algorithm != nullptr, "ChaCha20-IETF unavailable");
+        require(EVP_CipherInit_ex(impl_->context.get(), impl_->algorithm.get(), nullptr, key.data(), osslIv.data(), encrypt ? 1 : 0) == 1 &&
+                EVP_CIPHER_CTX_set_padding(impl_->context.get(), 0) == 1, "ChaCha20-IETF initialization failed");
+        return;
+    }
     impl_->algorithm.reset(EVP_CIPHER_fetch(nullptr,name.c_str(),nullptr));
     require(impl_->context != nullptr && impl_->algorithm != nullptr,"Stream cipher unavailable");
     require(key.size() == size_t(EVP_CIPHER_get_key_length(impl_->algorithm.get())) &&
@@ -399,6 +448,48 @@ CipherStream::CipherStream(CipherStream &&) noexcept = default;
 CipherStream &CipherStream::operator=(CipherStream &&) noexcept = default;
 Buffer CipherStream::update(const Buffer &input) {
     require(impl_ != nullptr,"Stream cipher has been moved");
+    if (input.empty()) return {};
+    if (impl_->mode == Impl::Mode::Passthrough) {
+        return input;
+    }
+    if (impl_->mode == Impl::Mode::RC4) {
+        Buffer output(input.size());
+        for (size_t k = 0; k < input.size(); ++k) {
+            impl_->rc4I = static_cast<uint8_t>(impl_->rc4I + 1);
+            impl_->rc4J = static_cast<uint8_t>(impl_->rc4J + impl_->rc4S[impl_->rc4I]);
+            std::swap(impl_->rc4S[impl_->rc4I], impl_->rc4S[impl_->rc4J]);
+            uint8_t t = static_cast<uint8_t>(impl_->rc4S[impl_->rc4I] + impl_->rc4S[impl_->rc4J]);
+            output[k] = input[k] ^ impl_->rc4S[t];
+        }
+        return output;
+    }
+    if (impl_->mode == Impl::Mode::ChaCha20Legacy) {
+        Buffer output(input.size());
+        for (size_t idx = 0; idx < input.size(); ++idx) {
+            if (impl_->chachaOffset >= 64) {
+                std::array<uint32_t, 16> state{0x61707865, 0x3320646e, 0x79622d32, 0x6b206574};
+                for (unsigned i = 0; i < 8; ++i) state[i + 4] = load32(impl_->chachaKey.data() + i * 4);
+                state[12] = static_cast<uint32_t>(impl_->chachaCounter & 0xffffffffu);
+                state[13] = static_cast<uint32_t>((impl_->chachaCounter >> 32) & 0xffffffffu);
+                state[14] = load32(impl_->chachaNonce.data());
+                state[15] = load32(impl_->chachaNonce.data() + 4);
+                auto working = state;
+                for (unsigned i = 0; i < 10; ++i) {
+                    quarter(working, 0, 4, 8, 12); quarter(working, 1, 5, 9, 13);
+                    quarter(working, 2, 6, 10, 14); quarter(working, 3, 7, 11, 15);
+                    quarter(working, 0, 5, 10, 15); quarter(working, 1, 6, 11, 12);
+                    quarter(working, 2, 7, 8, 13); quarter(working, 3, 4, 9, 14);
+                }
+                for (unsigned i = 0; i < 16; ++i) {
+                    store32(working[i] + state[i], impl_->chachaBlock.data() + i * 4);
+                }
+                ++impl_->chachaCounter;
+                impl_->chachaOffset = 0;
+            }
+            output[idx] = input[idx] ^ impl_->chachaBlock[impl_->chachaOffset++];
+        }
+        return output;
+    }
     Buffer output(input.size()+EVP_MAX_BLOCK_LENGTH); int written=0;
     require(EVP_CipherUpdate(impl_->context.get(),output.data(),&written,input.data(),length(input.size())) == 1,
             "Stream cipher processing failed");

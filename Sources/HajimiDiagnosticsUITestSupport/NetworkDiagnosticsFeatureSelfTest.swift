@@ -98,6 +98,9 @@ final class NetworkDiagnosticsFeatureSelfTest {
         repeat {
             RunLoop.current.run(until: Date().addingTimeInterval(0.015))
         } while condition.map({ !$0() }) == true && Date() < deadline
+        if condition != nil {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.015))
+        }
     }
 
     private func local(_ gateway: String = "192.0.2.1", capturedAt: TimeInterval = 1)
@@ -497,16 +500,19 @@ final class NetworkDiagnosticsFeatureSelfTest {
                    "deallocated feature delivered late results or repeated cleanup")
 
         var panelClosedCount = 0
-        var panel: NetworkDiagnosticsPanelController? = NetworkDiagnosticsPanelController(capabilities: environment.capabilities())
-        weak var weakPanel = panel
-        panel?.onClose = {
-            panelClosedCount += 1
-            panel = nil
+        weak var weakPanel: NetworkDiagnosticsPanelController?
+        try autoreleasepool {
+            var panel: NetworkDiagnosticsPanelController? = NetworkDiagnosticsPanelController(capabilities: environment.capabilities())
+            weakPanel = panel
+            panel?.onClose = {
+                panelClosedCount += 1
+                panel = nil
+            }
+            guard let closeButton = button(panel!.feature.view, titled: "退出诊断") else {
+                throw Failure(text: "missing explicit exit diagnostics button")
+            }
+            closeButton.performClick(nil)
         }
-        guard let closeButton = button(panel!.feature.view, titled: "退出诊断") else {
-            throw Failure(text: "missing explicit exit diagnostics button")
-        }
-        closeButton.performClick(nil)
         try expect(panelClosedCount == 1 && weakPanel == nil,
                    "explicit exit diagnostics button did not tear down and release panel controller")
     }

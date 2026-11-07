@@ -47,11 +47,58 @@ class PlainFramedStream : public Stream, public std::enable_shared_from_this<Pla
     Buffer request_;
     proto_common::CursorBuffer buffered_;
     std::unique_ptr<VisionCodec> vision_;
+    bool visionXudp_ = false;
+    bool firstXudpPacket_ = true;
+    Buffer xudpGlobalId_;
+    Buffer xudpRxBuf_;
     bool coalesceHeader_ = false;
     bool headerSent_ = false;
     bool responseReady_, closed_ = false, eof_ = false;
     ReadCallback pendingRead_;
     size_t requested_ = 0;
+
+    static Buffer encodeXudpFrame(const Target &target, const Buffer &payload, bool first, const Buffer &globalId) {
+        Buffer meta{0, 0, 0, 0, uint8_t(first ? 1 : 2), 1, 2};
+        append16(meta, target.port);
+        auto address = socksAddress(target);
+        address.resize(address.size() - 2);
+        if (address[0] == 3) address[0] = 2;
+        else if (address[0] == 4) address[0] = 3;
+        meta.insert(meta.end(), address.begin(), address.end());
+        if (first && globalId.size() == 8) {
+            meta.insert(meta.end(), globalId.begin(), globalId.end());
+        }
+        uint16_t metaLen = uint16_t(meta.size() - 2);
+        meta[0] = uint8_t(metaLen >> 8);
+        meta[1] = uint8_t(metaLen & 0xff);
+        append16(meta, uint16_t(payload.size()));
+        meta.insert(meta.end(), payload.begin(), payload.end());
+        return meta;
+    }
+
+    bool tryExtractXudpPacket(Buffer &outPayload) {
+        while (xudpRxBuf_.size() >= 6) {
+            uint16_t metaLen = read16(xudpRxBuf_, 0);
+            if (metaLen < 4 || metaLen > 512) {
+                throw std::runtime_error("Invalid XUDP metadata length");
+            }
+            if (xudpRxBuf_.size() < size_t(2 + metaLen)) return false;
+            uint8_t status = xudpRxBuf_[4];
+            uint8_t opt = xudpRxBuf_[5];
+            bool hasPayload = (opt & 1) != 0;
+            size_t frameHeaderEnd = 2 + metaLen;
+            size_t totalNeeded = frameHeaderEnd + (hasPayload ? 2 : 0);
+            if (xudpRxBuf_.size() < totalNeeded) return false;
+            uint16_t payloadLen = hasPayload ? read16(xudpRxBuf_, frameHeaderEnd) : 0;
+            if (xudpRxBuf_.size() < totalNeeded + payloadLen) return false;
+            outPayload.assign(xudpRxBuf_.begin() + totalNeeded, xudpRxBuf_.begin() + totalNeeded + payloadLen);
+            xudpRxBuf_.erase(xudpRxBuf_.begin(), xudpRxBuf_.begin() + totalNeeded + payloadLen);
+            if ((status == 1 || status == 2) && hasPayload) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     void finishRead(Buffer data, bool eof, Error error) {
         auto callback = std::move(pendingRead_);
@@ -136,6 +183,18 @@ class PlainFramedStream : public Stream, public std::enable_shared_from_this<Pla
             return;
         }
         if (vision_) {
+            if (visionXudp_) {
+                try {
+                    Buffer pkt;
+                    if (tryExtractXudpPacket(pkt)) {
+                        deliver(std::move(pkt), false);
+                        return;
+                    }
+                } catch (const std::exception &e) {
+                    failedRead(e.what());
+                    return;
+                }
+            }
             reader_->some(65536, [self](Buffer data, bool eof, Error error) {
                 if (!error.empty()) { self->failedRead(error); return; }
                 try {
@@ -146,6 +205,20 @@ class PlainFramedStream : public Stream, public std::enable_shared_from_this<Pla
                     }
                     if (eof && self->vision_->truncated()) {
                         self->failedRead("Truncated Vision frame");
+                        return;
+                    }
+                    if (self->visionXudp_) {
+                        if (!decoded.empty()) {
+                            self->xudpRxBuf_.insert(self->xudpRxBuf_.end(), decoded.begin(), decoded.end());
+                        }
+                        Buffer pkt;
+                        if (self->tryExtractXudpPacket(pkt)) {
+                            self->deliver(std::move(pkt), false);
+                        } else if (eof) {
+                            self->deliver({}, true);
+                        } else {
+                            self->nextRead();
+                        }
                         return;
                     }
                     if (!decoded.empty() || eof) self->deliver(std::move(decoded), eof);
@@ -222,8 +295,6 @@ public:
             request_.insert(request_.end(), uuid.begin(), uuid.end());
             auto flow = node.option("flow");
             if (!flow.empty()) {
-                if (target_.udp)
-                    throw std::runtime_error("VLESS Vision UDP requires an XUDP carrier");
                 bool reality = node.parameters.count("reality-public-key") || node.option("security") == "reality";
                 if (reality && !source_->supportsVisionDirect())
                     throw std::runtime_error("VLESS Vision needs a direct-capable REALITY TCP carrier");
@@ -232,12 +303,20 @@ public:
                 addons.insert(addons.end(), canonical.begin(), canonical.end());
                 request_.push_back(uint8_t(addons.size()));
                 request_.insert(request_.end(), addons.begin(), addons.end());
-                vision_ = std::make_unique<VisionCodec>(uuid, !muxTarget(target_) && source_->supportsVisionDirect());
+                if (target_.udp) {
+                    visionXudp_ = true;
+                    xudpGlobalId_ = crypto::randomBytes(8);
+                    bool anyNonZero = false;
+                    for (uint8_t b : xudpGlobalId_) if (b != 0) anyNonZero = true;
+                    if (!anyNonZero && !xudpGlobalId_.empty()) xudpGlobalId_[7] = 1;
+                }
+                vision_ = std::make_unique<VisionCodec>(uuid, !muxTarget(target_) && !visionXudp_ && source_->supportsVisionDirect());
             } else {
                 request_.push_back(0);
             }
-            request_.push_back(muxTarget(target_) ? 3 : target_.udp ? 2 : 1);
-            if (!muxTarget(target_)) {
+            bool useMuxCmd = muxTarget(target_) || visionXudp_;
+            request_.push_back(useMuxCmd ? 3 : target_.udp ? 2 : 1);
+            if (!useMuxCmd) {
                 append16(request_, target_.port);
                 auto address = socksAddress(target_);
                 address.resize(address.size() - 2);
@@ -298,6 +377,10 @@ public:
         try {
             bool direct = false;
             if (vision_) {
+                if (visionXudp_) {
+                    data = encodeXudpFrame(target_, data, firstXudpPacket_, xudpGlobalId_);
+                    firstXudpPacket_ = false;
+                }
                 data = vision_->encode(data, direct);
             } else if (target_.udp) {
                 Buffer frame;

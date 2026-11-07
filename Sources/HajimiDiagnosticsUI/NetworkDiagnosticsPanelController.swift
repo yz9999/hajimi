@@ -46,8 +46,19 @@ public final class NetworkDiagnosticsPanelController: NSWindowController, NSWind
     public func closeAndTeardown() {
         precondition(Thread.isMainThread)
         guard !didClose else { return }
-        suspend()
         window?.close()
+        finishClose()
+    }
+
+    private func finishClose() {
+        guard !didClose else { return }
+        didClose = true
+        suspend()
+        window?.delegate = nil
+        window?.contentView = nil
+        let callback = onClose
+        onClose = nil
+        callback?()
     }
 
     private var isVisible: Bool {
@@ -80,12 +91,6 @@ public final class NetworkDiagnosticsPanelController: NSWindowController, NSWind
     public func windowDidDeminiaturize(_ notification: Notification) { reconcileTimer() }
     public func windowDidMiniaturize(_ notification: Notification) { suspend() }
     public func windowWillClose(_ notification: Notification) {
-        didClose = true
-        suspend()
-        window?.delegate = nil
-        window?.contentView = nil
-        let callback = onClose
-        onClose = nil
-        callback?()
+        finishClose()
     }
 }

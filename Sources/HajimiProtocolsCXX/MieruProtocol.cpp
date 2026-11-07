@@ -1283,19 +1283,7 @@ private:
                 if (parsed.protoType == kMieruDataServerToClientLE) {
                     cipherPayload = decodeMieruLowEntropyPayload(parsed, cipherPayload);
                 }
-                try {
-                    plainPayload = crypto::open(crypto::AEAD::XChaCha20Poly1305, rxKey_, nonce, cipherPayload);
-                } catch (...) {
-                    Buffer beNonce = nonce;
-                    incrementNonceBE(beNonce);
-                    try {
-                        plainPayload = crypto::open(crypto::AEAD::XChaCha20Poly1305, rxKey_, beNonce, cipherPayload);
-                    } catch (...) {
-                        Buffer leNonce = nonce;
-                        incrementNonceLE(leNonce);
-                        plainPayload = crypto::open(crypto::AEAD::XChaCha20Poly1305, rxKey_, leNonce, cipherPayload);
-                    }
-                }
+                plainPayload = crypto::open(crypto::AEAD::XChaCha20Poly1305, rxKey_, nonce, cipherPayload);
             }
 
             bool justOpened = false;

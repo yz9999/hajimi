@@ -45,6 +45,12 @@ static Buffer bodyNonce(uint32_t counter,const Buffer &iv) {
     if(counter>65535 || iv.size()<12)throw std::runtime_error("VMess nonce sequence exhausted");
     Buffer nonce;nonce.reserve(12);append16(nonce,uint16_t(counter));nonce.insert(nonce.end(),iv.begin()+2,iv.begin()+12);return nonce;
 }
+static Buffer vmessChaChaPolyKey(const Buffer &key16) {
+    Buffer first = crypto::digest("MD5", key16);
+    Buffer second = crypto::digest("MD5", first);
+    first.insert(first.end(), second.begin(), second.end());
+    return first;
+}
 static const std::pair<Buffer, Buffer> &cachedVmessCommandAndAuthKey(const Buffer &uuid16) {
     std::string keyStr(reinterpret_cast<const char *>(uuid16.data()), uuid16.size());
     static std::mutex cacheMutex;
@@ -83,10 +89,11 @@ static Buffer sealHeader(const Buffer &command,const Buffer &commandKey,const Bu
 class VMessStream final:public Stream,public std::enable_shared_from_this<VMessStream> {
     std::shared_ptr<Stream> source_;std::shared_ptr<TransportFactory> factory_;
     std::shared_ptr<Reader> reader_;std::shared_ptr<OrderedWriter> writer_;
-    Buffer requestIV_,requestKey_,responseIV_,responseKey_,request_;
+    Buffer requestIV_,requestKey_,responseIV_,responseKey_,bodyTxKey_,bodyRxKey_,request_;
     proto_common::CursorBuffer buffer_;
-    uint8_t verification_;uint32_t writeCounter_=0,readCounter_=0;
-    bool udp_,coalesceHeader_=false,headerSent_=false,ready_=false,closed_=false,eof_=false,writeEnded_=false;
+    uint8_t verification_,securityType_=3;uint32_t writeCounter_=0,readCounter_=0;
+    crypto::AEAD bodyAead_=crypto::AEAD::AES128GCM;
+    bool udp_,bodyEncrypted_=true,chunkStream_=true,coalesceHeader_=false,headerSent_=false,ready_=false,closed_=false,eof_=false,writeEnded_=false;
     ReadCallback pending_;size_t maximum_=0;
     void flushPendingHeaderIfIdle(){
         if(closed_ || headerSent_)return;
@@ -140,15 +147,33 @@ class VMessStream final:public Stream,public std::enable_shared_from_this<VMessS
         if(eof_){finishRead({},true,{});return;}
         if(!ready_){responseHeader();return;}
         auto self=shared_from_this();
+        if(!chunkStream_){
+            reader_->some(maximum_,[self](Buffer data,bool eof,Error error){
+                if(!error.empty()){self->failRead(error);return;}
+                if(eof && data.empty()){self->eof_=true;self->finishRead({},true,{});return;}
+                if(eof)self->eof_=true;
+                self->deliver(std::move(data));
+            });
+            return;
+        }
         reader_->exactly(2,[self](Buffer length,Error error){
             if(!error.empty()){self->failRead(error);return;}
             size_t count=read16(length);
+            if(!self->bodyEncrypted_){
+                if(count==0){self->eof_=true;self->finishRead({},true,{});return;}
+                if(!self->udp_ && count>17*1024){self->failRead("Invalid VMess body frame length");return;}
+                self->reader_->exactly(count,[self](Buffer plain,Error error){
+                    if(!error.empty()){self->failRead(error=="EOF"?"Truncated VMess body frame":error);return;}
+                    self->deliver(std::move(plain));
+                });
+                return;
+            }
             if(count<16 || (!self->udp_ && count>17*1024)){self->failRead("Invalid VMess body frame length");return;}
             self->reader_->exactly(count,[self](Buffer sealed,Error error){
                 if(!error.empty()){self->failRead(error=="EOF"?"Truncated VMess body frame":error);return;}
                 try{
                     auto nonce=bodyNonce(self->readCounter_,self->responseIV_);
-                    auto data=crypto::open(crypto::AEAD::AES128GCM,self->responseKey_,nonce,sealed);++self->readCounter_;
+                    auto data=crypto::open(self->bodyAead_,self->bodyRxKey_,nonce,sealed);++self->readCounter_;
                     if(data.empty()){self->eof_=true;self->finishRead({},true,{});}else self->deliver(std::move(data));
                 }catch(const std::exception &e){self->failRead(e.what());}
             });
@@ -163,16 +188,46 @@ public:
             rawUuid = node.option("username");
         }
         auto uuid=uuidBytes(rawUuid);
+        auto cipher=node.option("cipher",node.option("encrypt-method",node.option("encryption","auto")));
+        std::transform(cipher.begin(),cipher.end(),cipher.begin(),[](unsigned char c){return char(std::tolower(c));});
+        if(cipher.rfind("encrypt-method=",0)==0) cipher=cipher.substr(15);
+        if(cipher=="chacha20-poly1305" || cipher=="chacha20-ietf-poly1305"){
+            securityType_=4;
+            bodyAead_=crypto::AEAD::ChaCha20Poly1305;
+            bodyEncrypted_=true;
+            chunkStream_=true;
+        }else if(cipher=="none"){
+            securityType_=5;
+            bodyEncrypted_=false;
+            chunkStream_=true;
+        }else if(cipher=="zero"){
+            securityType_=target.udp?5:6;
+            bodyEncrypted_=false;
+            chunkStream_=target.udp;
+        }else{
+            securityType_=3;
+            bodyAead_=crypto::AEAD::AES128GCM;
+            bodyEncrypted_=true;
+            chunkStream_=true;
+        }
         auto randomMaterial=crypto::randomBytes(34);
         requestIV_.assign(randomMaterial.begin(),randomMaterial.begin()+16);
         requestKey_.assign(randomMaterial.begin()+16,randomMaterial.begin()+32);
         verification_=randomMaterial[32];
         uint8_t padding=randomMaterial[33]&15;
         responseKey_=prefix(crypto::digest("SHA256",requestKey_),16);responseIV_=prefix(crypto::digest("SHA256",requestIV_),16);
+        if(securityType_==4){
+            bodyTxKey_=vmessChaChaPolyKey(requestKey_);
+            bodyRxKey_=vmessChaChaPolyKey(responseKey_);
+        }else{
+            bodyTxKey_=requestKey_;
+            bodyRxKey_=responseKey_;
+        }
+        uint8_t optionFlags=chunkStream_?1:0;
         Buffer command;command.reserve(64+padding);
         command.push_back(1);
         command.insert(command.end(),requestIV_.begin(),requestIV_.end());command.insert(command.end(),requestKey_.begin(),requestKey_.end());
-        command.insert(command.end(),{verification_,1,uint8_t((padding<<4)|3),0,uint8_t(muxTarget(target)?3:target.udp?2:1)});
+        command.insert(command.end(),{verification_,optionFlags,uint8_t((padding<<4)|securityType_),0,uint8_t(muxTarget(target)?3:target.udp?2:1)});
         if(!muxTarget(target)){
             append16(command,target.port);auto address=socksAddress(target);address.resize(address.size()-2);
             if(address[0]==3)address[0]=2;else if(address[0]==4)address[0]=3;
@@ -201,22 +256,34 @@ public:
         if(data.empty()){completion({});return;}
         if(udp_ && data.size()>65507){completion("VMess UDP payload exceeds wire limit");return;}
         const size_t chunkSize=udp_?65507:16368,chunks=(data.size()+chunkSize-1)/chunkSize;
+        const size_t perChunkOverhead=chunkStream_?(bodyEncrypted_?18:2):0;
         const size_t headerBytes=headerSent_?0:request_.size();
-        if(data.size()>maximumQueuedBytes || chunks>(maximumQueuedBytes-data.size())/18 || !writer_->canAccept(headerBytes+data.size()+chunks*18)){
+        if(data.size()>maximumQueuedBytes || (perChunkOverhead>0 && chunks>(maximumQueuedBytes-data.size())/perChunkOverhead) || !writer_->canAccept(headerBytes+data.size()+chunks*perChunkOverhead)){
             completion("VMess write queue limit exceeded");return;
         }
-        if(writeCounter_+chunks>65536){close();completion("VMess nonce sequence exhausted");return;}
+        if(bodyEncrypted_ && writeCounter_+chunks>65536){close();completion("VMess nonce sequence exhausted");return;}
         try{
-            Buffer output;output.reserve(headerBytes+data.size()+chunks*18);
+            Buffer output;output.reserve(headerBytes+data.size()+chunks*perChunkOverhead);
             if(!headerSent_){
                 headerSent_=true;
                 output.insert(output.end(),request_.begin(),request_.end());
                 request_.clear();
             }
-            for(size_t offset=0;offset<data.size();){
-                size_t count=std::min(chunkSize,data.size()-offset);
-                Buffer sealed=crypto::sealSlice(crypto::AEAD::AES128GCM,requestKey_,bodyNonce(writeCounter_,requestIV_),data.data()+offset,count);
-                append16(output,uint16_t(sealed.size()));output.insert(output.end(),sealed.begin(),sealed.end());++writeCounter_;offset+=count;
+            if(!chunkStream_){
+                output.insert(output.end(),data.begin(),data.end());
+            }else if(!bodyEncrypted_){
+                for(size_t offset=0;offset<data.size();){
+                    size_t count=std::min(chunkSize,data.size()-offset);
+                    append16(output,uint16_t(count));
+                    output.insert(output.end(),data.data()+offset,data.data()+offset+count);
+                    offset+=count;
+                }
+            }else{
+                for(size_t offset=0;offset<data.size();){
+                    size_t count=std::min(chunkSize,data.size()-offset);
+                    Buffer sealed=crypto::sealSlice(bodyAead_,bodyTxKey_,bodyNonce(writeCounter_,requestIV_),data.data()+offset,count);
+                    append16(output,uint16_t(sealed.size()));output.insert(output.end(),sealed.begin(),sealed.end());++writeCounter_;offset+=count;
+                }
             }
             writer_->write(std::move(output),std::move(completion));
         }catch(const std::exception &e){close();completion(e.what());}
@@ -233,18 +300,30 @@ public:
         if(closed_ || writeEnded_){completion("Stream write side closed");return;}
         if(!supportsHalfClose()){completion("VMess carrier does not support half-close");return;}
         const size_t headerBytes=headerSent_?0:request_.size();
-        if(!writer_->canAccept(headerBytes+18)){completion("VMess write queue limit exceeded");return;}
+        const size_t eofBytes=chunkStream_?(bodyEncrypted_?18:2):0;
+        if(!writer_->canAccept(headerBytes+eofBytes)){completion("VMess write queue limit exceeded");return;}
         writeEnded_=true;
         try{
-            auto sealed=crypto::seal(crypto::AEAD::AES128GCM,requestKey_,bodyNonce(writeCounter_,requestIV_),{});++writeCounter_;
-            Buffer frame;frame.reserve(headerBytes+2+sealed.size());
+            Buffer frame;frame.reserve(headerBytes+eofBytes);
             if(!headerSent_){
                 headerSent_=true;
                 frame.insert(frame.end(),request_.begin(),request_.end());
                 request_.clear();
             }
-            append16(frame,uint16_t(sealed.size()));frame.insert(frame.end(),sealed.begin(),sealed.end());auto self=shared_from_this();
-            writer_->write(std::move(frame),[self,completion=std::move(completion)](Error error)mutable{if(!error.empty())completion(error);else self->writer_->finish(std::move(completion));});
+            if(chunkStream_){
+                if(bodyEncrypted_){
+                    auto sealed=crypto::seal(bodyAead_,bodyTxKey_,bodyNonce(writeCounter_,requestIV_),{});++writeCounter_;
+                    append16(frame,uint16_t(sealed.size()));frame.insert(frame.end(),sealed.begin(),sealed.end());
+                }else{
+                    append16(frame,0);
+                }
+            }
+            auto self=shared_from_this();
+            if(frame.empty()){
+                writer_->finish(std::move(completion));
+            }else{
+                writer_->write(std::move(frame),[self,completion=std::move(completion)](Error error)mutable{if(!error.empty())completion(error);else self->writer_->finish(std::move(completion));});
+            }
         }catch(const std::exception &e){close();completion(e.what());}
     }
     bool supportsHalfClose()const override{return !udp_ && source_->supportsHalfClose();}

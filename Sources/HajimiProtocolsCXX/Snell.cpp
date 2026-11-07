@@ -49,7 +49,7 @@ void swapPadding(Buffer &bytes, size_t padding, size_t payload) {
 }
 
 struct EndpointCompatEntry {
-    snell::CompatMode mode = snell::CompatMode::Compat16Pool7;
+    snell::CompatMode mode = snell::CompatMode::Standard;
     bool verified = false;
 };
 
@@ -65,24 +65,23 @@ std::string endpointKey(const Node &node) {
     return node.dialHost() + ":" + std::to_string(node.port) + "|" + node.option("psk");
 }
 snell::CompatMode endpointCompatMode(const Node &node, unsigned version) {
-    if (version < 4 || node.host == "fixture.invalid") {
+    if (version < 4) {
         return snell::CompatMode::Standard;
     }
     std::lock_guard<std::mutex> lock(compatCacheMutex());
     auto it = compatEndpointModes().find(endpointKey(node));
     if (it != compatEndpointModes().end()) return it->second.mode;
-    return snell::CompatMode::Compat16Pool7;
+    return snell::CompatMode::Standard;
 }
 snell::CompatMode nextCompatMode(snell::CompatMode current) {
     switch (current) {
-        case snell::CompatMode::Compat16Pool7: return snell::CompatMode::Compat16RFC;
-        case snell::CompatMode::Compat16RFC:   return snell::CompatMode::Standard;
-        case snell::CompatMode::Standard:      return snell::CompatMode::Compat16Pool7;
+        case snell::CompatMode::Standard:      return snell::CompatMode::Compat16RFC;
+        case snell::CompatMode::Compat16RFC:   return snell::CompatMode::Compat16Pool7;
+        case snell::CompatMode::Compat16Pool7: return snell::CompatMode::Standard;
     }
-    return snell::CompatMode::Compat16Pool7;
+    return snell::CompatMode::Standard;
 }
 void setEndpointCompatMode(const Node &node, snell::CompatMode mode, bool verified = true) {
-    if (node.host == "fixture.invalid") return;
     std::lock_guard<std::mutex> lock(compatCacheMutex());
     if (compatEndpointModes().size() > 256) compatEndpointModes().clear();
     auto &entry = compatEndpointModes()[endpointKey(node)];

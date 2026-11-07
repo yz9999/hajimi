@@ -956,7 +956,7 @@ Error Connection::Impl::writePackets() {
             return 1;
         }
         if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == ENOBUFS || errno == ECONNREFUSED)) return 0;
-        if (length < 0 && (errno == EMSGSIZE || ++consecutiveSendLosses_ >= 3) && maxTxPayload_ > 1200) {
+        if (length < 0 && errno == EMSGSIZE && maxTxPayload_ > 1200) {
             maxTxPayload_ = maxTxPayload_ > 1280 ? 1280 : 1200;
             pmtudState_ = DPLPMTUDState::BlackholeRecovery;
             pmtudProbesSucceeded_ = 0;
@@ -1239,6 +1239,29 @@ void OwnedStream::close() {
     if (stream_) { stream_->close(); stream_.reset(); }
     if (reader_) { reader_->close(); reader_.reset(); }
     if (connection_) { connection_->close(); connection_.reset(); }
+}
+
+SharedStream::SharedStream(std::shared_ptr<Connection> connection, std::shared_ptr<Stream> stream,
+                           std::shared_ptr<Reader> reader)
+    : connection_(std::move(connection)), stream_(std::move(stream)), reader_(std::move(reader)) {}
+SharedStream::~SharedStream() { close(); }
+void SharedStream::write(Buffer value, WriteCallback callback) {
+    if (!stream_) { callback("QUIC stream is closed"); return; }
+    stream_->write(std::move(value), std::move(callback));
+}
+void SharedStream::read(size_t count, ReadCallback callback) {
+    if (!stream_) { callback({}, true, "QUIC stream is closed"); return; }
+    if (reader_) reader_->some(count, std::move(callback));
+    else stream_->read(count, std::move(callback));
+}
+void SharedStream::shutdownWrite(WriteCallback callback) {
+    if (!stream_) { callback("QUIC stream is closed"); return; }
+    stream_->shutdownWrite(std::move(callback));
+}
+void SharedStream::close() {
+    if (stream_) { stream_->close(); stream_.reset(); }
+    if (reader_) { reader_->close(); reader_.reset(); }
+    connection_.reset();
 }
 
 namespace {

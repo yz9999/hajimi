@@ -513,7 +513,12 @@ public enum SubscriptionDocument {
                 output.append(character)
             }
         }
+        let hadLineBreak = raw.contains("\n") || raw.contains("\r")
         var trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if hadLineBreak {
+            trimmed = trimmed.replacingOccurrences(of: "[", with: "【")
+                .replacingOccurrences(of: "]", with: "】")
+        }
         while trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
             let inner = String(trimmed.dropFirst().dropLast())
             if !inner.contains("[") && !inner.contains("]") {

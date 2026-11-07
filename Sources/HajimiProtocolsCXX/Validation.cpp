@@ -46,7 +46,8 @@ Error validateBasicProtocol(const Node &node,bool udp) {
             auto alter=node.option("alter-id",node.option("alterid","0"));if(alter!="0")return "Legacy VMess alter-id is not supported";
             auto cipher=lower(node.option("cipher",node.option("encrypt-method",node.option("encryption","auto"))));
             if(cipher.rfind("encrypt-method=",0)==0) cipher=cipher.substr(15);
-            if(cipher!="auto" && cipher!="aes-128-gcm")return "VMess currently requires AES-128-GCM body encryption";
+            if(cipher!="auto" && cipher!="aes-128-gcm" && cipher!="chacha20-poly1305" && cipher!="chacha20-ietf-poly1305" && cipher!="none" && cipher!="zero")
+                return "Unsupported VMess body cipher";
         } else {
             auto encryption=lower(node.option("encryption","none"));if(!encryption.empty() && encryption!="none")return "Unsupported VLESS encryption extension";
             auto flow=lower(node.option("flow"));
@@ -57,8 +58,6 @@ Error validateBasicProtocol(const Node &node,bool udp) {
                 auto network=lower(node.option("network","tcp"));
                 if(!tls || (network!="tcp" && !network.empty()))return "VLESS Vision requires TLS or REALITY over TCP";
                 if(node.flag("mux"))return "VLESS Vision TCP cannot use shared Mux.Cool";
-                // The datagram entry point uses command=mux/XUDP, not command=2.
-                if(udp)return "VLESS Vision UDP requires an XUDP carrier";
             }
         }
         if(node.flag("global-padding") || node.flag("authenticated-length"))return "Unsupported VMess/VLESS framing option";

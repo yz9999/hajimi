@@ -8,6 +8,9 @@
 #include <cctype>
 #include <deque>
 #include <chrono>
+#include <mutex>
+#include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 #include <stdexcept>
 
@@ -386,29 +389,311 @@ double heartbeatInterval(const Node &node) {
     double interval = std::strtod(value.c_str(), &end);
     return std::isfinite(interval) && interval > 0 && *end == 0 ? std::max(3.0, interval) : 10;
 }
+
+class QUICDatagram;
+
+class PooledQUICSession final : public std::enable_shared_from_this<PooledQUICSession> {
+public:
+    using ReadyCallback = std::function<void(std::shared_ptr<PooledQUICSession>, Error)>;
+
+    PooledQUICSession(Node node, std::shared_ptr<TransportFactory> factory)
+        : node_(std::move(node)), factory_(std::move(factory)) {}
+
+    std::shared_ptr<Connection> connection() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return connection_;
+    }
+
+    bool udpSupported() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return udpSupported_;
+    }
+
+    bool matchesFactory(const std::shared_ptr<TransportFactory> &f) const {
+        return !f || factory_ == f;
+    }
+
+    bool isUsable() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return !closed_ && (!ready_ || (connection_ && !connection_->isClosed()));
+    }
+
+    void ensureAuthenticated(ReadyCallback cb) {
+        bool startNow = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (closed_ || (ready_ && (!connection_ || connection_->isClosed()))) {
+                cb(nullptr, "QUIC connection closed");
+                return;
+            }
+            if (ready_) {
+                cb(shared_from_this(), {});
+                return;
+            }
+            waiters_.push_back(std::move(cb));
+            if (!authenticating_) {
+                authenticating_ = true;
+                startNow = true;
+            }
+        }
+        if (!startNow) return;
+        auto self = shared_from_this();
+        authenticate(node_, factory_, [self](std::shared_ptr<Connection> conn, bool udp, Error err) {
+            std::vector<ReadyCallback> pending;
+            {
+                std::lock_guard<std::mutex> lock(self->mutex_);
+                self->authenticating_ = false;
+                if (!err.empty() || !conn || conn->isClosed() || self->closed_) {
+                    self->closed_ = true;
+                    if (conn) conn->close();
+                    if (err.empty()) err = "QUIC connection cancelled";
+                    pending = std::move(self->waiters_);
+                } else {
+                    self->connection_ = conn;
+                    self->udpSupported_ = udp;
+                    self->ready_ = true;
+                    conn->authenticated();
+                    if (self->node_.type == "tuic") {
+                        heartbeat(conn, self->factory_, heartbeatInterval(self->node_));
+                    }
+                    self->setupDatagramDispatchLocked();
+                    pending = std::move(self->waiters_);
+                }
+            }
+            for (auto &w : pending) {
+                w(err.empty() ? self : nullptr, err);
+            }
+        });
+    }
+
+    void registerDatagram(uint32_t sessionId, std::function<void(Buffer)> onPacket, std::function<void(Error)> onFail) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        udpSessions_[sessionId] = {std::move(onPacket), std::move(onFail)};
+    }
+
+    void unregisterDatagram(uint32_t sessionId) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        udpSessions_.erase(sessionId);
+    }
+
+    void closeSession() {
+        std::shared_ptr<Connection> conn;
+        std::vector<ReadyCallback> pending;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (closed_) return;
+            closed_ = true;
+            conn = std::move(connection_);
+            pending = std::move(waiters_);
+            udpSessions_.clear();
+        }
+        if (conn) conn->close();
+        for (auto &w : pending) w(nullptr, "QUIC connection cancelled");
+    }
+
+private:
+    struct UDPSessionCallbacks {
+        std::function<void(Buffer)> onPacket;
+        std::function<void(Error)> onFail;
+    };
+
+    mutable std::mutex mutex_;
+    Node node_;
+    std::shared_ptr<TransportFactory> factory_;
+    std::shared_ptr<Connection> connection_;
+    bool udpSupported_ = false;
+    bool authenticating_ = false;
+    bool ready_ = false;
+    bool closed_ = false;
+    std::vector<ReadyCallback> waiters_;
+    std::unordered_map<uint32_t, UDPSessionCallbacks> udpSessions_;
+
+    void setupDatagramDispatchLocked() {
+        if (!connection_) return;
+        std::weak_ptr<PooledQUICSession> weak = shared_from_this();
+        connection_->receiveDatagrams(
+            [weak](Buffer bytes) {
+                if (auto s = weak.lock()) s->dispatchUDPBytes(std::move(bytes));
+            },
+            [weak](Error error) {
+                if (auto s = weak.lock()) s->failUDPSessions(std::move(error));
+            }
+        );
+        if (node_.type == "tuic") {
+            connection_->receivePeerStreams([weak](std::shared_ptr<Stream> stream) {
+                if (auto s = weak.lock()) s->readPeerUniStream(stream, {});
+                else stream->close();
+            });
+        }
+    }
+
+    void readPeerUniStream(std::shared_ptr<Stream> stream, Buffer buffer) {
+        std::weak_ptr<PooledQUICSession> weak = shared_from_this();
+        stream->read(65535, [weak, stream, buffer = std::move(buffer)](Buffer bytes, bool eof, Error error) mutable {
+            auto self = weak.lock();
+            if (!self) { stream->close(); return; }
+            {
+                std::lock_guard<std::mutex> lock(self->mutex_);
+                if (self->closed_ || !self->connection_ || self->connection_->isClosed()) {
+                    stream->close();
+                    return;
+                }
+            }
+            if (!error.empty()) return;
+            if (bytes.size() > 65535 - buffer.size()) { stream->close(); return; }
+            append(buffer, bytes);
+            if (eof) self->dispatchUDPBytes(std::move(buffer));
+            else self->readPeerUniStream(stream, std::move(buffer));
+        });
+    }
+
+    void dispatchUDPBytes(Buffer bytes) {
+        hajimi_udp_frame frame{};
+        hajimi_codec_result result;
+        if (node_.type == "hysteria") result = hajimi_hysteria1_parse_udp(bytes.data(), bytes.size(), &frame);
+        else if (node_.type == "hysteria2") result = hajimi_hysteria2_parse_udp(bytes.data(), bytes.size(), &frame);
+        else result = hajimi_tuic5_parse_udp(bytes.data(), bytes.size(), &frame);
+        if (result.status != HAJIMI_CODEC_OK) return;
+        std::function<void(Buffer)> handler;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = udpSessions_.find(frame.session_id);
+            if (it != udpSessions_.end()) handler = it->second.onPacket;
+        }
+        if (handler) handler(std::move(bytes));
+    }
+
+    void failUDPSessions(Error error) {
+        std::vector<std::function<void(Error)>> callbacks;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto &kv : udpSessions_) {
+                if (kv.second.onFail) callbacks.push_back(kv.second.onFail);
+            }
+        }
+        for (auto &cb : callbacks) cb(error);
+    }
+};
+
+std::mutex &quicPoolMutex() {
+    static auto *m = new std::mutex();
+    return *m;
+}
+
+std::unordered_map<std::string, std::shared_ptr<PooledQUICSession>> &quicPoolMap() {
+    static auto *m = new std::unordered_map<std::string, std::shared_ptr<PooledQUICSession>>();
+    return *m;
+}
+
+std::string quicPoolKey(const Node &node, const std::shared_ptr<TransportFactory> &factory) {
+    std::ostringstream oss;
+    oss << reinterpret_cast<uintptr_t>(factory.get()) << "|"
+        << node.type << "|" << node.dialHost() << ":" << node.port << "|"
+        << node.interfaceName << "|" << auth(node) << "|"
+        << node.option("uuid") << "|" << node.option("obfs") << "|"
+        << node.option("obfs-password") << "|" << node.option("sni") << "|"
+        << node.option("udp-relay-mode");
+    return oss.str();
+}
+
+std::shared_ptr<PooledQUICSession> acquireQUICSession(const Node &node,
+                                                      const std::shared_ptr<TransportFactory> &factory,
+                                                      bool forceNew = false) {
+    std::string key = quicPoolKey(node, factory);
+    std::lock_guard<std::mutex> lock(quicPoolMutex());
+    if (!forceNew) {
+        auto it = quicPoolMap().find(key);
+        if (it != quicPoolMap().end() && it->second && it->second->isUsable()) {
+            return it->second;
+        }
+    }
+    auto created = std::make_shared<PooledQUICSession>(node, factory);
+    quicPoolMap()[key] = created;
+    return created;
+}
+
 } // namespace
 
-void connectQUICProtocol(const Node &node, const Target &target,
-                         std::shared_ptr<TransportFactory> factory, StreamCallback completion) {
-    auto validation = validateQUICProtocol(node, false);
-    if (!validation.empty()) { completion(nullptr, validation); return; }
-    authenticate(node, factory, [node, target, factory, completion](std::shared_ptr<Connection> connection, bool, Error error) {
-        if (!error.empty()) { completion(nullptr, error); return; }
-        if (connection->isClosed()) { connection->close(); completion(nullptr, "QUIC connection cancelled"); return; }
-        if (node.type == "tuic") heartbeat(connection, factory, heartbeatInterval(node));
+void resetQUICClients() {
+    std::vector<std::shared_ptr<PooledQUICSession>> sessions;
+    {
+        std::lock_guard<std::mutex> lock(quicPoolMutex());
+        for (auto &kv : quicPoolMap()) {
+            if (kv.second) sessions.push_back(kv.second);
+        }
+        quicPoolMap().clear();
+    }
+    for (auto &s : sessions) s->closeSession();
+}
+
+void resetQUICClient(const std::shared_ptr<TransportFactory> &factory) {
+    if (!factory) {
+        resetQUICClients();
+        return;
+    }
+    std::vector<std::shared_ptr<PooledQUICSession>> sessions;
+    {
+        std::lock_guard<std::mutex> lock(quicPoolMutex());
+        for (auto it = quicPoolMap().begin(); it != quicPoolMap().end();) {
+            if (!it->second || it->second->matchesFactory(factory)) {
+                if (it->second) sessions.push_back(it->second);
+                it = quicPoolMap().erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto &s : sessions) s->closeSession();
+}
+
+static void connectQUICProtocolWithRetry(const Node &node, const Target &target,
+                                         std::shared_ptr<TransportFactory> factory,
+                                         bool forceNew, StreamCallback completion) {
+    auto session = acquireQUICSession(node, factory, forceNew);
+    session->ensureAuthenticated([node, target, factory, forceNew, completion](std::shared_ptr<PooledQUICSession> readySession, Error error) {
+        if (!error.empty() || !readySession) {
+            if (!forceNew) {
+                connectQUICProtocolWithRetry(node, target, factory, true, completion);
+                return;
+            }
+            completion(nullptr, error.empty() ? "QUIC connection cancelled" : error);
+            return;
+        }
+        auto connection = readySession->connection();
+        if (!connection || connection->isClosed()) {
+            if (!forceNew) {
+                connectQUICProtocolWithRetry(node, target, factory, true, completion);
+                return;
+            }
+            completion(nullptr, "QUIC connection cancelled");
+            return;
+        }
         if (node.type == "hysteria") {
-            hysteria1Request(connection, target, false, [connection, completion](std::shared_ptr<Stream> stream,
+            hysteria1Request(connection, target, false, [node, target, factory, forceNew, connection, completion](std::shared_ptr<Stream> stream,
                 std::shared_ptr<Reader> reader, uint32_t, Error error) {
-                if (connection->isClosed()) { connection->close(); completion(nullptr, "QUIC connection cancelled"); return; }
-                if (!error.empty()) { connection->close(); completion(nullptr, error); return; }
-                connection->authenticated();
-                completion(std::make_shared<quic::OwnedStream>(connection, stream, reader), {});
+                if (!error.empty() || connection->isClosed()) {
+                    if (!forceNew && (error == "QUIC connection is closed or stream limit reached" ||
+                                      error == "QUIC peer stream limit reached" || connection->isClosed())) {
+                        connectQUICProtocolWithRetry(node, target, factory, true, completion);
+                        return;
+                    }
+                    completion(nullptr, error.empty() ? "QUIC connection cancelled" : error);
+                    return;
+                }
+                completion(std::make_shared<quic::SharedStream>(connection, stream, reader), {});
             });
             return;
         }
-        connection->open(false, [node, target, connection, completion](std::shared_ptr<Stream> stream, Error error) {
-            if (connection->isClosed()) { connection->close(); completion(nullptr, "QUIC connection cancelled"); return; }
-            if (!error.empty()) { connection->close(); completion(nullptr, error); return; }
+        connection->open(false, [node, target, factory, forceNew, connection, completion](std::shared_ptr<Stream> stream, Error error) {
+            if (!error.empty() || connection->isClosed()) {
+                if (!forceNew && (error == "QUIC connection is closed or stream limit reached" ||
+                                  error == "QUIC peer stream limit reached" || connection->isClosed())) {
+                    connectQUICProtocolWithRetry(node, target, factory, true, completion);
+                    return;
+                }
+                completion(nullptr, error.empty() ? "QUIC connection cancelled" : error);
+                return;
+            }
             try {
                 auto destination = address(target); Buffer request;
                 if (node.type == "tuic") request = encoded([&](uint8_t *out, size_t size) {
@@ -421,21 +706,28 @@ void connectQUICProtocol(const Node &node, const Target &target,
                     });
                 }
                 stream->write(std::move(request), [node, stream, connection, completion](Error error) {
-                    if (connection->isClosed()) { connection->close(); completion(nullptr, "QUIC connection cancelled"); return; }
-                    if (!error.empty()) { connection->close(); completion(nullptr, error); return; }
+                    if (connection->isClosed()) { stream->close(); completion(nullptr, "QUIC connection cancelled"); return; }
+                    if (!error.empty()) { stream->close(); completion(nullptr, error); return; }
                     if (node.type == "tuic") {
-                        connection->authenticated(); completion(std::make_shared<quic::OwnedStream>(connection, stream), {}); return;
+                        completion(std::make_shared<quic::SharedStream>(connection, stream), {}); return;
                     }
                     auto reader = std::make_shared<Reader>(stream);
                     hysteria2Response(reader, [reader, stream, connection, completion](Error error) {
-                        if (connection->isClosed()) { connection->close(); completion(nullptr, "QUIC connection cancelled"); return; }
-                        if (!error.empty()) { connection->close(); completion(nullptr, error); return; }
-                        connection->authenticated(); completion(std::make_shared<quic::OwnedStream>(connection, stream, reader), {});
+                        if (connection->isClosed()) { stream->close(); completion(nullptr, "QUIC connection cancelled"); return; }
+                        if (!error.empty()) { stream->close(); completion(nullptr, error); return; }
+                        completion(std::make_shared<quic::SharedStream>(connection, stream, reader), {});
                     });
                 });
-            } catch (const std::exception &e) { connection->close(); completion(nullptr, e.what()); }
+            } catch (const std::exception &e) { stream->close(); completion(nullptr, e.what()); }
         });
     });
+}
+
+void connectQUICProtocol(const Node &node, const Target &target,
+                         std::shared_ptr<TransportFactory> factory, StreamCallback completion) {
+    auto validation = validateQUICProtocol(node, false);
+    if (!validation.empty()) { completion(nullptr, validation); return; }
+    connectQUICProtocolWithRetry(node, target, std::move(factory), false, std::move(completion));
 }
 
 namespace {
@@ -444,7 +736,10 @@ class QUICDatagram final : public Datagram, public std::enable_shared_from_this<
         std::vector<Buffer> parts; std::vector<bool> seen; Target target;
         size_t bytes = 0, received = 0; uint64_t expiry = 0; bool hasTarget = false;
     };
-    Node node_; std::shared_ptr<Connection> connection_; std::shared_ptr<Stream> hold_;
+    Node node_;
+    std::shared_ptr<PooledQUICSession> pooledSession_;
+    std::shared_ptr<Connection> connection_;
+    std::shared_ptr<Stream> hold_;
     uint32_t session_; uint16_t packet_ = 0;
     std::unordered_map<uint16_t, Fragments> fragments_;
     std::deque<std::pair<uint16_t, uint64_t>> completed_;
@@ -453,19 +748,23 @@ class QUICDatagram final : public Datagram, public std::enable_shared_from_this<
     std::deque<std::pair<Target, Buffer>> queued_;
     PacketCallback receive_; WriteCallback failure_; Error terminal_; bool closed_ = false;
 public:
-    QUICDatagram(Node node, std::shared_ptr<Connection> connection, uint32_t session,
+    QUICDatagram(Node node, std::shared_ptr<PooledQUICSession> pooledSession,
+                 std::shared_ptr<Connection> connection, uint32_t session,
                  std::shared_ptr<Stream> hold = {})
-        : node_(std::move(node)), connection_(std::move(connection)), hold_(std::move(hold)), session_(session) {
+        : node_(std::move(node)), pooledSession_(std::move(pooledSession)),
+          connection_(std::move(connection)), hold_(std::move(hold)), session_(session) {
         auto random = crypto::randomBytes(2); packet_ = be16(random.data());
     }
     ~QUICDatagram() override { close(); }
     void initialize() {
         auto weak = weak_from_this();
-        connection_->receiveDatagrams([weak](Buffer bytes) { if (auto self = weak.lock()) self->feed(std::move(bytes)); },
-            [weak](Error error) { if (auto self = weak.lock()) self->fail(error); });
-        if (node_.type == "tuic") connection_->receivePeerStreams([weak](std::shared_ptr<Stream> stream) {
-            if (auto self = weak.lock()) self->readPeer(stream, {}); else stream->close();
-        });
+        if (pooledSession_) {
+            pooledSession_->registerDatagram(
+                session_,
+                [weak](Buffer bytes) { if (auto self = weak.lock()) self->feed(std::move(bytes)); },
+                [weak](Error error) { if (auto self = weak.lock()) self->fail(error); }
+            );
+        }
         if (hold_) monitorHold();
     }
     void start(PacketCallback receive, WriteCallback failure) override {
@@ -482,8 +781,12 @@ public:
     void close() override {
         if (closed_) return;
         closed_ = true;
+        if (pooledSession_) {
+            pooledSession_->unregisterDatagram(session_);
+            pooledSession_.reset();
+        }
         if (hold_) { hold_->close(); hold_.reset(); }
-        if (connection_) { connection_->close(); connection_.reset(); }
+        connection_.reset();
         fragments_.clear(); completed_.clear(); completedIDs_.clear();
         queued_.clear(); fragmentBytes_ = queuedBytes_ = 0;
         receive_ = {}; failure_ = {};
@@ -622,26 +925,41 @@ void QUICDatagram::feed(Buffer bytes) {
 }
 } // namespace
 
-void makeQUICDatagram(const Node &node, std::shared_ptr<TransportFactory> factory, DatagramCallback completion) {
-    auto validation = validateQUICProtocol(node, true);
-    if (!validation.empty()) { completion(nullptr, validation); return; }
-    authenticate(node, factory, [node, factory, completion](std::shared_ptr<Connection> connection, bool udp, Error error) {
-        if (!error.empty()) { completion(nullptr, error); return; }
-        if (connection->isClosed()) { connection->close(); completion(nullptr, "QUIC connection cancelled"); return; }
-        bool streamRelay = node.type == "tuic" && node.option("udp-relay-mode", "native") == "quic";
-        if (!udp || (!streamRelay && !connection->datagramLimit())) {
-            connection->close(); completion(nullptr, "QUIC server disabled UDP/DATAGRAM relay"); return;
+static void makeQUICDatagramWithRetry(const Node &node, std::shared_ptr<TransportFactory> factory,
+                                      bool forceNew, DatagramCallback completion) {
+    auto pooled = acquireQUICSession(node, factory, forceNew);
+    pooled->ensureAuthenticated([node, factory, forceNew, completion](std::shared_ptr<PooledQUICSession> readySession, Error error) {
+        if (!error.empty() || !readySession) {
+            if (!forceNew) {
+                makeQUICDatagramWithRetry(node, factory, true, completion);
+                return;
+            }
+            completion(nullptr, error.empty() ? "QUIC connection cancelled" : error);
+            return;
         }
-        auto finish = [node, connection, factory, completion](std::shared_ptr<Stream> hold, uint32_t session, Error error) {
-            if (connection->isClosed()) { connection->close(); completion(nullptr, "QUIC connection cancelled"); return; }
-            if (!error.empty()) { connection->close(); completion(nullptr, error); return; }
+        auto connection = readySession->connection();
+        if (!connection || connection->isClosed()) {
+            if (!forceNew) {
+                makeQUICDatagramWithRetry(node, factory, true, completion);
+                return;
+            }
+            completion(nullptr, "QUIC connection cancelled");
+            return;
+        }
+        bool streamRelay = node.type == "tuic" && node.option("udp-relay-mode", "native") == "quic";
+        if (!readySession->udpSupported() || (!streamRelay && !connection->datagramLimit())) {
+            completion(nullptr, "QUIC server disabled UDP/DATAGRAM relay");
+            return;
+        }
+        auto finish = [node, readySession, connection, completion](std::shared_ptr<Stream> hold, uint32_t session, Error error) {
+            if (connection->isClosed()) { if (hold) hold->close(); completion(nullptr, "QUIC connection cancelled"); return; }
+            if (!error.empty()) { if (hold) hold->close(); completion(nullptr, error); return; }
             try {
-                auto result = std::make_shared<QUICDatagram>(node, connection, session, hold);
-                result->initialize(); connection->authenticated();
+                auto result = std::make_shared<QUICDatagram>(node, readySession, connection, session, hold);
+                result->initialize();
                 if (connection->isClosed()) { result->close(); completion(nullptr, "QUIC connection cancelled"); return; }
-                if (node.type == "tuic") heartbeat(connection, factory, heartbeatInterval(node));
                 completion(result, {});
-            } catch (const std::exception &e) { connection->close(); completion(nullptr, e.what()); }
+            } catch (const std::exception &e) { if (hold) hold->close(); completion(nullptr, e.what()); }
         };
         if (node.type == "hysteria") {
             hysteria1Request(connection, {}, true, [finish](std::shared_ptr<Stream> stream, std::shared_ptr<Reader>, uint32_t session, Error error) {
@@ -653,6 +971,12 @@ void makeQUICDatagram(const Node &node, std::shared_ptr<TransportFactory> factor
             finish(nullptr, session ? session : 1, {});
         }
     });
+}
+
+void makeQUICDatagram(const Node &node, std::shared_ptr<TransportFactory> factory, DatagramCallback completion) {
+    auto validation = validateQUICProtocol(node, true);
+    if (!validation.empty()) { completion(nullptr, validation); return; }
+    makeQUICDatagramWithRetry(node, std::move(factory), false, std::move(completion));
 }
 
 Error validateQUICProtocol(const Node &node, bool) {

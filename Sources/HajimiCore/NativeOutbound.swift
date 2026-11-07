@@ -629,14 +629,29 @@ public enum NativeOutboundFactory {
             return staticStreamValidationError(for: policy)
         }
         if type == "ssr" {
-            let cipher = policy.parameters["cipher"] ?? policy.parameters["encrypt-method"] ?? "(空)"
-            let proto = policy.parameters["protocol"] ?? "origin"
-            let obfs = policy.parameters["obfs"] ?? "plain"
-            if !["aes-128-cfb", "aes-192-cfb", "aes-256-cfb"].contains(cipher.lowercased()) {
+            let cipher = (policy.parameters["cipher"] ?? policy.parameters["encrypt-method"] ?? "").lowercased()
+            let allowedCiphers: Set<String> = [
+                "aes-128-cfb", "aes-192-cfb", "aes-256-cfb",
+                "aes-128-ctr", "aes-192-ctr", "aes-256-ctr",
+                "rc4", "rc4-md5", "chacha20", "chacha20-ietf", "none", "table"
+            ]
+            if !allowedCiphers.contains(cipher) {
                 return "SSR 原生路径暂不支持 cipher=\(cipher)"
             }
-            if proto.lowercased() != "origin" { return "SSR 原生路径暂不支持 protocol=\(proto)" }
-            if obfs.lowercased() != "plain" { return "SSR 原生路径暂不支持 obfs=\(obfs)" }
+            var proto = (policy.parameters["protocol"] ?? "origin").lowercased()
+            if proto.hasSuffix("_compatible") { proto.removeLast("_compatible".count) }
+            let allowedProtos: Set<String> = [
+                "origin", "verify_sha1", "ota", "auth_sha1_v4",
+                "auth_aes128_md5", "auth_aes128_sha1", "auth_chain_a"
+            ]
+            if !allowedProtos.contains(proto) { return "SSR 原生路径暂不支持 protocol=\(proto)" }
+            var obfs = (policy.parameters["obfs"] ?? "plain").lowercased()
+            if obfs.hasSuffix("_compatible") { obfs.removeLast("_compatible".count) }
+            let allowedObfs: Set<String> = [
+                "plain", "none", "http_simple", "http_post",
+                "tls1.2_ticket_auth", "tls1.2_ticket_fastauth"
+            ]
+            if !allowedObfs.contains(obfs) { return "SSR 原生路径暂不支持 obfs=\(obfs)" }
         }
         if type == "vmess" || type == "vless" {
             guard let rawUUID = policy.parameters["uuid"] ?? policy.parameters["username"],

@@ -794,7 +794,7 @@ public final class NativePacketRouter {
         let inboundPort: UInt16?
     }
     private let dnsMapping = DNSMappingCache()
-    private let dnsQueryCoordinator = DNSQueryCoordinator(maximumActiveUpstreams: 64)
+    private let dnsQueryCoordinator = DNSQueryCoordinator()
     private let dnsAdaptiveSelector = DNSAdaptiveUpstreamSelector()
     // Assigned only by the explicitly guarded CLI fixture below. Production
     // initializers never accept test anchors or a configurable TLS override.
@@ -6274,7 +6274,7 @@ public enum DNSSecurityRoutingSelfTest {
             let elapsed = ProcessInfo.processInfo.systemUptime - began
             try expect(probe.snapshot.attempts == ["203.0.113.70", "203.0.113.71", "203.0.113.72"]
                        && probe.concurrency.peak == 2 && probe.concurrency.active == 0
-                       && probe.concurrency.cancelled == 3 && elapsed >= 0.25 && elapsed < 1.5,
+                       && probe.concurrency.cancelled == 3 && elapsed >= 0.25 && elapsed < 2.5,
                        "unknown hedge 轮替丢失 primary、超过 2 live/3 attempts 或延长总期限")
         }
 

@@ -85,7 +85,7 @@ public struct ODoHEndpoint: Equatable {
     /// Builds the RFC 9230 §4.1 Oblivious Proxy request path with `targethost` and `targetpath` query parameters.
     public var proxyRequestPathWithTarget: String {
         var allowed = CharacterSet.urlQueryAllowed
-        allowed.remove(charactersIn: "&+=?")
+        allowed.remove(charactersIn: "&+=?/")
         let encodedHost = target.host.addingPercentEncoding(withAllowedCharacters: allowed) ?? target.host
         let targetPath = target.url.path.isEmpty ? "/dns-query" : target.url.path
         let encodedPath = targetPath.addingPercentEncoding(withAllowedCharacters: allowed) ?? targetPath

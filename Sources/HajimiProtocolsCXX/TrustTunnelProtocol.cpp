@@ -1,10 +1,302 @@
-// TrustTunnel Outbound Protocol (HTTP/1.1 TLS & HTTP/3 QUIC VPN Tunnel)
+// TrustTunnel Outbound Protocol (HTTP/1.1 TLS, HTTP/2 & HTTP/3 QUIC VPN Tunnel)
 #include "TrustTunnelProtocol.hpp"
 #include "ProtocolCommon.hpp"
+#include "QUICTransport.hpp"
+#include "../HajimiProtocolCXX/include/HajimiProtocolCXX.h"
+#include <nghttp3/nghttp3.h>
 
 namespace hajimi {
 namespace {
 using namespace proto_common;
+using Fields = std::vector<std::pair<std::string, std::string>>;
+
+Buffer encodeVarint(uint64_t value) {
+    uint8_t out[8]{};
+    auto res = hajimi_quic_varint_encode(value, out, sizeof(out));
+    if (res.status != HAJIMI_CODEC_OK) throw std::runtime_error("Varint encode failed");
+    return Buffer(out, out + res.written);
+}
+
+void readQuicVarint(std::shared_ptr<Reader> reader, std::function<void(uint64_t, Error)> completion) {
+    reader->exactly(1, [reader, completion](Buffer first, Error error) {
+        if (!error.empty()) { completion(0, error); return; }
+        size_t length = size_t(1) << (first[0] >> 6);
+        reader->exactly(length - 1, [first, completion](Buffer rest, Error error) mutable {
+            if (!error.empty()) { completion(0, error); return; }
+            first.insert(first.end(), rest.begin(), rest.end());
+            uint64_t value = 0;
+            auto result = hajimi_quic_varint_decode(first.data(), first.size(), &value);
+            completion(value, result.status == HAJIMI_CODEC_OK ? Error{} : "Invalid QUIC varint");
+        });
+    });
+}
+
+Buffer encodeQpack(const Fields &fields) {
+    const auto *memory = nghttp3_mem_default();
+    nghttp3_qpack_encoder *encoder = nullptr;
+    if (nghttp3_qpack_encoder_new(&encoder, 0, memory)) throw std::runtime_error("QPACK encoder creation failed");
+    nghttp3_buf prefix, block, instructions;
+    nghttp3_buf_init(&prefix); nghttp3_buf_init(&block); nghttp3_buf_init(&instructions);
+    std::vector<nghttp3_nv> values;
+    for (auto &field : fields) values.push_back({
+        reinterpret_cast<uint8_t *>(const_cast<char *>(field.first.data())),
+        reinterpret_cast<uint8_t *>(const_cast<char *>(field.second.data())),
+        field.first.size(), field.second.size(), NGHTTP3_NV_FLAG_NEVER_INDEX});
+    int code = nghttp3_qpack_encoder_encode(encoder, &prefix, &block, &instructions, 0, values.data(), values.size());
+    Buffer output;
+    if (!code) {
+        output.insert(output.end(), prefix.pos, prefix.last);
+        output.insert(output.end(), block.pos, block.last);
+    }
+    nghttp3_buf_free(&prefix, memory); nghttp3_buf_free(&block, memory); nghttp3_buf_free(&instructions, memory);
+    nghttp3_qpack_encoder_del(encoder);
+    if (code) throw std::runtime_error("QPACK encoding failed");
+    return output;
+}
+
+Fields decodeQpack(const Buffer &input) {
+    const auto *memory = nghttp3_mem_default();
+    nghttp3_qpack_decoder *decoder = nullptr;
+    nghttp3_qpack_stream_context *context = nullptr;
+    if (nghttp3_qpack_decoder_new(&decoder, 0, 0, memory)) throw std::runtime_error("QPACK decoder creation failed");
+    if (nghttp3_qpack_stream_context_new(&context, 0, memory)) {
+        nghttp3_qpack_decoder_del(decoder);
+        throw std::runtime_error("QPACK context creation failed");
+    }
+    Fields fields; size_t offset = 0, size = 0; bool valid = false;
+    for (size_t iteration = 0; iteration < 256; ++iteration) {
+        nghttp3_qpack_nv value{}; uint8_t flags = 0;
+        auto count = nghttp3_qpack_decoder_read_request(decoder, context, &value, &flags,
+            input.data() + offset, input.size() - offset, 1);
+        if (count < 0 || (flags & NGHTTP3_QPACK_DECODE_FLAG_BLOCKED)) break;
+        offset += static_cast<size_t>(count);
+        if (flags & NGHTTP3_QPACK_DECODE_FLAG_EMIT) {
+            auto name = nghttp3_rcbuf_get_buf(value.name), content = nghttp3_rcbuf_get_buf(value.value);
+            fields.push_back({std::string(reinterpret_cast<char *>(name.base), name.len),
+                              std::string(reinterpret_cast<char *>(content.base), content.len)});
+            size += name.len + content.len;
+            nghttp3_rcbuf_decref(value.name); nghttp3_rcbuf_decref(value.value);
+            if (size > 65536 || fields.size() > 128) break;
+        }
+        if (flags & NGHTTP3_QPACK_DECODE_FLAG_FINAL) { valid = offset == input.size(); break; }
+        if (count == 0 && !(flags & NGHTTP3_QPACK_DECODE_FLAG_EMIT)) break;
+    }
+    nghttp3_qpack_stream_context_del(context);
+    nghttp3_qpack_decoder_del(decoder);
+    if (!valid) throw std::runtime_error("Invalid QPACK response");
+    return fields;
+}
+
+class HTTP3ConnectStream final : public Stream, public std::enable_shared_from_this<HTTP3ConnectStream> {
+public:
+    HTTP3ConnectStream(std::shared_ptr<quic::Connection> connection, std::shared_ptr<Stream> stream, std::shared_ptr<Reader> reader)
+        : connection_(std::move(connection)), stream_(std::move(stream)), reader_(std::move(reader)),
+          writer_(std::make_shared<OrderedWriter>(stream_)) {}
+    ~HTTP3ConnectStream() override { close(); }
+
+    void write(Buffer data, WriteCallback completion) override {
+        if (closed_) { completion("Stream closed"); return; }
+        if (data.empty()) { completion({}); return; }
+        try {
+            Buffer frame{0x00};
+            auto lenVar = encodeVarint(data.size());
+            frame.insert(frame.end(), lenVar.begin(), lenVar.end());
+            frame.insert(frame.end(), data.begin(), data.end());
+            writer_->write(std::move(frame), std::move(completion));
+        } catch (const std::exception &e) {
+            completion(e.what());
+        }
+    }
+
+    void read(size_t maximum, ReadCallback completion) override {
+        if (closed_) { completion({}, true, "Stream closed"); return; }
+        if (pendingRead_) { completion({}, false, "Concurrent HTTP/3 read"); return; }
+        if (!maximum || maximum > maximumReadBytes) { completion({}, false, "Invalid maximum read size"); return; }
+        requested_ = maximum;
+        pendingRead_ = std::move(completion);
+        pumpRead();
+    }
+
+    void shutdownWrite(WriteCallback completion) override {
+        if (closed_) { completion("Stream closed"); return; }
+        writer_->finish(std::move(completion));
+    }
+
+    bool supportsHalfClose() const override { return true; }
+
+    void close() override {
+        if (closed_) return;
+        closed_ = true;
+        writer_->close();
+        reader_->close();
+        if (stream_) { stream_->close(); stream_.reset(); }
+        if (connection_) { connection_->close(); connection_.reset(); }
+        buffered_.clear();
+        if (auto cb = std::exchange(pendingRead_, {})) cb({}, true, "Stream closed");
+    }
+
+private:
+    void pumpRead() {
+        if (!pendingRead_) return;
+        if (!buffered_.empty()) {
+            size_t n = std::min(requested_, buffered_.size());
+            Buffer chunk = buffered_.consume(n);
+            bool done = buffered_.empty() && eof_;
+            auto cb = std::exchange(pendingRead_, {});
+            cb(std::move(chunk), done, {});
+            return;
+        }
+        if (eof_) {
+            auto cb = std::exchange(pendingRead_, {});
+            cb({}, true, {});
+            return;
+        }
+        auto self = shared_from_this();
+        readQuicVarint(reader_, [self](uint64_t frameType, Error typeErr) {
+            if (self->closed_) return;
+            if (!typeErr.empty()) {
+                if (typeErr == "EOF") {
+                    self->eof_ = true;
+                    self->pumpRead();
+                    return;
+                }
+                auto cb = std::exchange(self->pendingRead_, {});
+                self->close();
+                if (cb) cb({}, true, typeErr);
+                return;
+            }
+            readQuicVarint(self->reader_, [self, frameType](uint64_t frameLen, Error lenErr) {
+                if (self->closed_) return;
+                if (!lenErr.empty() || frameLen > 16 * 1024 * 1024) {
+                    auto cb = std::exchange(self->pendingRead_, {});
+                    self->close();
+                    if (cb) cb({}, true, lenErr.empty() ? "Oversized HTTP/3 frame" : lenErr);
+                    return;
+                }
+                self->reader_->exactly(static_cast<size_t>(frameLen), [self, frameType](Buffer payload, Error payErr) {
+                    if (self->closed_) return;
+                    if (!payErr.empty()) {
+                        auto cb = std::exchange(self->pendingRead_, {});
+                        self->close();
+                        if (cb) cb({}, true, payErr);
+                        return;
+                    }
+                    if (frameType == 0x00 && !payload.empty()) {
+                        self->buffered_.append(payload.data(), payload.size());
+                    }
+                    self->pumpRead();
+                });
+            });
+        });
+    }
+
+    std::shared_ptr<quic::Connection> connection_;
+    std::shared_ptr<Stream> stream_;
+    std::shared_ptr<Reader> reader_;
+    std::shared_ptr<OrderedWriter> writer_;
+    CursorBuffer buffered_;
+    ReadCallback pendingRead_;
+    size_t requested_ = 0;
+    bool closed_ = false, eof_ = false;
+};
+
+void connectTrustTunnelQUIC(const Node &node, const Target &target,
+                            const std::string &username, const std::string &password,
+                            std::shared_ptr<TransportFactory> factory, StreamCallback completion) {
+    quic::Connection::connect(node, factory, [node, target, username, password, completion = std::move(completion)](std::shared_ptr<quic::Connection> connection, Error err) mutable {
+        if (!err.empty() || !connection || connection->isClosed()) {
+            if (connection) connection->close();
+            completion(nullptr, err.empty() ? "TrustTunnel QUIC connection failed" : err);
+            return;
+        }
+        // Open HTTP/3 control stream (uni stream type 0x00 + SETTINGS frame 0x04)
+        connection->open(true, [connection](std::shared_ptr<Stream> ctrl, Error ctrlErr) {
+            if (!ctrlErr.empty() || !ctrl) return;
+            Buffer settings{0x00, 0x04, 0x00};
+            ctrl->write(std::move(settings), [](Error) {});
+        });
+        connection->open(false, [connection, target, username, password, completion = std::move(completion)](std::shared_ptr<Stream> stream, Error openErr) mutable {
+            if (!openErr.empty() || !stream || connection->isClosed()) {
+                connection->close();
+                completion(nullptr, openErr.empty() ? "TrustTunnel QUIC stream open failed" : openErr);
+                return;
+            }
+            try {
+                Buffer cred(username.begin(), username.end());
+                cred.push_back(':');
+                cred.insert(cred.end(), password.begin(), password.end());
+                std::string auth = "Basic " + crypto::base64Encode(cred);
+
+                std::string authority = target.udp
+                    ? "_trusttunnel_udp_:443"
+                    : ((target.host.find(':') != std::string::npos && target.host.front() != '[')
+                        ? ("[" + target.host + "]:" + std::to_string(target.port))
+                        : (target.host + ":" + std::to_string(target.port)));
+
+                Buffer qpackBlock = encodeQpack({
+                    {":method", "CONNECT"},
+                    {":authority", authority},
+                    {"proxy-authorization", auth},
+                    {"user-agent", "TrustTunnel-Client/1.0"}
+                });
+                Buffer h3Req{0x01};
+                auto lenVar = encodeVarint(qpackBlock.size());
+                h3Req.insert(h3Req.end(), lenVar.begin(), lenVar.end());
+                h3Req.insert(h3Req.end(), qpackBlock.begin(), qpackBlock.end());
+
+                auto reader = std::make_shared<Reader>(stream);
+                stream->write(std::move(h3Req), [connection, stream, reader, completion = std::move(completion)](Error writeErr) mutable {
+                    if (!writeErr.empty() || connection->isClosed()) {
+                        connection->close();
+                        completion(nullptr, writeErr.empty() ? "TrustTunnel QUIC cancelled" : writeErr);
+                        return;
+                    }
+                    readQuicVarint(reader, [connection, stream, reader, completion = std::move(completion)](uint64_t fType, Error tErr) mutable {
+                        if (!tErr.empty() || fType != 0x01) {
+                            connection->close();
+                            completion(nullptr, tErr.empty() ? "Expected HTTP/3 HEADERS frame" : tErr);
+                            return;
+                        }
+                        readQuicVarint(reader, [connection, stream, reader, completion = std::move(completion)](uint64_t fLen, Error lErr) mutable {
+                            if (!lErr.empty() || fLen > 65536) {
+                                connection->close();
+                                completion(nullptr, lErr.empty() ? "Oversized HTTP/3 HEADERS frame" : lErr);
+                                return;
+                            }
+                            reader->exactly(static_cast<size_t>(fLen), [connection, stream, reader, completion = std::move(completion)](Buffer block, Error bErr) mutable {
+                                if (!bErr.empty()) {
+                                    connection->close();
+                                    completion(nullptr, bErr);
+                                    return;
+                                }
+                                try {
+                                    auto fields = decodeQpack(block);
+                                    std::string status;
+                                    for (auto &f : fields) {
+                                        if (f.first == ":status") status = f.second;
+                                    }
+                                    if (status != "200") {
+                                        connection->close();
+                                        completion(nullptr, "TrustTunnel HTTP/3 CONNECT rejected");
+                                        return;
+                                    }
+                                    connection->authenticated();
+                                    completion(std::make_shared<HTTP3ConnectStream>(connection, stream, reader), {});
+                                } catch (const std::exception &e) {
+                                    connection->close();
+                                    completion(nullptr, e.what());
+                                }
+                            });
+                        });
+                    });
+                });
+            } catch (const std::exception &e) {
+                connection->close();
+                completion(nullptr, e.what());
+            }
+        });
+    });
+}
 
 // ============================================================================
 // 3. TRUSTTUNNEL PROTOCOL
@@ -224,9 +516,14 @@ void connectTrustTunnel(const Node &node, const Target &target,
     auto err = parseTrustTunnelConfig(node, username, password);
     if (!err.empty()) { completion(nullptr, err); return; }
 
+    if (node.flag("quic", false)) {
+        connectTrustTunnelQUIC(node, target, username, password, std::move(factory), std::move(completion));
+        return;
+    }
+
     auto tls = tlsOptions(node, true);
     if (tls.alpn.empty()) {
-        tls.alpn.push_back(node.flag("quic", false) ? "h3" : "http/1.1");
+        tls.alpn.push_back("http/1.1");
     }
 
     factory->tcp(node, tls, [factory, username = std::move(username), password = std::move(password),

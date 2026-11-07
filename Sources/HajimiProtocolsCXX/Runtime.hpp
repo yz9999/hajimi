@@ -160,6 +160,8 @@ void makeAnyTLSDatagram(const Node &, std::shared_ptr<TransportFactory>, Datagra
 void connectQUICProtocol(const Node &, const Target &, std::shared_ptr<TransportFactory>, StreamCallback);
 void makeQUICDatagram(const Node &, std::shared_ptr<TransportFactory>, DatagramCallback);
 Error validateQUICProtocol(const Node &, bool udp);
+void resetQUICClients();
+void resetQUICClient(const std::shared_ptr<TransportFactory> &factory);
 void connectSnell(const Node &, const Target &, std::shared_ptr<TransportFactory>, StreamCallback);
 void makeSnellDatagram(const Node &, std::shared_ptr<TransportFactory>, DatagramCallback);
 void connectSSH(const Node &, const Target &, std::shared_ptr<TransportFactory>, StreamCallback);

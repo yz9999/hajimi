@@ -44,4 +44,22 @@ private:
     std::shared_ptr<Stream> stream_;
     std::shared_ptr<Reader> reader_;
 };
+
+// A multiplexed stream over a pooled QUIC connection: closing the stream
+// closes only the individual QUIC stream while keeping the shared Connection alive.
+class SharedStream final : public Stream {
+public:
+    SharedStream(std::shared_ptr<Connection>, std::shared_ptr<Stream>,
+                 std::shared_ptr<Reader> = {});
+    ~SharedStream() override;
+    void write(Buffer, WriteCallback) override;
+    void read(size_t, ReadCallback) override;
+    void shutdownWrite(WriteCallback) override;
+    bool supportsHalfClose() const override { return true; }
+    void close() override;
+private:
+    std::shared_ptr<Connection> connection_;
+    std::shared_ptr<Stream> stream_;
+    std::shared_ptr<Reader> reader_;
+};
 } // namespace hajimi::quic

@@ -285,6 +285,7 @@ struct WGConfig {
     bool hasSelfIPv6 = false;
     std::array<uint8_t, 3> reserved{0, 0, 0};
     size_t mtu = 1420;
+    uint32_t keepaliveSeconds = 0;
     ~WGConfig() {
         if (!clientPriv.empty()) OPENSSL_cleanse(clientPriv.data(), clientPriv.size());
         if (!psk.empty()) OPENSSL_cleanse(psk.data(), psk.size());
@@ -363,6 +364,12 @@ WGConfig parseWGConfig(const Node &node) {
     }
     cfg.selfIPv4 = parseIPv4CIDR(ipStr);
     auto ipv6Str = node.option("ipv6", node.option("self-ip-v6"));
+    if (ipv6Str.empty()) {
+        auto comma = ipStr.find_first_of(",;");
+        if (comma != std::string::npos) {
+            ipv6Str = ipStr.substr(comma + 1);
+        }
+    }
     if (!ipv6Str.empty() && tryParseIPv6CIDR(ipv6Str, cfg.selfIPv6)) {
         cfg.hasSelfIPv6 = true;
     } else {
@@ -378,6 +385,13 @@ WGConfig parseWGConfig(const Node &node) {
         if (m < 576 || m > 65535) throw std::runtime_error("Invalid WireGuard mtu");
         cfg.mtu = size_t(m);
     }
+    auto kaStr = node.option("persistent-keepalive", node.option("keepalive"));
+    if (!kaStr.empty()) {
+        try {
+            int ka = std::stoi(kaStr);
+            if (ka > 0 && ka <= 3600) cfg.keepaliveSeconds = uint32_t(ka);
+        } catch (...) {}
+    }
     return cfg;
 }
 
@@ -390,7 +404,34 @@ struct WGHandshakeState {
     Buffer hash;
     Buffer sendKey;
     Buffer recvKey;
+    Buffer lastMac1;
     uint64_t sendCounter = 0;
+    uint64_t replayMax = 0;
+    uint64_t replayBitmap = 0;
+    bool replayInit = false;
+
+    bool acceptReplay(uint64_t counter) {
+        if (counter >= (1ULL << 60)) return false;
+        if (!replayInit) {
+            replayInit = true;
+            replayMax = counter;
+            replayBitmap = 1ULL;
+            return true;
+        }
+        if (counter > replayMax) {
+            uint64_t shift = counter - replayMax;
+            replayBitmap = (shift >= 64) ? 1ULL : ((replayBitmap << shift) | 1ULL);
+            replayMax = counter;
+            return true;
+        }
+        uint64_t diff = replayMax - counter;
+        if (diff >= 64) return false;
+        uint64_t mask = 1ULL << diff;
+        if (replayBitmap & mask) return false;
+        replayBitmap |= mask;
+        return true;
+    }
+
     ~WGHandshakeState() {
         if (!ephemeralPriv.empty()) OPENSSL_cleanse(ephemeralPriv.data(), ephemeralPriv.size());
         if (!chainingKey.empty()) OPENSSL_cleanse(chainingKey.data(), chainingKey.size());
@@ -399,7 +440,7 @@ struct WGHandshakeState {
     }
 };
 
-Buffer buildHandshakeInitiation(const WGConfig &cfg, WGHandshakeState &hs) {
+Buffer buildHandshakeInitiation(const WGConfig &cfg, WGHandshakeState &hs, const Buffer &cookie = {}) {
     static const std::string kConstruction = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
     static const std::string kIdentifier = "WireGuard v1 zx2c4 Jason@zx2c4.com";
     static const std::string kLabelMac1 = "mac1----";
@@ -446,7 +487,29 @@ Buffer buildHandshakeInitiation(const WGConfig &cfg, WGHandshakeState &hs) {
     auto mac1Key = wgHash2(Buffer(kLabelMac1.begin(), kLabelMac1.end()), cfg.serverPub);
     auto mac1 = wgMac(mac1Key, msg.data(), 116);
     std::memcpy(msg.data() + 116, mac1.data(), 16);
+    hs.lastMac1 = mac1;
+    if (cookie.size() == 16) {
+        auto mac2 = wgMac(cookie, msg.data(), 132);
+        std::memcpy(msg.data() + 132, mac2.data(), 16);
+    }
     return msg;
+}
+
+bool consumeCookieReply(const WGConfig &cfg, const Buffer &lastMac1, uint32_t expectedIndex,
+                        const Buffer &msg, Buffer &cookieOut) {
+    static const std::string kLabelCookie = "cookie--";
+    if (msg.size() != 64 || msg[0] != 3 || lastMac1.size() != 16) return false;
+    uint32_t recvIdx = readLE32(msg.data() + 4);
+    if (recvIdx != expectedIndex) return false;
+    try {
+        auto cookieKey = wgHash2(Buffer(kLabelCookie.begin(), kLabelCookie.end()), cfg.serverPub);
+        Buffer nonce(msg.begin() + 8, msg.begin() + 32);
+        Buffer cipher(msg.begin() + 32, msg.begin() + 64);
+        cookieOut = crypto::open(crypto::AEAD::XChaCha20Poly1305, cookieKey, nonce, cipher, lastMac1);
+        return cookieOut.size() == 16;
+    } catch (...) {
+        return false;
+    }
 }
 
 bool consumeHandshakeResponse(const WGConfig &cfg, WGHandshakeState &hs, const Buffer &msg) {
@@ -512,14 +575,16 @@ Buffer encryptTransportPacket(const WGConfig &cfg, WGHandshakeState &hs, const B
     return out;
 }
 
-bool decryptTransportPacket(const WGHandshakeState &hs, const Buffer &pkt, Buffer &ipPacketOut) {
+bool decryptTransportPacket(WGHandshakeState &hs, const Buffer &pkt, Buffer &ipPacketOut) {
     if (pkt.size() < 32 || pkt[0] != 4) return false;
     uint32_t recvIdx = readLE32(pkt.data() + 4);
     if (recvIdx != hs.clientIndex) return false;
     uint64_t counter = readLE64(pkt.data() + 8);
+    if (hs.replayInit && counter + 64 <= hs.replayMax) return false;
     try {
         auto plain = crypto::openSlice(crypto::AEAD::ChaCha20Poly1305, hs.recvKey, wgNonce(counter),
                                        pkt.data() + 16, pkt.size() - 16);
+        if (!hs.acceptReplay(counter)) return false;
         if (plain.empty()) {
             ipPacketOut.clear();
             return true; // Keepalive packet
@@ -773,7 +838,7 @@ Buffer buildIPv6TCPPacket(const std::array<uint8_t, 16> &srcIP, uint16_t srcPort
     return pkt;
 }
 
-Buffer buildDNSQueryA(const std::string &domain, uint16_t txid) {
+Buffer buildDNSQuery(const std::string &domain, uint16_t txid, uint16_t qtype) {
     Buffer q;
     q.resize(12, 0);
     writeBE16(q.data(), txid);
@@ -791,9 +856,53 @@ Buffer buildDNSQueryA(const std::string &domain, uint16_t txid) {
         start = dot + 1;
     }
     q.push_back(0);
-    q.push_back(0); q.push_back(1); // QTYPE A
+    q.push_back(uint8_t(qtype >> 8)); q.push_back(uint8_t(qtype & 0xff));
     q.push_back(0); q.push_back(1); // QCLASS IN
     return q;
+}
+
+Buffer buildDNSQueryA(const std::string &domain, uint16_t txid) {
+    return buildDNSQuery(domain, txid, 1);
+}
+
+bool parseDNSAnswerAAAA(const Buffer &resp, uint16_t expectedTxid, std::array<uint8_t, 16> &ipv6Out) {
+    if (resp.size() < 12 || readBE16(resp.data()) != expectedTxid) return false;
+    if ((resp[2] & 0x80) == 0 || (resp[3] & 0x0F) != 0) return false;
+    uint16_t qdCount = readBE16(resp.data() + 4);
+    uint16_t anCount = readBE16(resp.data() + 6);
+    if (anCount == 0) return false;
+    size_t pos = 12;
+    auto skipName = [&](size_t &p) -> bool {
+        size_t jumps = 0;
+        while (p < resp.size() && ++jumps < 64) {
+            uint8_t c = resp[p];
+            if (c == 0) { ++p; return true; }
+            if ((c & 0xC0) == 0xC0) {
+                if (p + 2 > resp.size()) return false;
+                p += 2;
+                return true;
+            }
+            p += 1 + c;
+        }
+        return false;
+    };
+    for (uint16_t i = 0; i < qdCount; ++i) {
+        if (!skipName(pos) || pos + 4 > resp.size()) return false;
+        pos += 4;
+    }
+    for (uint16_t i = 0; i < anCount; ++i) {
+        if (!skipName(pos) || pos + 10 > resp.size()) return false;
+        uint16_t rtype = readBE16(resp.data() + pos);
+        uint16_t rdlen = readBE16(resp.data() + pos + 8);
+        pos += 10;
+        if (pos + rdlen > resp.size()) return false;
+        if (rtype == 28 && rdlen == 16) {
+            std::memcpy(ipv6Out.data(), resp.data() + pos, 16);
+            return true;
+        }
+        pos += rdlen;
+    }
+    return false;
 }
 
 bool parseDNSAnswerA(const Buffer &resp, uint16_t expectedTxid, uint32_t &ipv4NetOut) {
@@ -946,17 +1055,26 @@ public:
         std::shared_ptr<Datagram> carrier;
         Buffer wgPkt;
         bool triggerRehandshake = false;
+        uint64_t nowMs = monotonicMillis();
         {
             std::lock_guard<std::recursive_mutex> lock(mutex_);
             if (closed_ || !established_ || !carrier_) {
                 completion("WireGuard tunnel is not established");
                 return;
             }
+            if (lastHandshakeMs_ > 0 && nowMs - lastHandshakeMs_ >= 180000) {
+                // REJECT_AFTER_TIME (180s): session keys expired; trigger rekey
+                sendHandshakeInitiation(true);
+            }
             try {
                 wgPkt = encryptTransportPacket(cfg_, hs_, ipPkt);
                 carrier = carrier_;
-                if (++unansweredTxPackets_ > 8) {
-                    unansweredTxPackets_ = 0;
+                lastTxMs_ = nowMs;
+                bool rekeyAfterTime = (lastHandshakeMs_ > 0 && (nowMs - lastHandshakeMs_) >= 120000);
+                bool rekeyAfterMessages = (hs_.sendCounter >= (1ULL << 60));
+                bool unresponsivePeer = (lastTxMs_ > lastRxMs_ && lastRxMs_ > 0 && (nowMs - lastRxMs_) >= 15000);
+                if ((rekeyAfterTime || rekeyAfterMessages || unresponsivePeer) &&
+                    (nowMs - lastHandshakeInitSentMs_ >= 5000)) {
                     triggerRehandshake = true;
                 }
             } catch (const std::exception &e) {
@@ -1039,6 +1157,69 @@ public:
         });
     }
 
+    void resolveHostIPv6(const std::string &host, std::function<void(std::array<uint8_t, 16>, Error)> completion) {
+        std::array<uint8_t, 16> addr6{};
+        if (tryParseIPv6CIDR(host, addr6)) {
+            completion(addr6, {});
+            return;
+        }
+        uint16_t dnsPort = 0;
+        uint16_t txid = 0;
+        {
+            std::lock_guard<std::recursive_mutex> lock(mutex_);
+            if (!cfg_.hasSelfIPv6) {
+                completion({}, "WireGuard tunnel has no IPv6 address configured");
+                return;
+            }
+            auto it = dnsCacheV6_.find(host);
+            if (it != dnsCacheV6_.end()) {
+                completion(it->second, {});
+                return;
+            }
+            dnsPort = allocatePort();
+            txid = ++dnsTxid_;
+            if (txid == 0) txid = ++dnsTxid_;
+        }
+        auto self = shared_from_this();
+        auto resolved = std::make_shared<bool>(false);
+        registerUDP(dnsPort, [self, dnsPort, txid, host, resolved, completion](const Buffer &ipPkt) mutable {
+            std::lock_guard<std::recursive_mutex> lock(self->mutex_);
+            if (*resolved) return;
+            uint8_t ihl = (ipPkt[0] & 0x0F) * 4;
+            if (ipPkt.size() < size_t(ihl + 8)) return;
+            const uint8_t *udp = ipPkt.data() + ihl;
+            uint16_t srcPort = readBE16(udp);
+            uint16_t udpLen = readBE16(udp + 4);
+            if (srcPort != 53 || udpLen < 8 || ipPkt.size() < ihl + udpLen) return;
+            Buffer payload(udp + 8, udp + udpLen);
+            std::array<uint8_t, 16> ip6{};
+            if (parseDNSAnswerAAAA(payload, txid, ip6)) {
+                *resolved = true;
+                self->unregisterUDP(dnsPort);
+                if (self->dnsCacheV6_.size() >= 256) self->dnsCacheV6_.clear();
+                self->dnsCacheV6_[host] = ip6;
+                completion(ip6, {});
+            } else if (payload.size() >= 12 && readBE16(payload.data()) == txid) {
+                *resolved = true;
+                self->unregisterUDP(dnsPort);
+                completion({}, "WireGuard in-tunnel AAAA DNS resolution failed");
+            }
+        });
+        auto q = buildDNSQuery(host, txid, 28 /* AAAA */);
+        auto ipPkt = buildIPv4UDPPacket(cfg_.selfIPv4, dnsPort, cfg_.dnsIPv4, 53, q);
+        sendIPPacket(ipPkt, [](Error) {});
+        std::weak_ptr<SharedWGTunnel> weak = self;
+        factory_->after(4.0, [weak, dnsPort, resolved, completion]() mutable {
+            auto s = weak.lock();
+            if (!s) return;
+            std::lock_guard<std::recursive_mutex> lock(s->mutex_);
+            if (*resolved) return;
+            *resolved = true;
+            s->unregisterUDP(dnsPort);
+            completion({}, "WireGuard in-tunnel AAAA DNS timed out");
+        });
+    }
+
     void closeTunnel() {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
         failAll("WireGuard tunnel closed");
@@ -1054,31 +1235,76 @@ private:
     WGHandshakeState hs_;
     WGHandshakeState pendingHs_;
     bool hasPendingHs_ = false;
+    Buffer cookie_;
+    uint64_t cookieReceivedMs_ = 0;
+    uint64_t lastHandshakeMs_ = 0;
+    uint64_t lastHandshakeInitSentMs_ = 0;
+    uint64_t lastTxMs_ = 0;
+    uint64_t lastRxMs_ = 0;
+    bool keepaliveScheduled_ = false;
     std::vector<WriteCallback> waiters_;
     std::unordered_map<uint16_t, PacketHandler> tcpHandlers_;
     std::unordered_map<uint16_t, PacketHandler> udpHandlers_;
     std::unordered_map<std::string, uint32_t> dnsCache_;
+    std::unordered_map<std::string, std::array<uint8_t, 16>> dnsCacheV6_;
     uint16_t nextPort_ = 32768;
     uint16_t dnsTxid_ = 0x3100;
     unsigned retryCount_ = 0;
-    unsigned unansweredTxPackets_ = 0;
     bool connecting_ = false;
     bool established_ = false;
     bool closed_ = false;
 
+    static uint64_t monotonicMillis() {
+        return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+
     Target peerEndpoint() const { return {node_.dialHost(), node_.port, true, false}; }
+
+    Buffer activeCookie(uint64_t nowMs) const {
+        if (cookie_.size() == 16 && cookieReceivedMs_ > 0 && nowMs - cookieReceivedMs_ < 120000) {
+            return cookie_;
+        }
+        return {};
+    }
+
+    void schedulePersistentKeepalive() {
+        if (closed_ || !established_ || cfg_.keepaliveSeconds == 0 || keepaliveScheduled_) return;
+        keepaliveScheduled_ = true;
+        std::weak_ptr<SharedWGTunnel> weak = shared_from_this();
+        double interval = double(cfg_.keepaliveSeconds);
+        factory_->after(interval, [weak] {
+            auto self = weak.lock();
+            if (!self) return;
+            std::lock_guard<std::recursive_mutex> lock(self->mutex_);
+            self->keepaliveScheduled_ = false;
+            if (self->closed_ || !self->established_ || !self->carrier_) return;
+            uint64_t nowMs = monotonicMillis();
+            if (nowMs - self->lastTxMs_ >= uint64_t(self->cfg_.keepaliveSeconds) * 1000ULL) {
+                try {
+                    auto keepalive = encryptTransportPacket(self->cfg_, self->hs_, {});
+                    self->lastTxMs_ = nowMs;
+                    self->carrier_->send(self->peerEndpoint(), std::move(keepalive), [](Error) {});
+                } catch (...) {}
+            }
+            self->schedulePersistentKeepalive();
+        });
+    }
 
     void sendHandshakeInitiation(bool rekey = false) {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
         if (closed_ || (!rekey && established_) || !carrier_) return;
+        uint64_t nowMs = monotonicMillis();
+        lastHandshakeInitSentMs_ = nowMs;
         Buffer initPkt;
         try {
+            Buffer cookie = activeCookie(nowMs);
             if (rekey && established_) {
                 pendingHs_ = WGHandshakeState{};
-                initPkt = buildHandshakeInitiation(cfg_, pendingHs_);
+                initPkt = buildHandshakeInitiation(cfg_, pendingHs_, cookie);
                 hasPendingHs_ = true;
             } else {
-                initPkt = buildHandshakeInitiation(cfg_, hs_);
+                initPkt = buildHandshakeInitiation(cfg_, hs_, cookie);
             }
         }
         catch (const std::exception &e) { if (!rekey) failAll(e.what()); return; }
@@ -1113,13 +1339,26 @@ private:
         {
             std::lock_guard<std::recursive_mutex> lock(mutex_);
             if (closed_) return;
+            uint64_t nowMs = monotonicMillis();
+            if (pkt.size() == 64 && pkt[0] == 3) {
+                Buffer newCookie;
+                if ((hasPendingHs_ && consumeCookieReply(cfg_, pendingHs_.lastMac1, pendingHs_.clientIndex, pkt, newCookie)) ||
+                    consumeCookieReply(cfg_, hs_.lastMac1, hs_.clientIndex, pkt, newCookie)) {
+                    cookie_ = std::move(newCookie);
+                    cookieReceivedMs_ = nowMs;
+                    sendHandshakeInitiation(established_);
+                }
+                return;
+            }
             if (!established_ || (pkt.size() == 92 && pkt[0] == 2)) {
                 if (hasPendingHs_ && consumeHandshakeResponse(cfg_, pendingHs_, pkt)) {
                     hs_ = std::move(pendingHs_);
                     hasPendingHs_ = false;
-                    unansweredTxPackets_ = 0;
+                    lastHandshakeMs_ = nowMs;
+                    lastRxMs_ = nowMs;
                     try {
                         auto keepalive = encryptTransportPacket(cfg_, hs_, {});
+                        lastTxMs_ = nowMs;
                         carrier_->send(peerEndpoint(), std::move(keepalive), [](Error) {});
                     } catch (...) {}
                     return;
@@ -1127,11 +1366,14 @@ private:
                 if (!established_ && consumeHandshakeResponse(cfg_, hs_, pkt)) {
                     established_ = true;
                     connecting_ = false;
-                    unansweredTxPackets_ = 0;
+                    lastHandshakeMs_ = nowMs;
+                    lastRxMs_ = nowMs;
                     try {
                         auto keepalive = encryptTransportPacket(cfg_, hs_, {});
+                        lastTxMs_ = nowMs;
                         carrier_->send(peerEndpoint(), std::move(keepalive), [](Error) {});
                     } catch (...) {}
+                    schedulePersistentKeepalive();
                     readyWaiters = std::move(waiters_);
                     waiters_.clear();
                     selfKeepAlive_.reset();
@@ -1139,9 +1381,18 @@ private:
                     return;
                 }
             } else {
+                if (lastHandshakeMs_ > 0 && nowMs - lastHandshakeMs_ >= 180000) return;
                 if (!decryptTransportPacket(hs_, pkt, ipPkt)) return;
-                unansweredTxPackets_ = 0;
+                lastRxMs_ = nowMs;
                 if (ipPkt.size() < 20) return;
+                if (nowMs - lastTxMs_ >= 10000 && carrier_) {
+                    // Passive keepalive (WireGuard Whitepaper §6.5)
+                    try {
+                        auto keepalive = encryptTransportPacket(cfg_, hs_, {});
+                        lastTxMs_ = nowMs;
+                        carrier_->send(peerEndpoint(), std::move(keepalive), [](Error) {});
+                    } catch (...) {}
+                }
                 uint8_t ver = ipPkt[0] >> 4;
                 size_t ihl = 0;
                 uint8_t proto = 0;
@@ -1621,6 +1872,22 @@ private:
             self->factory_->post([self, ipNet, err = std::move(err)]() mutable {
                 if (self->closed_) return;
                 if (!err.empty() || !ipNet) {
+                    if (self->cfg_.hasSelfIPv6 && self->tunnel_) {
+                        self->tunnel_->resolveHostIPv6(self->target_.host, [self](std::array<uint8_t, 16> ip6, Error err6) {
+                            self->factory_->post([self, ip6, err6 = std::move(err6)]() mutable {
+                                if (self->closed_) return;
+                                if (!err6.empty()) {
+                                    self->fail(std::move(err6));
+                                    return;
+                                }
+                                self->dstIPv6_ = ip6;
+                                self->isIPv6Target_ = true;
+                                self->peerMSS_ = 1220;
+                                self->sendSyn();
+                            });
+                        });
+                        return;
+                    }
                     self->fail(err.empty() ? "WireGuard in-tunnel DNS resolution failed" : std::move(err));
                     return;
                 }

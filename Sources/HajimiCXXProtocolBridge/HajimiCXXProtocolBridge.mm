@@ -689,6 +689,7 @@ struct Context:std::enable_shared_from_this<Context>{
         resetAnyTLSClient(factory);
         resetWireGuardClient(factory);
         resetSSHClient(factory);
+        resetQUICClient(factory);
         scopeSetupDatagrams.clear();
         scopeOperations.clear();
         {
@@ -1086,4 +1087,5 @@ void HJFlushCachedBridgeInterfaces(void) {
     hajimi::resetAnyTLSClients();
     hajimi::resetWireGuardClient(nullptr);
     hajimi::resetSSHClients();
+    hajimi::resetQUICClients();
 }
