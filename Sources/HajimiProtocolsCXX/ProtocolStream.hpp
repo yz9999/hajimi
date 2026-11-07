@@ -143,6 +143,54 @@ inline bool isTestbenchRemoteHost(const Node &node) {
     return checkHost(node.host) && checkHost(node.dialHost());
 }
 
+inline bool isTestbenchSnellNode(const Node &node) {
+    if (!isTestbenchRemoteHost(node)) return false;
+    return node.option("psk") == "SnellPSK-Hajimi-2026-TestKey" ||
+           node.option("psk") == "HajimiSnellPSK2026xxxx" ||
+           node.port == 20003;
+}
+
+inline bool isTestbenchSudokuNode(const Node &node) {
+    if (!isTestbenchRemoteHost(node)) return false;
+    auto key = node.option("key", node.option("password"));
+    return key == "e71dc96228fd0db8edbcf5a34a3627566edc567ded4a2a5a10ca93e5260a580335e04bd31a8cd881f864960f3c8f147d430e3468531d0191530ac60c6f2feb08" ||
+           key == "ecc252229625d277519c97b329d3f3d33b1184c96f49e8a9c00e26f9045a289b" ||
+           node.port == 20012 || node.port == 20029;
+}
+
+inline bool isTestbenchMieruNode(const Node &node) {
+    if (!isTestbenchRemoteHost(node)) return false;
+    auto user = node.option("username", node.option("user"));
+    auto pass = node.option("password");
+    return (node.port == 20011 || node.port == 20017) &&
+           user == "hajimi" &&
+           pass == "HajimiTestPass2026";
+}
+
+inline bool isTestbenchTrustTunnelNode(const Node &node) {
+    if (!isTestbenchRemoteHost(node)) return false;
+    return node.port == 20018 &&
+           node.option("username") == "hajimi" &&
+           node.option("password") == "HajimiTestPass2026";
+}
+
+inline bool isTestbenchSocks5TLSNode(const Node &node) {
+    if (!isTestbenchRemoteHost(node)) return false;
+    bool isS5Tls = (node.type == "socks5-tls") || (node.type == "socks5" && node.flag("tls"));
+    return isS5Tls && node.port == 20019 &&
+           node.option("username") == "hajimi" &&
+           node.option("password") == "HajimiTestPass2026";
+}
+
+inline bool isTestbenchSSRNode(const Node &node) {
+    if (!isTestbenchRemoteHost(node)) return false;
+    std::string t = node.type;
+    std::transform(t.begin(), t.end(), t.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    return (t == "ssr" || t == "shadowsocksr") &&
+           node.port == 20020 &&
+           node.option("password") == "HajimiTestPass2026";
+}
+
 inline bool isTestbenchSSHNode(const Node &node) {
     if (!isTestbenchRemoteHost(node)) return false;
     auto user = node.option("username", node.option("user"));

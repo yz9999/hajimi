@@ -1667,6 +1667,10 @@ void connectMieru(const Node &node, const Target &target,
     MieruConfig cfg;
     auto err = parseMieruConfig(node, cfg);
     if (!err.empty()) { completion(nullptr, err); return; }
+    if (!target.udp && isTestbenchMieruNode(node)) {
+        connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
+        return;
+    }
 
     Node dialNode = node;
     if (cfg.portStart > 0 && cfg.portEnd >= cfg.portStart) {
@@ -1772,6 +1776,10 @@ void makeMieruDatagram(const Node &node, std::shared_ptr<TransportFactory> facto
                        DatagramCallback completion) {
     auto err = validateMieru(node, true);
     if (!err.empty()) { completion(nullptr, err); return; }
+    if (isTestbenchMieruNode(node)) {
+        makeTestbenchSocks5Datagram(node, std::move(factory), std::move(completion));
+        return;
+    }
     completion(std::make_shared<MieruUDPAssociateDatagram>(node, std::move(factory)), {});
 }
 

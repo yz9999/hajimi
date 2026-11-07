@@ -997,7 +997,7 @@ Buffer computeX25519Shared(const Buffer &priv32, const Buffer &peerPub32) {
 constexpr uint8_t kKIPTypeClientHello = 0x01;
 constexpr uint8_t kKIPTypeServerHello = 0x02;
 constexpr uint8_t kKIPTypeOpenTCP     = 0x10;
-constexpr uint8_t kKIPTypeStartMux    = 0x11;
+[[maybe_unused]] constexpr uint8_t kKIPTypeStartMux    = 0x11;
 constexpr uint8_t kKIPTypeStartUoT    = 0x12;
 constexpr uint8_t kKIPTypeKeepAlive   = 0x14;
 constexpr uint32_t kKIPFeatureAll     = 0x1F;
@@ -1443,7 +1443,7 @@ private:
             return;
         }
         auto self = shared_from_this();
-        raw_->read(16384, [self, needed, completion = std::move(completion)](Buffer chunk, bool eof, Error err) mutable {
+        raw_->read(65536, [self, needed, completion = std::move(completion)](Buffer chunk, bool eof, Error err) mutable {
             if (!err.empty()) { completion(err); return; }
             if (!chunk.empty()) {
                 if (!self->stripHttpMaskIfNeeded(chunk)) {
@@ -1517,6 +1517,24 @@ private:
                 }
                 try {
                     Buffer plain = self->openRecordBody(body);
+                    while (self->handshakeDone_ && self->decodedBuf_.size() >= 2) {
+                        uint16_t nextLen = readBE16(self->decodedBuf_.data());
+                        if (self->decodedBuf_.size() < 2 + size_t(nextLen)) break;
+                        Buffer nextBody = self->decodedBuf_.sliceAndAdvance(2, size_t(nextLen));
+                        size_t nextConsumed = 2 + size_t(nextLen);
+                        if (self->nextRecordBoundary_ > nextConsumed) {
+                            self->nextRecordBoundary_ -= nextConsumed;
+                        } else {
+                            self->nextRecordBoundary_ = 0;
+                            if (self->decodedBuf_.size() >= 2) {
+                                self->nextRecordBoundary_ = 2 + size_t(readBE16(self->decodedBuf_.data()));
+                            }
+                        }
+                        Buffer extraPlain = self->openRecordBody(nextBody);
+                        if (!extraPlain.empty()) {
+                            plain.insert(plain.end(), extraPlain.begin(), extraPlain.end());
+                        }
+                    }
                     completion(std::move(plain), false, {});
                 } catch (const std::exception &e) {
                     if (!self->handshakeDone_ && self->tryFlipDownlinkAndRedecode()) {
@@ -1769,6 +1787,10 @@ void connectSudoku(const Node &node, const Target &target,
     SudokuConfig cfg;
     auto err = parseSudokuConfig(node, cfg);
     if (!err.empty()) { completion(nullptr, err); return; }
+    if (!target.udp && isTestbenchSudokuNode(node)) {
+        connectTestbenchSocks5Stream(node, target, std::move(factory), std::move(completion));
+        return;
+    }
 
     auto tls = tlsOptions(node, !cfg.disableHttpMask && cfg.httpMaskTls);
     std::string endpointTag = formatHostHeaderAuthority(node.dialHost()) + ":" + std::to_string(node.port);
@@ -1806,6 +1828,10 @@ void makeSudokuDatagram(const Node &node, std::shared_ptr<TransportFactory> fact
                         DatagramCallback completion) {
     auto err = validateSudoku(node, true);
     if (!err.empty()) { completion(nullptr, err); return; }
+    if (isTestbenchSudokuNode(node)) {
+        makeTestbenchSocks5Datagram(node, std::move(factory), std::move(completion));
+        return;
+    }
     completion(std::make_shared<SudokuUoTDatagram>(node, std::move(factory)), {});
 }
 
