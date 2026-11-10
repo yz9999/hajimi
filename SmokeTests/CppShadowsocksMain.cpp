@@ -559,7 +559,7 @@ void validation() {
     expect(!validateShadowsocks(invalid,true).empty(),"Empty multikey segment accepted");
     invalid=spec.node;invalid.parameters["plugin"]="v2ray-plugin";
     expect(!validateShadowsocks(invalid,false).empty(),"Unsupported SIP003 plugin accepted");
-    invalid=spec.node;invalid.parameters["obfs"]="tls";
+    invalid=spec.node;invalid.parameters["obfs"]="websocket";
     expect(!validateShadowsocks(invalid,false).empty(),"Unsupported obfuscation plugin accepted");
     invalid=spec.node;invalid.parameters["network"]="ws";
     expect(!validateShadowsocks(invalid,false).empty(),"Unsupported Shadowsocks carrier accepted");
@@ -568,6 +568,8 @@ void validation() {
     Spec cfb("aes-256-cfb",32,crypto::AEAD::AES256GCM);cfb.node.type="ssr";
     expect(validateShadowsocks(cfb.node,true).empty(),"SSR origin/plain AESCFB rejected");
     cfb.node.parameters["protocol"]="auth_chain_a";
+    expect(validateShadowsocks(cfb.node,true).empty(),"SSR auth_chain_a rejected");
+    cfb.node.parameters["protocol"]="auth_chain_z_invalid";
     expect(!validateShadowsocks(cfb.node,true).empty(),"Unsupported SSR protocol accepted");
 }
 }

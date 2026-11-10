@@ -7,6 +7,7 @@
 #include <string.h>
 
 #define HJ_TRAFFIC_HISTORY_CAPACITY 60
+#define HJ_TRAFFIC_RING_CAPACITY HJ_TRAFFIC_HISTORY_CAPACITY
 
 typedef struct {
     uint64_t values[HJ_TRAFFIC_HISTORY_CAPACITY];

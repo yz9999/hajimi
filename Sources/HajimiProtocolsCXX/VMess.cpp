@@ -2,6 +2,7 @@
 #include "Crypto.hpp"
 #include "ProtocolCommon.hpp"
 #include "ProtocolStream.hpp"
+#include <openssl/evp.h>
 #include <algorithm>
 #include <array>
 #include <functional>
@@ -41,6 +42,45 @@ static uint32_t crc32(const Buffer &data) noexcept {
     for(auto byte:data) value = (value >> 8) ^ kTable[(value ^ byte) & 0xffU];
     return ~value;
 }
+// Standard VMess SHAKE128 MaskGenerator (V2Ray/Xray RequestOptionChunkMasking 0x04 & RequestOptionGlobalPadding 0x08)
+class VMessShake128Mask {
+public:
+    VMessShake128Mask() = default;
+    explicit VMessShake128Mask(const Buffer &nonce16) {
+        Buffer stream(4096);
+        EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+        if (!ctx) throw std::runtime_error("EVP_MD_CTX_new failed for VMess SHAKE128");
+        bool ok = EVP_DigestInit_ex(ctx, EVP_shake128(), nullptr) == 1 &&
+                  EVP_DigestUpdate(ctx, nonce16.data(), nonce16.size()) == 1 &&
+                  EVP_DigestFinalXOF(ctx, stream.data(), stream.size()) == 1;
+        EVP_MD_CTX_free(ctx);
+        if (!ok) throw std::runtime_error("VMess SHAKE128 XOF derivation failed");
+        stream_ = std::move(stream);
+        seed_ = nonce16;
+    }
+    uint16_t nextMask() {
+        if (offset_ + 2 > stream_.size()) {
+            size_t nextLen = stream_.size() * 2;
+            Buffer expanded(nextLen);
+            EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+            if (!ctx) throw std::runtime_error("EVP_MD_CTX_new failed for VMess SHAKE128");
+            bool ok = EVP_DigestInit_ex(ctx, EVP_shake128(), nullptr) == 1 &&
+                      EVP_DigestUpdate(ctx, seed_.data(), seed_.size()) == 1 &&
+                      EVP_DigestFinalXOF(ctx, expanded.data(), expanded.size()) == 1;
+            EVP_MD_CTX_free(ctx);
+            if (!ok) throw std::runtime_error("VMess SHAKE128 XOF expansion failed");
+            stream_ = std::move(expanded);
+        }
+        uint16_t val = (uint16_t(stream_[offset_]) << 8) | uint16_t(stream_[offset_ + 1]);
+        offset_ += 2;
+        return val;
+    }
+private:
+    Buffer seed_;
+    Buffer stream_;
+    size_t offset_ = 0;
+};
+
 static Buffer bodyNonce(uint32_t counter,const Buffer &iv) {
     if(counter>65535 || iv.size()<12)throw std::runtime_error("VMess nonce sequence exhausted");
     Buffer nonce;nonce.reserve(12);append16(nonce,uint16_t(counter));nonce.insert(nonce.end(),iv.begin()+2,iv.begin()+12);return nonce;
@@ -93,7 +133,8 @@ class VMessStream final:public Stream,public std::enable_shared_from_this<VMessS
     proto_common::CursorBuffer buffer_;
     uint8_t verification_,securityType_=3;uint32_t writeCounter_=0,readCounter_=0;
     crypto::AEAD bodyAead_=crypto::AEAD::AES128GCM;
-    bool udp_,bodyEncrypted_=true,chunkStream_=true,coalesceHeader_=false,headerSent_=false,ready_=false,closed_=false,eof_=false,writeEnded_=false;
+    VMessShake128Mask txMask_,rxMask_;
+    bool udp_,bodyEncrypted_=true,chunkStream_=true,chunkMasking_=false,globalPadding_=false,coalesceHeader_=false,headerSent_=false,ready_=false,closed_=false,eof_=false,writeEnded_=false;
     ReadCallback pending_;size_t maximum_=0;
     void flushPendingHeaderIfIdle(){
         if(closed_ || headerSent_)return;
@@ -158,22 +199,32 @@ class VMessStream final:public Stream,public std::enable_shared_from_this<VMessS
         }
         reader_->exactly(2,[self](Buffer length,Error error){
             if(!error.empty()){self->failRead(error);return;}
-            size_t count=read16(length);
+            size_t padLen = 0;
+            if (self->globalPadding_) {
+                padLen = self->rxMask_.nextMask() % 64;
+            }
+            uint16_t rawLen = read16(length);
+            if (self->chunkMasking_) {
+                rawLen ^= self->rxMask_.nextMask();
+            }
+            size_t count = size_t(rawLen);
             if(!self->bodyEncrypted_){
-                if(count==0){self->eof_=true;self->finishRead({},true,{});return;}
+                if(count <= padLen){self->eof_=true;self->finishRead({},true,{});return;}
                 if(!self->udp_ && count>17*1024){self->failRead("Invalid VMess body frame length");return;}
-                self->reader_->exactly(count,[self](Buffer plain,Error error){
+                self->reader_->exactly(count,[self, padLen](Buffer plain,Error error){
                     if(!error.empty()){self->failRead(error=="EOF"?"Truncated VMess body frame":error);return;}
+                    if (padLen > 0 && plain.size() >= padLen) plain.resize(plain.size() - padLen);
                     self->deliver(std::move(plain));
                 });
                 return;
             }
-            if(count<16 || (!self->udp_ && count>17*1024)){self->failRead("Invalid VMess body frame length");return;}
-            self->reader_->exactly(count,[self](Buffer sealed,Error error){
+            if(count < 16 + padLen || (!self->udp_ && count>17*1024)){self->failRead("Invalid VMess body frame length");return;}
+            self->reader_->exactly(count,[self, padLen](Buffer sealed,Error error){
                 if(!error.empty()){self->failRead(error=="EOF"?"Truncated VMess body frame":error);return;}
                 try{
+                    if (padLen > 0) sealed.resize(sealed.size() - padLen);
                     auto nonce=bodyNonce(self->readCounter_,self->responseIV_);
-                    auto data=crypto::open(self->bodyAead_,self->bodyRxKey_,nonce,sealed);++self->readCounter_;
+                    auto data=crypto::openSlice(self->bodyAead_,self->bodyRxKey_,nonce,sealed.data(),sealed.size());++self->readCounter_;
                     if(data.empty()){self->eof_=true;self->finishRead({},true,{});}else self->deliver(std::move(data));
                 }catch(const std::exception &e){self->failRead(e.what());}
             });
@@ -223,7 +274,13 @@ public:
             bodyTxKey_=requestKey_;
             bodyRxKey_=responseKey_;
         }
-        uint8_t optionFlags=chunkStream_?1:0;
+        globalPadding_ = chunkStream_ && node.flag("global-padding", false);
+        chunkMasking_ = chunkStream_ && (globalPadding_ || node.flag("chunk-masking", false));
+        if (chunkMasking_) {
+            txMask_ = VMessShake128Mask(requestIV_);
+            rxMask_ = VMessShake128Mask(responseIV_);
+        }
+        uint8_t optionFlags = (chunkStream_ ? 0x01 : 0x00) | (chunkMasking_ ? 0x04 : 0x00) | (globalPadding_ ? 0x08 : 0x00);
         Buffer command;command.reserve(64+padding);
         command.push_back(1);
         command.insert(command.end(),requestIV_.begin(),requestIV_.end());command.insert(command.end(),requestKey_.begin(),requestKey_.end());
@@ -274,15 +331,31 @@ public:
             }else if(!bodyEncrypted_){
                 for(size_t offset=0;offset<data.size();){
                     size_t count=std::min(chunkSize,data.size()-offset);
-                    append16(output,uint16_t(count));
+                    size_t padLen = globalPadding_ ? (txMask_.nextMask() % 64) : 0;
+                    uint16_t wireLen = uint16_t(count + padLen);
+                    if (chunkMasking_) wireLen ^= txMask_.nextMask();
+                    append16(output,wireLen);
                     output.insert(output.end(),data.data()+offset,data.data()+offset+count);
+                    if (padLen > 0) {
+                        auto pad = crypto::randomBytes(padLen);
+                        output.insert(output.end(), pad.begin(), pad.end());
+                    }
                     offset+=count;
                 }
             }else{
                 for(size_t offset=0;offset<data.size();){
                     size_t count=std::min(chunkSize,data.size()-offset);
+                    size_t padLen = globalPadding_ ? (txMask_.nextMask() % 64) : 0;
+                    uint16_t wireLen = uint16_t(count + 16 + padLen);
+                    if (chunkMasking_) wireLen ^= txMask_.nextMask();
                     Buffer sealed=crypto::sealSlice(bodyAead_,bodyTxKey_,bodyNonce(writeCounter_,requestIV_),data.data()+offset,count);
-                    append16(output,uint16_t(sealed.size()));output.insert(output.end(),sealed.begin(),sealed.end());++writeCounter_;offset+=count;
+                    append16(output,wireLen);
+                    output.insert(output.end(),sealed.begin(),sealed.end());
+                    if (padLen > 0) {
+                        auto pad = crypto::randomBytes(padLen);
+                        output.insert(output.end(), pad.begin(), pad.end());
+                    }
+                    ++writeCounter_;offset+=count;
                 }
             }
             writer_->write(std::move(output),std::move(completion));
@@ -311,11 +384,24 @@ public:
                 request_.clear();
             }
             if(chunkStream_){
+                size_t padLen = globalPadding_ ? (txMask_.nextMask() % 64) : 0;
                 if(bodyEncrypted_){
                     auto sealed=crypto::seal(bodyAead_,bodyTxKey_,bodyNonce(writeCounter_,requestIV_),{});++writeCounter_;
-                    append16(frame,uint16_t(sealed.size()));frame.insert(frame.end(),sealed.begin(),sealed.end());
+                    uint16_t wireLen = uint16_t(sealed.size() + padLen);
+                    if (chunkMasking_) wireLen ^= txMask_.nextMask();
+                    append16(frame,wireLen);frame.insert(frame.end(),sealed.begin(),sealed.end());
+                    if (padLen > 0) {
+                        auto pad = crypto::randomBytes(padLen);
+                        frame.insert(frame.end(), pad.begin(), pad.end());
+                    }
                 }else{
-                    append16(frame,0);
+                    uint16_t wireLen = uint16_t(padLen);
+                    if (chunkMasking_) wireLen ^= txMask_.nextMask();
+                    append16(frame,wireLen);
+                    if (padLen > 0) {
+                        auto pad = crypto::randomBytes(padLen);
+                        frame.insert(frame.end(), pad.begin(), pad.end());
+                    }
                 }
             }
             auto self=shared_from_this();

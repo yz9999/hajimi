@@ -273,7 +273,8 @@ final class UDPNodeAddressProbe {
             return
         }
 
-        let source = DispatchSource.makeReadSource(fileDescriptor: sockFD, queue: queue)
+        let capturedFD = sockFD
+        let source = DispatchSource.makeReadSource(fileDescriptor: capturedFD, queue: queue)
         source.setEventHandler { [weak self] in
             guard let self, !self.cancelled, self.fd >= 0 else { return }
             var buf = [UInt8](repeating: 0, count: 256)
@@ -286,6 +287,9 @@ final class UDPNodeAddressProbe {
                 self.cancel()
                 completion(.failure(NWError.posix(code)))
             }
+        }
+        source.setCancelHandler {
+            Darwin.close(capturedFD)
         }
         self.readSource = source
         source.resume()
@@ -314,12 +318,18 @@ final class UDPNodeAddressProbe {
         cancelled = true
         timerSource?.cancel()
         timerSource = nil
-        readSource?.cancel()
-        readSource = nil
-        if fd >= 0 {
+        if let source = readSource {
+            readSource = nil
+            fd = -1
+            source.cancel()
+        } else if fd >= 0 {
             Darwin.close(fd)
             fd = -1
         }
+    }
+
+    deinit {
+        cancel()
     }
 }
 
@@ -459,11 +469,11 @@ enum NodeLatencyClassificationSelfTest {
 
 private func protocolAccentColor(for rawType: String) -> NSColor {
     switch rawType.lowercased() {
-    case "vless", "vmess", "mieru": return .systemIndigo
+    case "vless", "vmess", "mieru": return HajimiAppearance.indigoAccent
     case "trojan", "anytls", "trusttunnel": return HajimiAppearance.accentText
-    case "hysteria", "hysteria2", "tuic": return .systemBlue
-    case "ss", "ssr", "snell", "sudoku": return .systemPurple
-    case "wireguard", "ssh": return .systemTeal
+    case "hysteria", "hysteria2", "tuic": return HajimiAppearance.uploadAccent
+    case "ss", "ssr", "snell", "sudoku": return HajimiAppearance.accent
+    case "wireguard", "ssh": return HajimiAppearance.accentText
     default: return .secondaryLabelColor
     }
 }
@@ -522,14 +532,15 @@ private final class PolicyCardSurface: NSView {
 
     private func updateColors() {
         activeBarLayer.isHidden = !active
+        layer?.cornerRadius = min(18, max(0, round(HajimiAppearance.cardCornerRadius * 0.86)))
         effectiveAppearance.performAsCurrentDrawingAppearance {
             topHighlightLayer.backgroundColor = HajimiAppearance.specularHighlight.cgColor
             activeBarLayer.backgroundColor = HajimiAppearance.accent.cgColor
             layer?.backgroundColor = (active || selected ? HajimiAppearance.selection
                 : hovered ? HajimiAppearance.elevatedPanel : HajimiAppearance.panel).cgColor
-            layer?.borderColor = (active ? HajimiAppearance.accent.withAlphaComponent(0.82)
-                : selected ? HajimiAppearance.accent.withAlphaComponent(0.60)
-                : hovered ? HajimiAppearance.accent.withAlphaComponent(0.38)
+            layer?.borderColor = (active ? HajimiAppearance.accent.themedAlpha(0.82)
+                : selected ? HajimiAppearance.accent.themedAlpha(0.60)
+                : hovered ? HajimiAppearance.accent.themedAlpha(0.38)
                 : HajimiAppearance.border).cgColor
             layer?.borderWidth = (active || selected) ? 1.4 : 1.0
         }
@@ -564,9 +575,10 @@ private final class PolicyAddButton: NSButton {
     }
 
     private func updateColors() {
+        layer?.cornerRadius = min(18, max(0, round(HajimiAppearance.cardCornerRadius * 0.86)))
         effectiveAppearance.performAsCurrentDrawingAppearance {
             layer?.backgroundColor = (hovered ? HajimiAppearance.selection : HajimiAppearance.mutedPanel).cgColor
-            layer?.borderColor = (hovered ? HajimiAppearance.accent.withAlphaComponent(0.45) : HajimiAppearance.border).cgColor
+            layer?.borderColor = (hovered ? HajimiAppearance.accent.themedAlpha(0.45) : HajimiAppearance.border).cgColor
             layer?.borderWidth = hovered ? 1.0 : 0.8
         }
     }
@@ -710,8 +722,8 @@ final class ProxyNodeCellView: NSTableCellView {
         useButton.isEnabled = !isActive
         self.onUse = onUse
 
-        let palette: [NSColor] = [.systemIndigo, .systemBlue, .systemPurple, .systemTeal,
-                                  .systemPink, .systemOrange]
+        let palette: [NSColor] = [HajimiAppearance.indigoAccent, HajimiAppearance.uploadAccent,
+                                  HajimiAppearance.accent, HajimiAppearance.accentText]
         let hash = policy.name.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) & 0x7fffffff }
         iconTint = isActive ? HajimiAppearance.accent : palette[hash % palette.count]
         latencyTint = policyLatencyColor(latency)
@@ -1046,19 +1058,19 @@ final class GroupCardCollectionItem: NSCollectionViewItem {
             kindTint = HajimiAppearance.accentText
         case .loadBalance:
             kindLabel.stringValue = "负载均衡 · \(group.members.count)\(statusSuffix)"
-            kindTint = .systemIndigo
+            kindTint = HajimiAppearance.indigoAccent
         case .urlTest:
             kindLabel.stringValue = "URL 测速 · \(group.members.count)\(statusSuffix)"
-            kindTint = .systemBlue
+            kindTint = HajimiAppearance.uploadAccent
         case .fallback:
             kindLabel.stringValue = "故障转移 · \(group.members.count)\(statusSuffix)"
-            kindTint = .systemOrange
+            kindTint = HajimiAppearance.statusWarning
         case .smart:
             kindLabel.stringValue = "Smart · \(group.members.count)\(statusSuffix)"
-            kindTint = .systemPurple
+            kindTint = HajimiAppearance.accent
         case .subnet:
             kindLabel.stringValue = "子网策略 · \(group.members.count)\(statusSuffix)"
-            kindTint = .systemTeal
+            kindTint = HajimiAppearance.accentText
         }
         kindLabel.textColor = kindTint
         view.effectiveAppearance.performAsCurrentDrawingAppearance {

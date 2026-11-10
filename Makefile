@@ -132,6 +132,12 @@ native-core:
 build: native-core
 	swift build -c $(BUILD_CONFIG) $(SWIFT_ARCH_FLAGS) -Xcc "-I$(CURDIR)/Sources/HajimiProtocolsCXX/VendorInclude" -Xcc "-I$(CURDIR)/.build/Vendor/OpenSSL/include" -Xcc "-I$(CURDIR)/.build/Vendor/HajimiQUIC/include" -Xcc "-I$(CURDIR)/.build/Vendor/HajimiSSH/include"
 
+build-slim: native-core
+	HAJIMI_MINIMAL_RELEASE=1 swift build -c $(BUILD_CONFIG) $(SWIFT_ARCH_FLAGS) -Xcc "-I$(CURDIR)/Sources/HajimiProtocolsCXX/VendorInclude" -Xcc "-I$(CURDIR)/.build/Vendor/OpenSSL/include" -Xcc "-I$(CURDIR)/.build/Vendor/HajimiQUIC/include" -Xcc "-I$(CURDIR)/.build/Vendor/HajimiSSH/include"
+
+app-slim:
+	HAJIMI_MINIMAL_RELEASE=1 $(MAKE) app
+
 icon:
 	python3 scripts/generate_icon.py
 
@@ -208,6 +214,7 @@ app: build icon
 	cp Resources/Info.plist "$(APP_BUNDLE)/Contents/Info.plist"
 	cp Resources/Hajimi.icns "$(APP_BUNDLE)/Contents/Resources/Hajimi.icns"
 	cp Resources/ThirdPartyNotices.txt "$(APP_BUNDLE)/Contents/Resources/ThirdPartyNotices.txt"
+	cp -R Resources/Themes "$(APP_BUNDLE)/Contents/Resources/Themes"
 	cp "$(BUILD_DIR)/HajimiHelper" "$(APP_BUNDLE)/Contents/Resources/HajimiHelper"
 	chmod +x "$(APP_BUNDLE)/Contents/Resources/HajimiHelper"
 	chmod +x "$(APP_BUNDLE)/Contents/MacOS/$(EXECUTABLE_NAME)"

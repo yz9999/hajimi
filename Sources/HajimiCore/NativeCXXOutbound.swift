@@ -807,6 +807,7 @@ enum NativeCXXOutbound {
                         queue: DispatchQueue, preparedDialer: NativeCXXPreparedTransportDialer? = nil,
                         deadline: TimeInterval = LiteralAddressAttemptClock.now + 12,
                         waitForSetupAcknowledgement: Bool = false,
+                        recordSetup: Bool = true,
                         completion: @escaping (Result<any NativeOutboundByteStream, Error>) -> Void)
         -> NativeCXXConnectionAttempt {
         lock.lock(); let generation = configurationGeneration; lock.unlock()
@@ -817,7 +818,8 @@ enum NativeCXXOutbound {
             lock.lock(); let current = configurationGeneration == generation; lock.unlock()
             return current && ProxyEngine.currentOutboundInterface?.name == interface
                 && (!needsBootstrap || SecureDNSHostResolver.shared.isCurrentGeneration(bootstrapGeneration))
-        }, waitForSetupAcknowledgement: waitForSetupAcknowledgement, completion: completion)
+        }, timing: NativeConnectionSetupTiming(enabled: recordSetup),
+           waitForSetupAcknowledgement: waitForSetupAcknowledgement, completion: completion)
         let dial: (String?, [String]?) -> Void = { connectHost, addresses in
             connectPinned(policy: policy, target: target, plainHTTP: plainHTTP, queue: queue,
                           preparedDialer: preparedDialer, connectHost: connectHost,
@@ -1561,9 +1563,22 @@ private final class NativeCXXDatagramSession: NativeOutboundDatagramSession {
     private var sending = false
     private var cancelled = false
     private var creationAcknowledged = false
+    private var setupCleanedUp = false
+    private var ownerReleased = false
     private let releaseOwner: () -> Void
     private let setupFinished: () -> Void
     private let permitted: () -> Bool
+
+    private func cleanupSetupOnce() {
+        guard !setupCleanedUp else { return }
+        setupCleanedUp = true
+        setupFinished()
+    }
+    private func releaseOwnerOnce() {
+        guard !ownerReleased else { return }
+        ownerReleased = true
+        releaseOwner()
+    }
 
     init(owner: HJCppProtocolClient, queue: DispatchQueue,
          receive: @escaping (RequestTarget, Data) -> Void,
@@ -1588,7 +1603,7 @@ private final class NativeCXXDatagramSession: NativeOutboundDatagramSession {
             self.queue.async {
                 defer { creationObserved?() }
                 self.creationAcknowledged = true
-                if self.cancelled { handle?.cancel(); self.setupFinished(); self.releaseOwner(); return }
+                if self.cancelled { handle?.cancel(); self.cleanupSetupOnce(); self.releaseOwnerOnce(); return }
                 guard self.permitted() else {
                     handle?.cancel(); self.fail(NativeOutboundError.connection("已关闭旧代际或接口的 UDP 会话")); return
                 }
@@ -1636,15 +1651,15 @@ private final class NativeCXXDatagramSession: NativeOutboundDatagramSession {
         cancelled = true; admission.lock(); admissionClosed = true; admission.unlock()
         for item in pending.dropFirst(head) { release(item.0.count) }
         pending.removeAll(); head = 0; handle?.cancel(); handle = nil
-        setupFinished()
-        if creationAcknowledged { releaseOwner() }
+        cleanupSetupOnce()
+        if creationAcknowledged { releaseOwnerOnce() }
     }
     private func fail(_ error: Error) {
         guard !cancelled else { return }; stop(); failureHandler(error)
     }
     func cancel() { queue.async { self.stop() } }
     fileprivate func drainForSelfTest() { queue.sync {} }
-    deinit { handle?.cancel(); setupFinished(); if creationAcknowledged { releaseOwner() } }
+    deinit { handle?.cancel(); cleanupSetupOnce(); if creationAcknowledged { releaseOwnerOnce() } }
 }
 
 /// A request deadline/cancellation gate, separate from the shared C++ client.

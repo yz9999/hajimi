@@ -72,8 +72,8 @@ private final class NetworkConnectivityDiagnosticRowView: NSView {
         }
         statusLabel.textColor = color
         statusBar.fillColor = color
-        statusBadge.fillColor = color.withAlphaComponent(0.11)
-        statusBadge.borderColor = color.withAlphaComponent(0.22)
+        statusBadge.fillColor = color.themedAlpha(0.11)
+        statusBadge.borderColor = color.themedAlpha(0.22)
     }
 }
 

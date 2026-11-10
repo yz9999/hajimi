@@ -190,15 +190,17 @@ final class NativeConnectionSetupTiming {
     private let lock = NSLock()
     private let diagnostics: NetworkPerformanceDiagnostics
     private let clock: () -> UInt64
+    private let enabled: Bool
     private var started: UInt64?
     private var ended = false
     init(diagnostics: NetworkPerformanceDiagnostics = .shared,
-         clock: @escaping () -> UInt64 = NetworkPerformanceDiagnostics.now) {
-        self.diagnostics = diagnostics; self.clock = clock
+         clock: @escaping () -> UInt64 = NetworkPerformanceDiagnostics.now,
+         enabled: Bool = true) {
+        self.diagnostics = diagnostics; self.clock = clock; self.enabled = enabled
     }
     func begin() {
         lock.lock(); defer { lock.unlock() }
-        guard !ended, started == nil else { return }
+        guard enabled, !ended, started == nil else { return }
         started = clock()
     }
     func finish<Value>(result: Result<Value, Error>, permitted: Bool = true) {
@@ -223,6 +225,7 @@ final class NativeConnectionSetupTiming {
             success: outcome == .success)
     }
     private static func isNonNetworkFailure(_ error: Error) -> Bool {
+        if case NativeOutboundError.cancelled = error { return true }
         let value = error as NSError
         if error is NodeConnectionAdmissionError
             || (value.domain == NodeConnectionAdmissionError.errorDomain
@@ -232,6 +235,8 @@ final class NativeConnectionSetupTiming {
                     HJProxyRuntimeError.Code.interfaceUnavailable.rawValue,
                     HJProxyRuntimeError.Code.busy.rawValue, HJProxyRuntimeError.Code.queueLimit.rawValue].contains(value.code)
         }
+        if value.domain == "app.hajimi.cpp-protocol",
+           value.localizedDescription.lowercased().contains("cancelled") { return true }
         return false
     }
 }

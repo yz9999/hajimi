@@ -1,20 +1,22 @@
-// TrustTunnel Outbound Protocol (HTTP/1.1 TLS, HTTP/2 & HTTP/3 QUIC VPN Tunnel)
+// TrustTunnel Outbound Protocol (RFC 9298 MASQUE connect-udp Capsule Protocol, HTTP/1.1 TLS, HTTP/2 & HTTP/3 QUIC VPN Tunnel)
 #include "TrustTunnelProtocol.hpp"
 #include "ProtocolCommon.hpp"
 #include "QUICTransport.hpp"
 #include "../HajimiProtocolCXX/include/HajimiProtocolCXX.h"
 #include <nghttp3/nghttp3.h>
+#include <mutex>
+#include <unordered_map>
 
 namespace hajimi {
 namespace {
 using namespace proto_common;
 using Fields = std::vector<std::pair<std::string, std::string>>;
 
-Buffer encodeVarint(uint64_t value) {
+void appendVarint(Buffer &buf, uint64_t value) {
     uint8_t out[8]{};
     auto res = hajimi_quic_varint_encode(value, out, sizeof(out));
     if (res.status != HAJIMI_CODEC_OK) throw std::runtime_error("Varint encode failed");
-    return Buffer(out, out + res.written);
+    buf.insert(buf.end(), out, out + res.written);
 }
 
 void readQuicVarint(std::shared_ptr<Reader> reader, std::function<void(uint64_t, Error)> completion) {
@@ -31,6 +33,46 @@ void readQuicVarint(std::shared_ptr<Reader> reader, std::function<void(uint64_t,
     });
 }
 
+// RFC 9298 Section 3: URI Template /.well-known/masque/udp/{target_host}/{target_port}/
+// IPv6 literals have colons percent-encoded as %3A per RFC 9298 Section 3.
+std::string buildMasqueUdpPath(const Target &target) {
+    std::string cleanHost = unbracketAndStripZone(target.host);
+    std::string encodedHost;
+    encodedHost.reserve(cleanHost.size() * 3);
+    for (char ch : cleanHost) {
+        if (ch == ':') {
+            encodedHost += "%3A";
+        } else {
+            encodedHost.push_back(ch);
+        }
+    }
+    return "/.well-known/masque/udp/" + encodedHost + "/" + std::to_string(target.port) + "/";
+}
+
+std::string formatAuthorityHostPort(const std::string &host, uint16_t port) {
+    std::string clean = unbracketAndStripZone(host);
+    if (clean.find(':') != std::string::npos) {
+        return "[" + clean + "]:" + std::to_string(port);
+    }
+    return clean + ":" + std::to_string(port);
+}
+
+// RFC 9297 Section 3.2 & RFC 9298 Section 5:
+// HTTP Capsule Protocol DATAGRAM Capsule:
+//   Capsule Type = 0x00 (DATAGRAM, varint)
+//   Capsule Length = varint(1 + payload.size())
+//   Context ID = 0x00 (varint, 1 byte)
+//   UDP Proxying Payload = raw UDP payload bytes
+Buffer encodeMasqueDatagramCapsule(const Buffer &payload) {
+    Buffer capsule;
+    capsule.reserve(10 + payload.size());
+    appendVarint(capsule, 0x00); // Capsule Type: DATAGRAM (0x00)
+    appendVarint(capsule, 1 + uint64_t(payload.size())); // Length: Context ID (1B) + payload
+    appendVarint(capsule, 0x00); // Context ID = 0
+    capsule.insert(capsule.end(), payload.begin(), payload.end());
+    return capsule;
+}
+
 Buffer encodeQpack(const Fields &fields) {
     const auto *memory = nghttp3_mem_default();
     nghttp3_qpack_encoder *encoder = nullptr;
@@ -38,6 +80,7 @@ Buffer encodeQpack(const Fields &fields) {
     nghttp3_buf prefix, block, instructions;
     nghttp3_buf_init(&prefix); nghttp3_buf_init(&block); nghttp3_buf_init(&instructions);
     std::vector<nghttp3_nv> values;
+    values.reserve(fields.size());
     for (auto &field : fields) values.push_back({
         reinterpret_cast<uint8_t *>(const_cast<char *>(field.first.data())),
         reinterpret_cast<uint8_t *>(const_cast<char *>(field.second.data())),
@@ -45,6 +88,7 @@ Buffer encodeQpack(const Fields &fields) {
     int code = nghttp3_qpack_encoder_encode(encoder, &prefix, &block, &instructions, 0, values.data(), values.size());
     Buffer output;
     if (!code) {
+        output.reserve((prefix.last - prefix.pos) + (block.last - block.pos));
         output.insert(output.end(), prefix.pos, prefix.last);
         output.insert(output.end(), block.pos, block.last);
     }
@@ -98,9 +142,10 @@ public:
         if (closed_) { completion("Stream closed"); return; }
         if (data.empty()) { completion({}); return; }
         try {
-            Buffer frame{0x00};
-            auto lenVar = encodeVarint(data.size());
-            frame.insert(frame.end(), lenVar.begin(), lenVar.end());
+            Buffer frame;
+            frame.reserve(9 + data.size());
+            frame.push_back(0x00);
+            appendVarint(frame, data.size());
             frame.insert(frame.end(), data.begin(), data.end());
             writer_->write(std::move(frame), std::move(completion));
         } catch (const std::exception &e) {
@@ -130,7 +175,7 @@ public:
         writer_->close();
         reader_->close();
         if (stream_) { stream_->close(); stream_.reset(); }
-        if (connection_) { connection_->close(); connection_.reset(); }
+        connection_.reset();
         buffered_.clear();
         if (auto cb = std::exchange(pendingRead_, {})) cb({}, true, "Stream closed");
     }
@@ -200,24 +245,104 @@ private:
     bool closed_ = false, eof_ = false;
 };
 
+// Pooled HTTP/3 QUIC connection manager for TrustTunnel so concurrent TCP/UDP
+// streams multiplex over a single established HTTP/3 connection.
+struct PooledTrustTunnelQUIC : std::enable_shared_from_this<PooledTrustTunnelQUIC> {
+    std::shared_ptr<TransportFactory> factory;
+    std::shared_ptr<quic::Connection> connection;
+    std::vector<std::function<void(std::shared_ptr<quic::Connection>, Error)>> waiters;
+    bool connecting = false;
+    bool settingsSent = false;
+    void closeEntry() {
+        connecting = false;
+        settingsSent = false;
+        if (connection) {
+            connection->close();
+            connection.reset();
+        }
+        auto pending = std::move(waiters);
+        waiters.clear();
+        for (auto &w : pending) w(nullptr, "TrustTunnel QUIC client reset");
+    }
+};
+
+std::mutex &trustTunnelQuicPoolMutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::unordered_map<std::string, std::shared_ptr<PooledTrustTunnelQUIC>> &trustTunnelQuicPool() {
+    static std::unordered_map<std::string, std::shared_ptr<PooledTrustTunnelQUIC>> pool;
+    return pool;
+}
+
+std::string trustTunnelPoolKey(const Node &node, const std::string &username, const std::shared_ptr<TransportFactory> &factory) {
+    return std::to_string(reinterpret_cast<uintptr_t>(factory.get())) + "|" +
+           node.dialHost() + ":" + std::to_string(node.port) + "|" +
+           node.interfaceName + "|" + username + "|" + node.option("sni");
+}
+
+void acquireTrustTunnelQUIC(const Node &node, const std::string &username,
+                            std::shared_ptr<TransportFactory> factory,
+                            std::function<void(std::shared_ptr<quic::Connection>, Error)> completion) {
+    std::string key = trustTunnelPoolKey(node, username, factory);
+    std::shared_ptr<PooledTrustTunnelQUIC> entry;
+    {
+        std::lock_guard<std::mutex> lock(trustTunnelQuicPoolMutex());
+        if (trustTunnelQuicPool().size() > 64) trustTunnelQuicPool().clear();
+        auto &slot = trustTunnelQuicPool()[key];
+        if (!slot) {
+            slot = std::make_shared<PooledTrustTunnelQUIC>();
+            slot->factory = factory;
+        }
+        entry = slot;
+    }
+    if (entry->connection && !entry->connection->isClosed()) {
+        completion(entry->connection, {});
+        return;
+    }
+    entry->connection.reset();
+    entry->settingsSent = false;
+    entry->waiters.push_back(std::move(completion));
+    if (entry->connecting) return;
+    entry->connecting = true;
+
+    quic::Connection::connect(node, factory, [entry](std::shared_ptr<quic::Connection> conn, Error err) {
+        entry->connecting = false;
+        if (!err.empty() || !conn || conn->isClosed()) {
+            if (conn) conn->close();
+            auto pending = std::move(entry->waiters);
+            entry->waiters.clear();
+            Error finalErr = err.empty() ? Error("TrustTunnel QUIC connection failed") : err;
+            for (auto &w : pending) w(nullptr, finalErr);
+            return;
+        }
+        entry->connection = conn;
+        if (!entry->settingsSent) {
+            entry->settingsSent = true;
+            // Open HTTP/3 control stream (uni stream type 0x00 + SETTINGS frame 0x04 with RFC 9220/9297 SETTINGS_ENABLE_CONNECT_PROTOCOL = 0x08 : 1)
+            conn->open(true, [conn](std::shared_ptr<Stream> ctrl, Error ctrlErr) {
+                if (!ctrlErr.empty() || !ctrl) return;
+                Buffer settings{0x00, 0x04, 0x02, 0x08, 0x01};
+                ctrl->write(std::move(settings), [](Error) {});
+            });
+        }
+        auto pending = std::move(entry->waiters);
+        entry->waiters.clear();
+        for (auto &w : pending) w(conn, {});
+    });
+}
+
 void connectTrustTunnelQUIC(const Node &node, const Target &target,
                             const std::string &username, const std::string &password,
                             std::shared_ptr<TransportFactory> factory, StreamCallback completion) {
-    quic::Connection::connect(node, factory, [node, target, username, password, completion = std::move(completion)](std::shared_ptr<quic::Connection> connection, Error err) mutable {
+    acquireTrustTunnelQUIC(node, username, factory, [node, target, username, password, completion = std::move(completion)](std::shared_ptr<quic::Connection> connection, Error err) mutable {
         if (!err.empty() || !connection || connection->isClosed()) {
-            if (connection) connection->close();
             completion(nullptr, err.empty() ? "TrustTunnel QUIC connection failed" : err);
             return;
         }
-        // Open HTTP/3 control stream (uni stream type 0x00 + SETTINGS frame 0x04)
-        connection->open(true, [connection](std::shared_ptr<Stream> ctrl, Error ctrlErr) {
-            if (!ctrlErr.empty() || !ctrl) return;
-            Buffer settings{0x00, 0x04, 0x00};
-            ctrl->write(std::move(settings), [](Error) {});
-        });
-        connection->open(false, [connection, target, username, password, completion = std::move(completion)](std::shared_ptr<Stream> stream, Error openErr) mutable {
+        connection->open(false, [node, connection, target, username, password, completion = std::move(completion)](std::shared_ptr<Stream> stream, Error openErr) mutable {
             if (!openErr.empty() || !stream || connection->isClosed()) {
-                connection->close();
                 completion(nullptr, openErr.empty() ? "TrustTunnel QUIC stream open failed" : openErr);
                 return;
             }
@@ -227,45 +352,58 @@ void connectTrustTunnelQUIC(const Node &node, const Target &target,
                 cred.insert(cred.end(), password.begin(), password.end());
                 std::string auth = "Basic " + crypto::base64Encode(cred);
 
-                std::string authority = target.udp
-                    ? "_trusttunnel_udp_:443"
-                    : ((target.host.find(':') != std::string::npos && target.host.front() != '[')
-                        ? ("[" + target.host + "]:" + std::to_string(target.port))
-                        : (target.host + ":" + std::to_string(target.port)));
+                Fields headers;
+                if (target.udp) {
+                    // RFC 9298 Extended CONNECT for Proxying UDP in HTTP/3
+                    std::string proxyAuthority = formatAuthorityHostPort(
+                        node.option("sni").empty() ? node.host : node.option("sni"), node.port);
+                    headers = {
+                        {":method", "CONNECT"},
+                        {":protocol", "connect-udp"},
+                        {":scheme", "https"},
+                        {":authority", proxyAuthority},
+                        {":path", buildMasqueUdpPath(target)},
+                        {"capsule-protocol", "?1"},
+                        {"proxy-authorization", auth},
+                        {"user-agent", "TrustTunnel-Client/1.0"}
+                    };
+                } else {
+                    std::string authority = formatAuthorityHostPort(target.host, target.port);
+                    headers = {
+                        {":method", "CONNECT"},
+                        {":authority", authority},
+                        {"proxy-authorization", auth},
+                        {"user-agent", "TrustTunnel-Client/1.0"}
+                    };
+                }
 
-                Buffer qpackBlock = encodeQpack({
-                    {":method", "CONNECT"},
-                    {":authority", authority},
-                    {"proxy-authorization", auth},
-                    {"user-agent", "TrustTunnel-Client/1.0"}
-                });
+                Buffer qpackBlock = encodeQpack(headers);
                 Buffer h3Req{0x01};
-                auto lenVar = encodeVarint(qpackBlock.size());
-                h3Req.insert(h3Req.end(), lenVar.begin(), lenVar.end());
+                appendVarint(h3Req, qpackBlock.size());
                 h3Req.insert(h3Req.end(), qpackBlock.begin(), qpackBlock.end());
 
                 auto reader = std::make_shared<Reader>(stream);
                 stream->write(std::move(h3Req), [connection, stream, reader, completion = std::move(completion)](Error writeErr) mutable {
                     if (!writeErr.empty() || connection->isClosed()) {
-                        connection->close();
+                        stream->close();
                         completion(nullptr, writeErr.empty() ? "TrustTunnel QUIC cancelled" : writeErr);
                         return;
                     }
                     readQuicVarint(reader, [connection, stream, reader, completion = std::move(completion)](uint64_t fType, Error tErr) mutable {
                         if (!tErr.empty() || fType != 0x01) {
-                            connection->close();
+                            stream->close();
                             completion(nullptr, tErr.empty() ? "Expected HTTP/3 HEADERS frame" : tErr);
                             return;
                         }
                         readQuicVarint(reader, [connection, stream, reader, completion = std::move(completion)](uint64_t fLen, Error lErr) mutable {
                             if (!lErr.empty() || fLen > 65536) {
-                                connection->close();
+                                stream->close();
                                 completion(nullptr, lErr.empty() ? "Oversized HTTP/3 HEADERS frame" : lErr);
                                 return;
                             }
                             reader->exactly(static_cast<size_t>(fLen), [connection, stream, reader, completion = std::move(completion)](Buffer block, Error bErr) mutable {
                                 if (!bErr.empty()) {
-                                    connection->close();
+                                    stream->close();
                                     completion(nullptr, bErr);
                                     return;
                                 }
@@ -276,14 +414,14 @@ void connectTrustTunnelQUIC(const Node &node, const Target &target,
                                         if (f.first == ":status") status = f.second;
                                     }
                                     if (status != "200") {
-                                        connection->close();
+                                        stream->close();
                                         completion(nullptr, "TrustTunnel HTTP/3 CONNECT rejected");
                                         return;
                                     }
                                     connection->authenticated();
                                     completion(std::make_shared<HTTP3ConnectStream>(connection, stream, reader), {});
                                 } catch (const std::exception &e) {
-                                    connection->close();
+                                    stream->close();
                                     completion(nullptr, e.what());
                                 }
                             });
@@ -291,7 +429,7 @@ void connectTrustTunnelQUIC(const Node &node, const Target &target,
                     });
                 });
             } catch (const std::exception &e) {
-                connection->close();
+                stream->close();
                 completion(nullptr, e.what());
             }
         });
@@ -299,7 +437,7 @@ void connectTrustTunnelQUIC(const Node &node, const Target &target,
 }
 
 // ============================================================================
-// 3. TRUSTTUNNEL PROTOCOL
+// 3. TRUSTTUNNEL PROTOCOL (RFC 9298 MASQUE connect-udp & HTTP CONNECT)
 // ============================================================================
 
 Error parseTrustTunnelConfig(const Node &node, std::string &username, std::string &password) {
@@ -325,13 +463,11 @@ Error parseTrustTunnelConfig(const Node &node, std::string &username, std::strin
     return {};
 }
 
-
-
-// Stream-backed UDP datagram session for TrustTunnel
-class StreamPacketDatagram final : public Datagram, public std::enable_shared_from_this<StreamPacketDatagram> {
+// RFC 9298 (Proxying UDP in HTTP) Capsule Protocol Datagram Session
+class MasqueCapsuleDatagram final : public Datagram, public std::enable_shared_from_this<MasqueCapsuleDatagram> {
 public:
-    StreamPacketDatagram(Node node, std::shared_ptr<TransportFactory> factory,
-                         std::function<void(const Node &, const Target &, std::shared_ptr<TransportFactory>, StreamCallback)> dialer)
+    MasqueCapsuleDatagram(Node node, std::shared_ptr<TransportFactory> factory,
+                          std::function<void(const Node &, const Target &, std::shared_ptr<TransportFactory>, StreamCallback)> dialer)
         : node_(std::move(node)), factory_(std::move(factory)), dialer_(std::move(dialer)) {}
 
     void send(Target target, Buffer data, WriteCallback completion) override {
@@ -340,18 +476,14 @@ public:
             completion("Invalid UDP datagram target or payload size");
             return;
         }
-        Buffer packet;
+        Buffer capsule;
         try {
-            packet = socksAddress(target);
-            appendBE16(packet, uint16_t(data.size()));
-            packet.insert(packet.end(), data.begin(), data.end());
+            capsule = encodeMasqueDatagramCapsule(data);
         } catch (const std::exception &e) {
             completion(e.what());
             return;
         }
-
-        auto self = shared_from_this();
-        sendPacketWithRetry(target, std::move(packet), std::move(completion), true);
+        sendCapsuleWithRetry(std::move(target), std::move(capsule), std::move(completion), true);
     }
 
     void start(PacketCallback receive, WriteCallback failure) override {
@@ -374,18 +506,18 @@ private:
         else if (s) s->close();
     }
 
-    void sendPacketWithRetry(Target target, Buffer packet, WriteCallback completion, bool allowRetry) {
+    void sendCapsuleWithRetry(Target target, Buffer capsule, WriteCallback completion, bool allowRetry) {
         auto self = shared_from_this();
-        ensureStream(target, [self, target, packet = std::move(packet), completion = std::move(completion), allowRetry](Error err) mutable {
+        ensureStream(target, [self, target, capsule = std::move(capsule), completion = std::move(completion), allowRetry](Error err) mutable {
             if (!err.empty()) { completion(err); return; }
             if (!self->stream_) { completion("UDP stream unavailable"); return; }
             auto active = self->stream_;
             const bool wasUsed = self->streamUsed_;
             self->streamUsed_ = true;
-            active->write(packet, [self, target, packet, completion = std::move(completion), active, wasUsed, allowRetry](Error writeErr) mutable {
+            active->write(capsule, [self, target, capsule, completion = std::move(completion), active, wasUsed, allowRetry](Error writeErr) mutable {
                 if (!writeErr.empty() && !self->closed_ && wasUsed && allowRetry) {
                     if (self->stream_ == active) self->resetActiveStream();
-                    self->sendPacketWithRetry(std::move(target), std::move(packet), std::move(completion), false);
+                    self->sendCapsuleWithRetry(std::move(target), std::move(capsule), std::move(completion), false);
                     return;
                 }
                 completion(std::move(writeErr));
@@ -393,14 +525,21 @@ private:
         });
     }
 
-    void ensureStream(const Target &initialTarget, WriteCallback ready) {
-        if (stream_) { ready({}); return; }
+    void ensureStream(const Target &target, WriteCallback ready) {
+        if (stream_ && boundTarget_.host == target.host && boundTarget_.port == target.port) {
+            ready({});
+            return;
+        }
+        if (stream_ && (boundTarget_.host != target.host || boundTarget_.port != target.port)) {
+            resetActiveStream();
+        }
         pendingReady_.push_back(std::move(ready));
         if (connecting_) return;
         connecting_ = true;
 
-        Target udpTarget = initialTarget;
+        Target udpTarget = target;
         udpTarget.udp = true;
+        boundTarget_ = udpTarget;
         auto self = shared_from_this();
         dialer_(node_, udpTarget, factory_, [self](std::shared_ptr<Stream> stream, Error err) {
             self->connecting_ = false;
@@ -415,77 +554,60 @@ private:
             self->reader_ = std::make_shared<Reader>(self->stream_);
             self->streamUsed_ = false;
             for (auto &cb : callbacks) cb({});
-            self->readLoop();
+            self->readCapsuleLoop();
         });
     }
 
-    void readLoop() {
+    // RFC 9297 Section 3.2 Capsule Stream Reader:
+    //   Capsule {
+    //     Capsule Type (i),
+    //     Capsule Length (i),
+    //     Capsule Value (..),
+    //   }
+    // For Capsule Type 0x00 (DATAGRAM, RFC 9298 Section 5):
+    //   Datagram Capsule {
+    //     Context ID (i) = 0x00,
+    //     UDP Proxying Payload (..),
+    //   }
+    void readCapsuleLoop() {
         if (closed_ || !reader_) return;
         auto self = shared_from_this();
         auto activeReader = reader_;
-        activeReader->exactly(1, [self, activeReader](Buffer atyp, Error err) {
+        readQuicVarint(activeReader, [self, activeReader](uint64_t capsuleType, Error typeErr) {
             if (self->closed_ || self->reader_ != activeReader) return;
-            if (!err.empty()) {
+            if (!typeErr.empty()) {
                 const bool wasUsed = self->streamUsed_;
                 self->resetActiveStream();
-                if (self->failure_ && err != "EOF" && !wasUsed) self->failure_(err);
+                if (self->failure_ && typeErr != "EOF" && !wasUsed) self->failure_(typeErr);
                 return;
             }
-            size_t addrTail = 0;
-            if (atyp[0] == 1) addrTail = 6;
-            else if (atyp[0] == 4) addrTail = 18;
-            else if (atyp[0] == 3) {
-                self->reader_->exactly(1, [self](Buffer dlen, Error derr) {
-                    if (self->closed_ || !derr.empty() || dlen.empty() || !dlen[0]) {
-                        if (self->failure_ && !derr.empty()) self->failure_(derr);
-                        return;
-                    }
-                    size_t rest = size_t(dlen[0]) + 4;
-                    self->reader_->exactly(rest, [self, dlen](Buffer tail, Error terr) {
-                        if (self->closed_ || !terr.empty()) {
-                            if (self->failure_ && !terr.empty()) self->failure_(terr);
-                            return;
-                        }
-                        Buffer full{3, dlen[0]};
-                        full.insert(full.end(), tail.begin(), tail.begin() + dlen[0] + 2);
-                        uint16_t payLen = readBE16(tail.data() + dlen[0] + 2);
-                        self->readPayload(std::move(full), payLen);
-                    });
-                });
-                return;
-            } else {
-                if (self->failure_) self->failure_("Invalid UDP address family");
-                return;
-            }
-            self->reader_->exactly(addrTail + 2, [self, atyp](Buffer tail, Error terr) {
-                if (self->closed_ || !terr.empty()) {
-                    if (self->failure_ && !terr.empty()) self->failure_(terr);
+            readQuicVarint(activeReader, [self, activeReader, capsuleType](uint64_t capsuleLen, Error lenErr) {
+                if (self->closed_ || self->reader_ != activeReader) return;
+                if (!lenErr.empty() || capsuleLen > 65536) {
+                    if (self->failure_) self->failure_(lenErr.empty() ? Error("Oversized RFC 9298 capsule") : lenErr);
                     return;
                 }
-                Buffer full{atyp[0]};
-                full.insert(full.end(), tail.begin(), tail.end() - 2);
-                uint16_t payLen = readBE16(tail.data() + tail.size() - 2);
-                self->readPayload(std::move(full), payLen);
+                activeReader->exactly(static_cast<size_t>(capsuleLen), [self, activeReader, capsuleType](Buffer value, Error valErr) {
+                    if (self->closed_ || self->reader_ != activeReader) return;
+                    if (!valErr.empty()) {
+                        if (self->failure_) self->failure_(valErr);
+                        return;
+                    }
+                    if (capsuleType == 0x00 && !value.empty()) {
+                        uint64_t contextId = 0;
+                        auto dec = hajimi_quic_varint_decode(value.data(), value.size(), &contextId);
+                        if (dec.status != HAJIMI_CODEC_OK || dec.consumed > value.size()) {
+                            if (self->failure_) self->failure_("Invalid RFC 9298 Context ID varint");
+                            return;
+                        }
+                        if (contextId == 0) {
+                            Buffer payload(value.begin() + dec.consumed, value.end());
+                            if (self->receive_) self->receive_(self->boundTarget_, std::move(payload));
+                        }
+                    }
+                    self->readCapsuleLoop();
+                });
             });
-        });
-    }
-
-    void readPayload(Buffer encodedAddress, uint16_t payLen) {
-        auto self = shared_from_this();
-        reader_->exactly(payLen, [self, encodedAddress = std::move(encodedAddress)](Buffer payload, Error err) mutable {
-            if (self->closed_) return;
-            if (!err.empty()) {
-                if (self->failure_) self->failure_(err);
-                return;
-            }
-            try {
-                size_t consumed = 0;
-                Target source = parseSocksAddress(encodedAddress, consumed);
-                if (self->receive_) self->receive_(source, std::move(payload));
-                self->readLoop();
-            } catch (const std::exception &e) {
-                if (self->failure_) self->failure_(e.what());
-            }
         });
     }
 
@@ -494,6 +616,7 @@ private:
     std::function<void(const Node &, const Target &, std::shared_ptr<TransportFactory>, StreamCallback)> dialer_;
     std::shared_ptr<Stream> stream_;
     std::shared_ptr<Reader> reader_;
+    Target boundTarget_{};
     std::vector<WriteCallback> pendingReady_;
     PacketCallback receive_;
     WriteCallback failure_;
@@ -504,6 +627,37 @@ private:
 
 } // namespace
 
+void resetTrustTunnelClients() {
+    std::vector<std::shared_ptr<PooledTrustTunnelQUIC>> entries;
+    {
+        std::lock_guard<std::mutex> lock(trustTunnelQuicPoolMutex());
+        for (auto &kv : trustTunnelQuicPool()) {
+            if (kv.second) entries.push_back(kv.second);
+        }
+        trustTunnelQuicPool().clear();
+    }
+    for (auto &e : entries) e->closeEntry();
+}
+
+void resetTrustTunnelClient(const std::shared_ptr<TransportFactory> &factory) {
+    if (!factory) {
+        resetTrustTunnelClients();
+        return;
+    }
+    std::vector<std::shared_ptr<PooledTrustTunnelQUIC>> entries;
+    {
+        std::lock_guard<std::mutex> lock(trustTunnelQuicPoolMutex());
+        for (auto it = trustTunnelQuicPool().begin(); it != trustTunnelQuicPool().end();) {
+            if (!it->second || it->second->factory == factory) {
+                if (it->second) entries.push_back(it->second);
+                it = trustTunnelQuicPool().erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto &e : entries) e->closeEntry();
+}
 
 Error validateTrustTunnel(const Node &node, bool) {
     std::string user, pass;
@@ -526,7 +680,7 @@ void connectTrustTunnel(const Node &node, const Target &target,
         tls.alpn.push_back("http/1.1");
     }
 
-    factory->tcp(node, tls, [factory, username = std::move(username), password = std::move(password),
+    factory->tcp(node, tls, [node, factory, username = std::move(username), password = std::move(password),
                              target, rawCompletion = std::move(completion)]
                  (std::shared_ptr<Stream> raw, Error dialErr) mutable {
         auto doneFlag = std::make_shared<bool>(false);
@@ -556,28 +710,38 @@ void connectTrustTunnel(const Node &node, const Target &target,
             cred.insert(cred.end(), password.begin(), password.end());
             std::string auth = crypto::base64Encode(cred);
 
-            std::string authority = target.udp
-                ? "_trusttunnel_udp_:443"
-                : ((target.host.find(':') != std::string::npos && target.host.front() != '[')
-                    ? ("[" + target.host + "]:" + std::to_string(target.port))
-                    : (target.host + ":" + std::to_string(target.port)));
-
-            std::string request = "CONNECT " + authority + " HTTP/1.1\r\n"
-                "Host: " + authority + "\r\n"
-                "Proxy-Authorization: Basic " + auth + "\r\n"
-                "User-Agent: TrustTunnel-Client/1.0\r\n"
-                "Proxy-Connection: keep-alive\r\n\r\n";
+            std::string request;
+            if (target.udp) {
+                // RFC 9298 Section 3.1 HTTP/1.1 Upgrade to connect-udp with Capsule-Protocol: ?1
+                std::string proxyHost = formatAuthorityHostPort(
+                    node.option("sni").empty() ? node.host : node.option("sni"), node.port);
+                std::string path = buildMasqueUdpPath(target);
+                request = "GET " + path + " HTTP/1.1\r\n"
+                    "Host: " + proxyHost + "\r\n"
+                    "Connection: Upgrade\r\n"
+                    "Upgrade: connect-udp\r\n"
+                    "Capsule-Protocol: ?1\r\n"
+                    "Proxy-Authorization: Basic " + auth + "\r\n"
+                    "User-Agent: TrustTunnel-Client/1.0\r\n\r\n";
+            } else {
+                std::string authority = formatAuthorityHostPort(target.host, target.port);
+                request = "CONNECT " + authority + " HTTP/1.1\r\n"
+                    "Host: " + authority + "\r\n"
+                    "Proxy-Authorization: Basic " + auth + "\r\n"
+                    "User-Agent: TrustTunnel-Client/1.0\r\n"
+                    "Proxy-Connection: keep-alive\r\n\r\n";
+            }
 
             auto reader = std::make_shared<Reader>(raw);
             raw->write(Buffer(request.begin(), request.end()),
-                       [raw, reader, completion = std::move(completion)](Error writeErr) mutable {
+                       [raw, reader, target, completion = std::move(completion)](Error writeErr) mutable {
                 if (!writeErr.empty()) {
                     raw->close();
                     completion(nullptr, writeErr);
                     return;
                 }
                 reader->until(Buffer{'\r', '\n', '\r', '\n'}, 16384,
-                              [raw, reader, completion = std::move(completion)](Buffer header, Error readErr) mutable {
+                              [raw, reader, target, completion = std::move(completion)](Buffer header, Error readErr) mutable {
                     if (!readErr.empty()) {
                         raw->close();
                         completion(nullptr, readErr);
@@ -586,7 +750,10 @@ void connectTrustTunnel(const Node &node, const Target &target,
                     std::string statusLine(header.begin(), header.end());
                     auto eol = statusLine.find("\r\n");
                     if (eol != std::string::npos) statusLine.resize(eol);
-                    if (statusLine.find(" 200") == std::string::npos) {
+                    const bool accepted = target.udp
+                        ? (statusLine.find(" 101") != std::string::npos || statusLine.find(" 200") != std::string::npos)
+                        : (statusLine.find(" 200") != std::string::npos);
+                    if (!accepted) {
                         raw->close();
                         completion(nullptr, "TrustTunnel CONNECT rejected by endpoint");
                         return;
@@ -605,7 +772,7 @@ void makeTrustTunnelDatagram(const Node &node, std::shared_ptr<TransportFactory>
                              DatagramCallback completion) {
     auto err = validateTrustTunnel(node, true);
     if (!err.empty()) { completion(nullptr, err); return; }
-    completion(std::make_shared<StreamPacketDatagram>(node, std::move(factory), connectTrustTunnel), {});
+    completion(std::make_shared<MasqueCapsuleDatagram>(node, std::move(factory), connectTrustTunnel), {});
 }
 
 bool trustTunnelProtocolSelfTest() {
@@ -615,6 +782,12 @@ bool trustTunnelProtocolSelfTest() {
         ttNode.parameters["username"] = "bob";
         ttNode.parameters["password"] = "pass456";
         if (!validateTrustTunnel(ttNode, true).empty()) return false;
+
+        // Verify RFC 9298 URI template and Capsule encoding
+        if (buildMasqueUdpPath(Target{"8.8.8.8", 53, true, false}) != "/.well-known/masque/udp/8.8.8.8/53/") return false;
+        if (buildMasqueUdpPath(Target{"[2001:4860:4860::8888]", 53, true, false}) != "/.well-known/masque/udp/2001%3A4860%3A4860%3A%3A8888/53/") return false;
+        Buffer cap = encodeMasqueDatagramCapsule({0xde, 0xad, 0xbe, 0xef});
+        if (cap != Buffer{0x00, 0x05, 0x00, 0xde, 0xad, 0xbe, 0xef}) return false;
 
         // 1. Verify PrefixedStream OrderedWriter serializes concurrent writes
         struct SingleFlightStream final : public Stream {
@@ -655,23 +828,14 @@ bool trustTunnelProtocolSelfTest() {
         if (!err1.empty() || !err2.empty() || raw->writeCalls != 2) return false;
         prefixed->close();
 
-        // 2. Verify StreamPacketDatagram auto-reconnects when a previously used stream fails on write
-        size_t dialCount = 0;
-        auto dgram = std::make_shared<StreamPacketDatagram>(
-            ttNode, nullptr,
-            [&](const Node &, const Target &, std::shared_ptr<TransportFactory>, StreamCallback cb) {
-                ++dialCount;
-                auto s = std::make_shared<SingleFlightStream>();
-                s->failAfterFirstWrite = (dialCount == 1);
-                cb(s, {});
-                s->flushAll();
-            });
-        // Dialer above flushes synchronously on creation; let's use an immediate-complete stream for datagram test
+        // 2. Verify MasqueCapsuleDatagram auto-reconnects when a previously used stream fails on write
         struct ImmediateStream final : public Stream {
             size_t writes = 0;
             bool failSecondWrite = false;
-            void write(Buffer, WriteCallback cb) override {
+            Buffer lastWritten;
+            void write(Buffer data, WriteCallback cb) override {
                 ++writes;
+                lastWritten = std::move(data);
                 if (failSecondWrite && writes >= 2) {
                     cb("Simulated NAT rebinding broken pipe");
                     return;
@@ -682,18 +846,25 @@ bool trustTunnelProtocolSelfTest() {
             void close() override {}
         };
         size_t reconnectDials = 0;
-        auto autoRetryDgram = std::make_shared<StreamPacketDatagram>(
+        std::shared_ptr<ImmediateStream> lastStream;
+        auto autoRetryDgram = std::make_shared<MasqueCapsuleDatagram>(
             ttNode, nullptr,
-            [&](const Node &, const Target &, std::shared_ptr<TransportFactory>, StreamCallback cb) {
+            [&](const Node &, const Target &t, std::shared_ptr<TransportFactory>, StreamCallback cb) {
+                if (!t.udp || t.host != "8.8.8.8" || t.port != 53) {
+                    cb(nullptr, "Unexpected target");
+                    return;
+                }
                 ++reconnectDials;
                 auto s = std::make_shared<ImmediateStream>();
                 s->failSecondWrite = (reconnectDials == 1);
+                lastStream = s;
                 cb(s, {});
             });
         Error pktErr1 = "unset", pktErr2 = "unset";
         autoRetryDgram->send(Target{"8.8.8.8", 53, true, false}, {0xaa, 0xbb}, [&](Error e) { pktErr1 = std::move(e); });
         autoRetryDgram->send(Target{"8.8.8.8", 53, true, false}, {0xcc, 0xdd}, [&](Error e) { pktErr2 = std::move(e); });
         if (!pktErr1.empty() || !pktErr2.empty() || reconnectDials != 2) return false;
+        if (!lastStream || lastStream->lastWritten != Buffer{0x00, 0x03, 0x00, 0xcc, 0xdd}) return false;
         autoRetryDgram->close();
 
         return true;

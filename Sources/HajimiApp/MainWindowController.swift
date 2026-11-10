@@ -63,7 +63,7 @@ private enum HajimiTheme {
     static func eyebrowPill(_ text: String) -> NSView {
         let pill = HajimiSurfaceView(
             fill: HajimiAppearance.selection,
-            border: HajimiAppearance.accent.withAlphaComponent(0.24),
+            border: HajimiAppearance.accent.themedAlpha(0.24),
             cornerRadius: 6
         )
         pill.translatesAutoresizingMaskIntoConstraints = false
@@ -90,8 +90,8 @@ private enum HajimiTheme {
 
     static func iconTile(symbol: String, color: NSColor, size: CGFloat = 38, symbolSize: CGFloat = 17) -> HajimiSurfaceView {
         let badge = HajimiSurfaceView(
-            fill: color.withAlphaComponent(0.13),
-            border: color.withAlphaComponent(0.25),
+            fill: color.themedAlpha(0.13),
+            border: color.themedAlpha(0.25),
             cornerRadius: min(12, round(size * 0.29))
         )
         badge.translatesAutoresizingMaskIntoConstraints = false
@@ -185,217 +185,226 @@ struct SystemProxyListenerPlan {
 
 final class MainWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate,
                                   NSCollectionViewDataSource, NSCollectionViewDelegateFlowLayout, NSMenuDelegate {
-    private let engine = ProxyEngine()
-    private let configurationStore: ConfigurationStore
-    private let systemProxy: SystemProxyManager
-    private let enhancedMode: EnhancedModeManager
-    private let protocolAdapters: ProtocolAdapterManager
-    private let surgeRuleSets: SurgeRuleSetManager
-    private let subscriptions: SubscriptionManager
-    private let helperClient = PrivilegedHelperClient()
+    let engine = ProxyEngine()
+    let configurationStore: ConfigurationStore
+    let systemProxy: SystemProxyManager
+    let enhancedMode: EnhancedModeManager
+    let protocolAdapters: ProtocolAdapterManager
+    let surgeRuleSets: SurgeRuleSetManager
+    let subscriptions: SubscriptionManager
+    let helperClient = PrivilegedHelperClient()
 
-    private var profile: Profile
-    private var launchProfilePlan: LaunchProfilePlan
-    private var engineStatus: ProxyEngineStatus = .stopped
-    private let listenerLifecycle = RuntimeLifecycle()
-    private var listenerTicket: RuntimeLifecycle.Ticket?
-    private let enhancedRequestIntent = RuntimeLifecycle()
-    private let launchRestoreIntent = RuntimeLifecycle()
-    private var launchRestoreTicket: RuntimeLifecycle.Ticket?
-    private lazy var networkRuntime = AppNetworkRuntime(engine: engine, enhancedMode: enhancedMode,
+    var profile: Profile
+    var launchProfilePlan: LaunchProfilePlan
+    var engineStatus: ProxyEngineStatus = .stopped
+    let listenerLifecycle = RuntimeLifecycle()
+    var listenerTicket: RuntimeLifecycle.Ticket?
+    let enhancedRequestIntent = RuntimeLifecycle()
+    let launchRestoreIntent = RuntimeLifecycle()
+    var launchRestoreTicket: RuntimeLifecycle.Ticket?
+    lazy var networkRuntime = AppNetworkRuntime(engine: engine, enhancedMode: enhancedMode,
         listenerLifecycle: listenerLifecycle)
-    private var activeConnectionIDs = Set<UUID>()
-    private var totalConnections = 0
-    private var uploaded = 0
-    private var downloaded = 0
-    private var enhancedActiveConnections = 0
-    private var enhancedTotalConnections = 0
-    private var enhancedUploaded: UInt64 = 0
-    private var enhancedDownloaded: UInt64 = 0
+    var activeConnectionIDs = Set<UUID>()
+    var totalConnections = 0
+    var uploaded = 0
+    var downloaded = 0
+    var enhancedActiveConnections = 0
+    var enhancedTotalConnections = 0
+    var enhancedUploaded: UInt64 = 0
+    var enhancedDownloaded: UInt64 = 0
 
     /// One meter per source. The in-process engine reports on every flush and
     /// the helper once every few seconds, so a single meter over the summed
     /// counters would turn the helper's contribution into a spike every poll —
     /// and would read one source restarting as the other losing traffic.
-    private var engineUploadRate = TrafficRateMeter(aggregationWindow: 0.5)
-    private var engineDownloadRate = TrafficRateMeter(aggregationWindow: 0.5)
-    private var enhancedUploadRate = TrafficRateMeter(aggregationWindow: 0.5)
-    private var enhancedDownloadRate = TrafficRateMeter(aggregationWindow: 0.5)
-    private var statisticsUpdateScheduled = false
+    var engineUploadRate = TrafficRateMeter(aggregationWindow: 0.5)
+    var engineDownloadRate = TrafficRateMeter(aggregationWindow: 0.5)
+    var enhancedUploadRate = TrafficRateMeter(aggregationWindow: 0.5)
+    var enhancedDownloadRate = TrafficRateMeter(aggregationWindow: 0.5)
+    var statisticsUpdateScheduled = false
 
-    private let sidebar = HajimiSurfaceView(fill: HajimiAppearance.sidebar, cornerRadius: 0)
-    private let contentContainer = NSView()
-    private let dashboardView = NSView()
-    private let nativeTrafficView = HJTrafficDashboardView(frame: .zero)
-    private let networkExtensionController = HJNetworkExtensionController()
-    private let policiesView = NSView()
-    private let rulesView = NSView()
-    private let profileView = NSView()
-    private let aboutView = NSView()
-    private let settingsView = NSView()
-    private let settingsOverviewView = NSView()
-    private let dnsSettingsView = NSView()
+    let sidebar = HajimiSurfaceView(fill: HajimiAppearance.sidebar, cornerRadius: 0)
+    let contentContainer = NSView()
+    let dashboardView = NSView()
+    let nativeTrafficView = HJTrafficDashboardView(frame: .zero)
+    let networkExtensionController = HJNetworkExtensionController()
+    let policiesView = NSView()
+    let rulesView = NSView()
+    let profileView = NSView()
+    let aboutView = NSView()
+    let settingsView = NSView()
+    let settingsOverviewView = NSView()
+    let dnsSettingsView = NSView()
+    let themeSettingsView = NSView()
+    let themeOverviewSummaryLabel = NSTextField(wrappingLabelWithString: "内置 50 款 UI 主题 · 支持本地文件与 URL 导入")
+    let themeQuickSelectPopup = NSPopUpButton()
+    let themeCategoryPopup = NSPopUpButton()
+    let themeDetailSelectPopup = NSPopUpButton()
+    let themeAppearanceModePopup = NSPopUpButton()
+    let themeInspectorDetailLabel = NSTextField(wrappingLabelWithString: "")
+    let themeSwatchStack = NSStackView()
+    let themeImportStatusLabel = NSTextField(wrappingLabelWithString: "")
 
-    private let statusLabel = NSTextField(labelWithString: "已停止")
-    private let startButton = NSButton(title: "开启 HTTP / SOCKS5 代理", target: nil, action: nil)
-    private let systemProxyButton = NSButton(checkboxWithTitle: "设置为系统代理", target: nil, action: nil)
-    private let enhancedModeButton = NSButton(checkboxWithTitle: "增强模式", target: nil, action: nil)
-    private let modePopup = NSPopUpButton()
-    private let policyPopup = NSPopUpButton()
-    private let groupPopup = NSPopUpButton()
-    private let groupMemberPopup = NSPopUpButton()
-    private let activeValue = NSTextField(labelWithString: "0")
-    private let totalValue = NSTextField(labelWithString: "0")
-    private let uploadValue = NSTextField(labelWithString: "0 B")
-    private let downloadValue = NSTextField(labelWithString: "0 B")
-    private let httpRuntimeValue = NSTextField(labelWithString: "")
-    private let socksRuntimeValue = NSTextField(labelWithString: "")
-    private let routingRuntimeValue = NSTextField(labelWithString: "")
-    private let dataPlaneRuntimeValue = NSTextField(labelWithString: "HajimiNativeCore")
-    private let proxyTableView = NSTableView()
-    private let groupTableView = NSTableView()
-    private let policyCollectionView = ContextCollectionView()
-    private let rulesTableView = NSTableView()
-    private let proxySearchField = NSSearchField()
-    private let ruleSearchField = NSSearchField()
-    private let proxyCountLabel = NSTextField(labelWithString: "")
-    private let ruleCountLabel = NSTextField(labelWithString: "")
-    private let ruleSelectionCountLabel = NSTextField(labelWithString: "未选择")
-    private let ruleStatusLabel = NSTextField(wrappingLabelWithString: "")
-    private let ruleAddButton = NSButton(title: "新增规则", target: nil, action: nil)
-    private let ruleEditButton = NSButton(title: "编辑规则", target: nil, action: nil)
-    private let ruleDeleteButton = NSButton(title: "删除规则", target: nil, action: nil)
-    private let ruleUpdateButton = NSButton(title: "更新规则", target: nil, action: nil)
-    private let ruleMultiSelectButton = NSButton(checkboxWithTitle: "多选", target: nil, action: nil)
-    private let ruleSelectAllButton = NSButton(title: "全选", target: nil, action: nil)
-    private let ruleClearSelectionButton = NSButton(title: "取消选择", target: nil, action: nil)
-    private let policyStatusLabel = NSTextField(labelWithString: "")
-    private let profileTextView = NSTextView()
-    private let profileStatus = NSTextField(labelWithString: "")
-    private let profilePathLabel = NSTextField(labelWithString: "")
-    private let helperStatusLabel = NSTextField(labelWithString: "正在检查…")
-    private let helperInstallButton = NSButton(title: "安装 Helper", target: nil, action: nil)
-    private let helperUninstallButton = NSButton(title: "卸载 Helper", target: nil, action: nil)
-    private let localProxyStatusLabel = NSTextField(wrappingLabelWithString: "")
-    private let sidebarStatusDot = HajimiSurfaceView(fill: .tertiaryLabelColor, cornerRadius: 4)
-    private let sidebarStatusText = NSTextField(labelWithString: "已停止")
-    private let sidebarStatusDetail = NSTextField(labelWithString: "本机代理引擎")
-    private let subscriptionSummaryLabel = NSTextField(wrappingLabelWithString: "尚未添加订阅 · 支持导入本地配置或通过 URL 下载订阅")
-    private let subscriptionSelectPopup = NSPopUpButton()
-    private let subscriptionUseButton = NSButton(title: "选择使用", target: nil, action: nil)
-    private let subscriptionAddButton = NSButton(title: "URL 下载…", target: nil, action: nil)
-    private let subscriptionImportButton = NSButton(title: "导入配置…", target: nil, action: nil)
-    private let subscriptionEditButton = NSButton(title: "编辑订阅…", target: nil, action: nil)
-    private let subscriptionUpdateButton = NSButton(title: "更新订阅", target: nil, action: nil)
-    private let subscriptionDeleteButton = NSButton(title: "删除订阅", target: nil, action: nil)
-    private let dnsSummaryLabel = NSTextField(labelWithString: "防泄漏保护 · 默认加密 DNS")
-    private let dnsForm = DNSSettingsFormView()
-    private let dnsSettingsStatus = NSTextField(labelWithString: "")
-    private var dnsSaveRequestID: UUID?
-    private var dnsConnectivityRequestID: UUID?
-    private var dnsConnectivityResolver: TraditionalDNSBootstrapResolver?
-    private var navigationButtons: [NSButton] = []
-    private var groupSelections: [String: String] = [:]
-    private var manualManagedGroupSelections = Set<String>()
+    let statusLabel = NSTextField(labelWithString: "已停止")
+    let startButton = NSButton(title: "开启 HTTP / SOCKS5 代理", target: nil, action: nil)
+    let systemProxyButton = NSButton(checkboxWithTitle: "设置为系统代理", target: nil, action: nil)
+    let enhancedModeButton = NSButton(checkboxWithTitle: "增强模式", target: nil, action: nil)
+    let modePopup = NSPopUpButton()
+    let policyPopup = NSPopUpButton()
+    let groupPopup = NSPopUpButton()
+    let groupMemberPopup = NSPopUpButton()
+    let activeValue = NSTextField(labelWithString: "0")
+    let totalValue = NSTextField(labelWithString: "0")
+    let uploadValue = NSTextField(labelWithString: "0 B")
+    let downloadValue = NSTextField(labelWithString: "0 B")
+    let httpRuntimeValue = NSTextField(labelWithString: "")
+    let socksRuntimeValue = NSTextField(labelWithString: "")
+    let routingRuntimeValue = NSTextField(labelWithString: "")
+    let dataPlaneRuntimeValue = NSTextField(labelWithString: "HajimiNativeCore")
+    let proxyTableView = NSTableView()
+    let groupTableView = NSTableView()
+    let policyCollectionView = ContextCollectionView()
+    let rulesTableView = NSTableView()
+    let proxySearchField = NSSearchField()
+    let ruleSearchField = NSSearchField()
+    let proxyCountLabel = NSTextField(labelWithString: "")
+    let ruleCountLabel = NSTextField(labelWithString: "")
+    let ruleSelectionCountLabel = NSTextField(labelWithString: "未选择")
+    let ruleStatusLabel = NSTextField(wrappingLabelWithString: "")
+    let ruleAddButton = NSButton(title: "新增规则", target: nil, action: nil)
+    let ruleEditButton = NSButton(title: "编辑规则", target: nil, action: nil)
+    let ruleDeleteButton = NSButton(title: "删除规则", target: nil, action: nil)
+    let ruleUpdateButton = NSButton(title: "更新规则", target: nil, action: nil)
+    let ruleMultiSelectButton = NSButton(checkboxWithTitle: "多选", target: nil, action: nil)
+    let ruleSelectAllButton = NSButton(title: "全选", target: nil, action: nil)
+    let ruleClearSelectionButton = NSButton(title: "取消选择", target: nil, action: nil)
+    let policyStatusLabel = NSTextField(labelWithString: "")
+    let profileTextView = NSTextView()
+    let profileStatus = NSTextField(labelWithString: "")
+    let profilePathLabel = NSTextField(labelWithString: "")
+    let helperStatusLabel = NSTextField(labelWithString: "正在检查…")
+    let helperInstallButton = NSButton(title: "安装 Helper", target: nil, action: nil)
+    let helperUninstallButton = NSButton(title: "卸载 Helper", target: nil, action: nil)
+    let localProxyStatusLabel = NSTextField(wrappingLabelWithString: "")
+    let sidebarStatusDot = HajimiSurfaceView(fill: .tertiaryLabelColor, cornerRadius: 4)
+    let sidebarStatusText = NSTextField(labelWithString: "已停止")
+    let sidebarStatusDetail = NSTextField(labelWithString: "本机代理引擎")
+    let subscriptionSummaryLabel = NSTextField(wrappingLabelWithString: "尚未添加订阅 · 支持导入本地配置或通过 URL 下载订阅")
+    let subscriptionSelectPopup = NSPopUpButton()
+    let subscriptionUseButton = NSButton(title: "选择使用", target: nil, action: nil)
+    let subscriptionAddButton = NSButton(title: "URL 下载…", target: nil, action: nil)
+    let subscriptionImportButton = NSButton(title: "导入配置…", target: nil, action: nil)
+    let subscriptionEditButton = NSButton(title: "编辑订阅…", target: nil, action: nil)
+    let subscriptionUpdateButton = NSButton(title: "更新订阅", target: nil, action: nil)
+    let subscriptionDeleteButton = NSButton(title: "删除订阅", target: nil, action: nil)
+    let dnsSummaryLabel = NSTextField(labelWithString: "防泄漏保护 · 默认加密 DNS")
+    let dnsForm = DNSSettingsFormView()
+    let dnsSettingsStatus = NSTextField(labelWithString: "")
+    var dnsSaveRequestID: UUID?
+    var dnsConnectivityRequestID: UUID?
+    var dnsConnectivityResolver: TraditionalDNSBootstrapResolver?
+    var navigationButtons: [NSButton] = []
+    var groupSelections: [String: String] = [:]
+    var manualManagedGroupSelections = Set<String>()
     /// Confined to the main queue. An unrelated health-group result must not
     /// reach either router update, which would invalidate DNS and mux owners.
-    private let routingReloadGate = RoutingReloadGate()
+    let routingReloadGate = RoutingReloadGate()
     /// Drives `url-test` and `fallback` groups. Its results are written into
     /// `groupSelections`, which routing already consults ahead of a group's
     /// declared order, so no routing code has to know health checking exists.
-    private let policyHealth = PolicyHealthMonitor()
-    private var policyLatencies: [String: [String: TimeInterval]] = [:]
-    private var profileValidationGeneration = 0
-    private var filteredProxyNames: [String] = []
-    private var filteredRules: [RoutingRule] = []
-    private var filteredRuleRows: [RuleListRow] = []
-    private var filteredRuleSourceLines: [Int] = []
-    private var rulesPageSourceText: String?
-    private var rulesPageRevision: Int?
-    private var rulesPageProfile: Profile?
-    private var rulesPageRuleSetLocations = Set<String>()
-    private var pendingRuleSelection: (text: String, revision: Int, lines: Set<Int>)?
-    private let proxySearchDebouncer = ListSearchDebouncer()
-    private let ruleSearchDebouncer = ListSearchDebouncer()
-    private var proxySearchIndex: ListSearchIndex<String>?
-    private var proxySearchIndexRevision: Int?
-    private let ruleListPreparation = RuleListPreparation()
-    private let proxySearchQueue: OperationQueue = {
+    let policyHealth = PolicyHealthMonitor()
+    var policyLatencies: [String: [String: TimeInterval]] = [:]
+    var profileValidationGeneration = 0
+    var filteredProxyNames: [String] = []
+    var filteredRules: [RoutingRule] = []
+    var filteredRuleRows: [RuleListRow] = []
+    var filteredRuleSourceLines: [Int] = []
+    var rulesPageSourceText: String?
+    var rulesPageRevision: Int?
+    var rulesPageProfile: Profile?
+    var rulesPageRuleSetLocations = Set<String>()
+    var pendingRuleSelection: (text: String, revision: Int, lines: Set<Int>)?
+    let proxySearchDebouncer = ListSearchDebouncer()
+    let ruleSearchDebouncer = ListSearchDebouncer()
+    var proxySearchIndex: ListSearchIndex<String>?
+    var proxySearchIndexRevision: Int?
+    let ruleListPreparation = RuleListPreparation()
+    let proxySearchQueue: OperationQueue = {
         let queue = OperationQueue()
         queue.name = "app.hajimi.policy-search"
         queue.qualityOfService = .userInitiated
         queue.maxConcurrentOperationCount = 1
         return queue
     }()
-    private let ruleListQueue: OperationQueue = {
+    let ruleListQueue: OperationQueue = {
         let queue = OperationQueue()
         queue.name = "app.hajimi.rule-list-preparation"
         queue.qualityOfService = .userInitiated
         queue.maxConcurrentOperationCount = 1
         return queue
     }()
-    private var ruleSelectionRefreshInProgress = false
-    private var ruleOperationID: UUID?
-    private var ruleEditor: RuleEditorSheetController?
-    private var rulePolicyEditor: RulePolicySheetController?
-    private var resolvedProfile: Profile?
-    private var nodeLatencies: [String: NodeLatency] = [:]
-    private var nodeProbeEpoch: UInt64 = 0
-    private var nodeProbeRequests: [String: UUID] = [:]
-    private var nodeProbeTickets: [String: ProbeScheduler.Ticket] = [:]
-    private var nodeProbeBatch: NodeProbeBatchCursor?
-    private var renderedProxyOrder: [String]?
-    private var renderedGroupOrder: [String]?
-    private var renderedProxyPolicies: [String: ProxyPolicy] = [:]
-    private var renderedGroupPolicies: [String: PolicyGroup] = [:]
-    private var renderedGroupSelections: [String: String] = [:]
-    private var renderedActiveProxy: String?
-    private var pendingProxyCards = Set<String>()
-    private var proxyCardIdentities = Set<String>()
-    private var pendingGroupCards = Set<String>()
-    private var policyCardRefreshWork: DispatchWorkItem?
-    private var policyHealthEpoch: UInt64 = 0
-    private var diagnosticsPanel: NetworkDiagnosticsPanelController?
-    private var policyVisibilityObserver: NSObjectProtocol?
-    private var workspaceWakeObservers: [NSObjectProtocol] = []
-    private var wakeRecoveryWorkItems: [DispatchWorkItem] = []
-    private var nodeEditor: SurgeProxyEditorController?
-    private var groupEditor: PolicyGroupEditorController?
-    private var helperInstallationStatus: PrivilegedHelperClient.InstallationStatus = .notInstalled
+    var ruleSelectionRefreshInProgress = false
+    var ruleOperationID: UUID?
+    var ruleEditor: RuleEditorSheetController?
+    var rulePolicyEditor: RulePolicySheetController?
+    var resolvedProfile: Profile?
+    var nodeLatencies: [String: NodeLatency] = [:]
+    var nodeProbeEpoch: UInt64 = 0
+    var nodeProbeRequests: [String: UUID] = [:]
+    var nodeProbeTickets: [String: ProbeScheduler.Ticket] = [:]
+    var nodeProbeBatch: NodeProbeBatchCursor?
+    var renderedProxyOrder: [String]?
+    var renderedGroupOrder: [String]?
+    var renderedProxyPolicies: [String: ProxyPolicy] = [:]
+    var renderedGroupPolicies: [String: PolicyGroup] = [:]
+    var renderedGroupSelections: [String: String] = [:]
+    var renderedActiveProxy: String?
+    var pendingProxyCards = Set<String>()
+    var proxyCardIdentities = Set<String>()
+    var pendingGroupCards = Set<String>()
+    var policyCardRefreshWork: DispatchWorkItem?
+    var policyHealthEpoch: UInt64 = 0
+    var diagnosticsPanel: NetworkDiagnosticsPanelController?
+    var policyVisibilityObserver: NSObjectProtocol?
+    var workspaceWakeObservers: [NSObjectProtocol] = []
+    var wakeRecoveryWorkItems: [DispatchWorkItem] = []
+    var nodeEditor: SurgeProxyEditorController?
+    var groupEditor: PolicyGroupEditorController?
+    var helperInstallationStatus: PrivilegedHelperClient.InstallationStatus = .notInstalled
     /// Set at launch when the previous session had system proxy on. Applied
     /// once the HTTP listener is actually running.
-    private var pendingSystemProxyRestore = false
-    private var systemProxyAppliedAddress: ListenAddress?
-    private var systemProxyRebindInFlight = false
-    private var systemProxyRecoveryInFlight = false
+    var pendingSystemProxyRestore = false
+    var systemProxyAppliedAddress: ListenAddress?
+    var systemProxyRebindInFlight = false
+    var systemProxyRecoveryInFlight = false
     /// enable() takes a snapshot only after querying network services; protect
     /// its in-flight listener/bypass settings before that file exists.
-    private var systemProxyEnableRequests = 0
-    private var systemProxyDisableRequests = 0
-    private var systemProxyIsOrWillBeEnabled: Bool {
+    var systemProxyEnableRequests = 0
+    var systemProxyDisableRequests = 0
+    var systemProxyIsOrWillBeEnabled: Bool {
         SystemProxyListenerPlan.protectsConfiguration(
             snapshotExists: systemProxy.isEnabledByHajimi,
             enableRequests: systemProxyEnableRequests)
     }
-    private var staleSystemProxyCleanupAttempted = false
-    private let externalController = ExternalController()
-    private let ruleSetPreparationQueue = DispatchQueue(
+    var staleSystemProxyCleanupAttempted = false
+    let externalController = ExternalController()
+    let ruleSetPreparationQueue = DispatchQueue(
         label: "app.hajimi.rule-set-preparation", qos: .userInitiated)
-    private let automaticRuleSetQueue = DispatchQueue(
+    let automaticRuleSetQueue = DispatchQueue(
         label: "app.hajimi.rule-set-refresh", qos: .utility)
-    private var ruleSetRefreshTimer: Timer?
-    private var automaticRuleSetPlan = RuleSetBackgroundRefreshPlan()
-    private var automaticRuleSetCacheNeedsApply = false
-    private var restoringLaunchSession = true
-    private var startupSubscriptionsPending = true
-    private var profileRevision = 0
-    private var profileApplyGeneration = 0
-    private var activeProfilePreparationGeneration: Int?
+    var ruleSetRefreshTimer: Timer?
+    var automaticRuleSetPlan = RuleSetBackgroundRefreshPlan()
+    var automaticRuleSetCacheNeedsApply = false
+    var restoringLaunchSession = true
+    var startupSubscriptionsPending = true
+    var profileRevision = 0
+    var profileApplyGeneration = 0
+    var activeProfilePreparationGeneration: Int?
     /// Last disk contents this window loaded or committed. Do not overwrite
     /// edits made by an external editor while subscriptions or RULE-SETs load.
-    private var lastKnownStoredProfileText: String?
+    var lastKnownStoredProfileText: String?
 
-    private let byteFormatter: ByteCountFormatter = {
+    let byteFormatter: ByteCountFormatter = {
         let value = ByteCountFormatter()
         value.countStyle = .binary
         value.allowedUnits = [.useKB, .useMB, .useGB]
@@ -443,6 +452,11 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         restorePreferences()
         restartExternalController()
         selectPage(0)
+        HajimiThemeCenter.shared.applyCurrentThemeToApplication()
+        NetworkPerformanceDiagnostics.shared.setCollecting(false)
+        NetworkPerformanceDiagnostics.shared.reset()
+        ProbeScheduler.shared.setCollectingStatistics(false)
+        ProbeScheduler.shared.resetStatistics()
         policyVisibilityObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main
         ) { [weak self] _ in self?.applyPendingPolicyCardUpdates() }
@@ -464,10 +478,16 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
         wakeRecoveryWorkItems.forEach { $0.cancel() }
+        diagnosticsPanel?.closeAndTeardown()
+        diagnosticsPanel = nil
+        NetworkPerformanceDiagnostics.shared.setCollecting(false)
+        NetworkPerformanceDiagnostics.shared.reset()
+        ProbeScheduler.shared.setCollectingStatistics(false)
+        ProbeScheduler.shared.resetStatistics()
         policyHealth.stop()
     }
 
-    private func installWorkspaceWakeObservers() {
+    func installWorkspaceWakeObservers() {
         let notifications: [Notification.Name] = [
             NSWorkspace.didWakeNotification,
             NSWorkspace.screensDidWakeNotification,
@@ -482,7 +502,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private func handleWorkspaceWake() {
+    func handleWorkspaceWake() {
         wakeRecoveryWorkItems.forEach { $0.cancel() }
         wakeRecoveryWorkItems.removeAll()
         if isEngineActive && !isEnhancedModeActive {
@@ -583,7 +603,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         return profile.globalProxyNodes.map { statusItemNodeItem(named: $0, optimalName: optimal) }
     }
 
-    private func resolveLeafProxyName(from policyName: String) -> String {
+    func resolveLeafProxyName(from policyName: String) -> String {
         var current = policyName
         var visited = Set<String>()
         for _ in 0..<12 {
@@ -687,20 +707,34 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     func statusItemTelemetrySnapshot(uploadRate: Double, downloadRate: Double) -> StatusBarTelemetrySnapshot {
         let activeNode: String
+        let rawTargetForLatency: String
         switch selectedMode {
         case .direct:
             activeNode = "DIRECT"
+            rawTargetForLatency = "DIRECT"
         case .proxy:
             activeNode = statusItemGlobalPolicy
+            rawTargetForLatency = activeNode
         case .rule:
-            if let firstGroup = statusItemPolicyGroups.first, let selected = firstGroup.selectedMember {
-                activeNode = selected
+            if let firstGroup = statusItemPolicyGroups.first,
+               let effective = firstGroup.selectedMember ?? firstGroup.effectiveMember {
+                let leaf = resolveLeafProxyName(from: effective)
+                activeNode = (leaf != effective && !leaf.isEmpty && leaf != "DIRECT")
+                    ? "\(effective) · \(leaf)"
+                    : effective
+                rawTargetForLatency = effective
+            } else if let firstGroupName = profile.groupOrder.first {
+                let leaf = resolveLeafProxyName(from: firstGroupName)
+                activeNode = leaf
+                rawTargetForLatency = firstGroupName
             } else {
                 activeNode = profile.globalProxyNodes.first ?? "DIRECT"
+                rawTargetForLatency = activeNode
             }
         }
+        let leafNode = resolveLeafProxyName(from: rawTargetForLatency)
         let latencyMs: Int
-        if let lat = nodeLatencies[activeNode] {
+        if let lat = nodeLatencies[leafNode] ?? nodeLatencies[activeNode] {
             switch lat {
             case .success(let ms): latencyMs = max(1, ms)
             case .failed, .unavailable: latencyMs = 0
@@ -713,7 +747,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         let totalDown = UInt64(max(0, downloaded)) + enhancedDownloaded
         let activeConns = activeConnectionIDs.count + enhancedActiveConnections
         return StatusBarTelemetrySnapshot(
-            running: isEngineActive,
+            running: isEngineActive || isEnhancedModeActive,
             enhancedMode: isEnhancedModeActive,
             systemProxy: isSystemProxyActive,
             modeTitle: statusItemOutboundMode.displayName,
@@ -740,8 +774,15 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     func testActiveNodeFromStatusItem() {
         let snapshot = statusItemTelemetrySnapshot(uploadRate: 0, downloadRate: 0)
-        if profile.proxies[snapshot.activeNodeName] != nil {
-            testSingleNodeFromStatusItem(snapshot.activeNodeName)
+        let targetLeaf: String
+        if selectedMode == .rule, let firstGroup = statusItemPolicyGroups.first,
+           let eff = firstGroup.selectedMember ?? firstGroup.effectiveMember {
+            targetLeaf = resolveLeafProxyName(from: eff)
+        } else {
+            targetLeaf = resolveLeafProxyName(from: snapshot.activeNodeName)
+        }
+        if profile.proxies[targetLeaf] != nil {
+            testSingleNodeFromStatusItem(targetLeaf)
         } else if let first = profile.globalProxyNodes.first {
             testSingleNodeFromStatusItem(first)
         } else {
@@ -751,7 +792,29 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     func testGroupNodesFromStatusItem(group groupName: String) {
         guard let group = profile.groups[groupName] else { return }
-        let nodes = group.members.filter { profile.proxies[$0] != nil && profile.groups[$0] == nil }
+        var seen = Set<String>()
+        var nodes: [String] = []
+        func appendProxy(_ candidate: String) {
+            guard profile.proxies[candidate] != nil, profile.groups[candidate] == nil,
+                  seen.insert(candidate).inserted else { return }
+            nodes.append(candidate)
+        }
+        for member in group.members {
+            if profile.proxies[member] != nil && profile.groups[member] == nil {
+                appendProxy(member)
+            } else if profile.groups[member] != nil {
+                appendProxy(resolveLeafProxyName(from: member))
+            }
+        }
+        if nodes.isEmpty {
+            for member in group.members {
+                if let sub = profile.groups[member] {
+                    for subMember in sub.members {
+                        appendProxy(resolveLeafProxyName(from: subMember))
+                    }
+                }
+            }
+        }
         guard !nodes.isEmpty else { return }
         cancelNodeTests(refresh: false)
         for name in nodes { nodeLatencies[name] = .queued }
@@ -814,6 +877,10 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        if !dashboardView.isHidden {
+            updateStatistics(force: true)
+            nativeTrafficView.needsDisplay = true
+        }
         applyPendingPolicyCardUpdates()
     }
 
@@ -882,7 +949,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         externalController.stop()
     }
 
-    private func buildUI() {
+    func buildUI() {
         guard let root = window?.contentView else { return }
         sidebar.translatesAutoresizingMaskIntoConstraints = false
         contentContainer.translatesAutoresizingMaskIntoConstraints = false
@@ -900,10 +967,26 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         ])
         buildSidebar()
         buildDashboard()
+        HajimiAppTrafficWidgetView.activeInstance?.onResetRequested = { [weak self] in
+            self?.resetTrafficTelemetry()
+        }
+        AppTrafficTelemetryCenter.shared.onNeedsRefresh = { [weak self] in
+            self?.scheduleStatisticsUpdate()
+        }
+        NativePacketRouter.onTunnelFlowEvents = { [weak self] events in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                for event in events {
+                    AppTrafficTelemetryCenter.shared.observe(event: event)
+                }
+                self.scheduleStatisticsUpdate()
+            }
+        }
         buildPolicies()
         buildRules()
         buildAbout()
         buildSettings()
+        buildThemeSettings()
         for view in [dashboardView, policiesView, rulesView, aboutView, settingsView] {
             view.translatesAutoresizingMaskIntoConstraints = false
             contentContainer.addSubview(view)
@@ -916,7 +999,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private func buildSidebar() {
+    func buildSidebar() {
         let sidebarBorder = HajimiSurfaceView(fill: HajimiAppearance.border, cornerRadius: 0)
         sidebarBorder.translatesAutoresizingMaskIntoConstraints = false
         sidebar.addSubview(sidebarBorder)
@@ -945,7 +1028,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         titleStack.alignment = .leading
         titleStack.spacing = 2
         let logoTile = HajimiSurfaceView(fill: HajimiAppearance.elevatedPanel,
-                                         border: HajimiAppearance.accent.withAlphaComponent(0.24), cornerRadius: 14)
+                                         border: HajimiAppearance.accent.themedAlpha(0.24), cornerRadius: 14)
         logoTile.addSubview(logo)
         let brand = NSStackView(views: [logoTile, titleStack])
         brand.orientation = .horizontal
@@ -1061,7 +1144,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     private func buildDashboard() {
         let header = pageHeader(eyebrow: "CONTROL CENTER", title: "网络总览",
-                                subtitle: "本机代理状态、路由与流量")
+                                subtitle: "本机代理状态、路由策略、实时吞吐与程序流量用量排行")
         dashboardView.addSubview(header)
         let diagnostics = NSButton(title: "网络诊断", target: self, action: #selector(showNetworkDiagnostics))
         diagnostics.bezelStyle = .rounded
@@ -1075,9 +1158,9 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         NSLayoutConstraint.activate([
             header.leadingAnchor.constraint(equalTo: dashboardView.leadingAnchor, constant: 30),
             header.trailingAnchor.constraint(equalTo: dashboardView.trailingAnchor, constant: -30),
-            header.topAnchor.constraint(equalTo: dashboardView.topAnchor, constant: 48),
+            header.topAnchor.constraint(equalTo: dashboardView.topAnchor, constant: 40),
             diagnostics.trailingAnchor.constraint(equalTo: dashboardView.trailingAnchor, constant: -30),
-            diagnostics.topAnchor.constraint(equalTo: dashboardView.topAnchor, constant: 64)
+            diagnostics.topAnchor.constraint(equalTo: dashboardView.topAnchor, constant: 56)
         ])
 
         let controls = cardView()
@@ -1086,11 +1169,11 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         NSLayoutConstraint.activate([
             controls.leadingAnchor.constraint(equalTo: dashboardView.leadingAnchor, constant: 30),
             controls.trailingAnchor.constraint(equalTo: dashboardView.trailingAnchor, constant: -30),
-            controls.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 22),
-            controls.heightAnchor.constraint(equalToConstant: 126)
+            controls.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 16),
+            controls.heightAnchor.constraint(equalToConstant: 118)
         ])
 
-        statusLabel.font = .systemFont(ofSize: 19, weight: .semibold)
+        statusLabel.font = .systemFont(ofSize: 18.5, weight: .semibold)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -1125,11 +1208,11 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         let engineIdentity = NSStackView(views: [engineCaption, statusLabel])
         engineIdentity.orientation = .vertical
         engineIdentity.alignment = .leading
-        engineIdentity.spacing = 3
+        engineIdentity.spacing = 2
         let primarySpacer = NSView()
         primarySpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let connectionTile = HajimiTheme.iconTile(symbol: "network", color: HajimiAppearance.accentText,
-                                                  size: 44, symbolSize: 20)
+                                                  size: 42, symbolSize: 19)
         let primaryStack = NSStackView(views: [connectionTile, engineIdentity, primarySpacer,
                                                systemProxyButton, enhancedModeButton])
         primaryStack.orientation = .horizontal
@@ -1152,14 +1235,14 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         NSLayoutConstraint.activate([
             primaryStack.leadingAnchor.constraint(equalTo: controls.leadingAnchor, constant: 18),
             primaryStack.trailingAnchor.constraint(equalTo: controls.trailingAnchor, constant: -18),
-            primaryStack.topAnchor.constraint(equalTo: controls.topAnchor, constant: 15),
+            primaryStack.topAnchor.constraint(equalTo: controls.topAnchor, constant: 13),
             controlsDivider.leadingAnchor.constraint(equalTo: controls.leadingAnchor, constant: 18),
             controlsDivider.trailingAnchor.constraint(equalTo: controls.trailingAnchor, constant: -18),
-            controlsDivider.topAnchor.constraint(equalTo: primaryStack.bottomAnchor, constant: 11),
+            controlsDivider.topAnchor.constraint(equalTo: primaryStack.bottomAnchor, constant: 10),
             controlsDivider.heightAnchor.constraint(equalToConstant: 1),
             routingStack.leadingAnchor.constraint(equalTo: controls.leadingAnchor, constant: 18),
             routingStack.trailingAnchor.constraint(lessThanOrEqualTo: controls.trailingAnchor, constant: -18),
-            routingStack.bottomAnchor.constraint(equalTo: controls.bottomAnchor, constant: -14)
+            routingStack.bottomAnchor.constraint(equalTo: controls.bottomAnchor, constant: -12)
         ])
 
         let stats = NSStackView()
@@ -1168,64 +1251,117 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         stats.spacing = 14
         stats.translatesAutoresizingMaskIntoConstraints = false
         stats.addArrangedSubview(statCard(title: "活动连接", value: activeValue, color: HajimiTheme.accent))
-        stats.addArrangedSubview(statCard(title: "累计连接", value: totalValue, color: .systemIndigo))
-        stats.addArrangedSubview(statCard(title: "上传流量", value: uploadValue, color: .systemBlue))
+        stats.addArrangedSubview(statCard(title: "累计连接", value: totalValue, color: HajimiAppearance.indigoAccent))
+        stats.addArrangedSubview(statCard(title: "上传流量", value: uploadValue, color: HajimiAppearance.uploadAccent))
         stats.addArrangedSubview(statCard(title: "下载流量", value: downloadValue, color: HajimiTheme.accent))
         dashboardView.addSubview(stats)
         NSLayoutConstraint.activate([
             stats.leadingAnchor.constraint(equalTo: dashboardView.leadingAnchor, constant: 30),
             stats.trailingAnchor.constraint(equalTo: dashboardView.trailingAnchor, constant: -30),
-            stats.topAnchor.constraint(equalTo: controls.bottomAnchor, constant: 16),
-            stats.heightAnchor.constraint(equalToConstant: 96)
+            stats.topAnchor.constraint(equalTo: controls.bottomAnchor, constant: 12),
+            stats.heightAnchor.constraint(equalToConstant: 84)
         ])
 
-        let runtimeTitle = NSTextField(labelWithString: "运行概况")
         nativeTrafficView.translatesAutoresizingMaskIntoConstraints = false
         dashboardView.addSubview(nativeTrafficView)
-        runtimeTitle.font = .systemFont(ofSize: 14, weight: .semibold)
-        runtimeTitle.translatesAutoresizingMaskIntoConstraints = false
-        dashboardView.addSubview(runtimeTitle)
+
+        let appTrafficWidget = HajimiAppTrafficWidgetView()
+        appTrafficWidget.translatesAutoresizingMaskIntoConstraints = false
 
         let runtimeCard = cardView()
         runtimeCard.translatesAutoresizingMaskIntoConstraints = false
-        dashboardView.addSubview(runtimeCard)
-        let runtimeColumns = NSStackView(views: [
+        let runtimeEyebrow = HajimiTheme.eyebrowPill("RUNTIME & SPLIT")
+        let runtimeTitle = NSTextField(labelWithString: "运行概况与分流")
+        runtimeTitle.font = .systemFont(ofSize: 13.5, weight: .bold)
+        let runtimeHeader = NSStackView(views: [runtimeEyebrow, runtimeTitle, NSView()])
+        runtimeHeader.orientation = .horizontal
+        runtimeHeader.alignment = .centerY
+        runtimeHeader.spacing = 8
+        runtimeHeader.translatesAutoresizingMaskIntoConstraints = false
+        runtimeCard.addSubview(runtimeHeader)
+
+        let runtimeRowTop = NSStackView(views: [
             overviewInfoColumn(title: "HTTP 入口", value: httpRuntimeValue,
-                               detail: "系统 HTTP/HTTPS 代理入口", icon: "network", color: .systemBlue),
+                               detail: "系统 HTTP/HTTPS 代理", icon: "network", color: HajimiAppearance.uploadAccent),
             overviewInfoColumn(title: "SOCKS5 入口", value: socksRuntimeValue,
-                               detail: "TCP 与 UDP ASSOCIATE", icon: "arrow.triangle.branch", color: HajimiTheme.accent),
-            overviewInfoColumn(title: "当前路由", value: routingRuntimeValue,
-                               detail: "切换策略无需重启", icon: "point.3.connected.trianglepath.dotted", color: .systemIndigo),
-            overviewInfoColumn(title: "数据面", value: dataPlaneRuntimeValue,
-                               detail: "连接并行 · 流量批量统计", icon: "speedometer", color: .systemOrange)
+                               detail: "TCP 与 UDP 关联", icon: "arrow.triangle.branch", color: HajimiTheme.accent)
         ])
-        runtimeColumns.orientation = .horizontal
-        runtimeColumns.distribution = .fillEqually
-        runtimeColumns.spacing = 0
-        runtimeColumns.translatesAutoresizingMaskIntoConstraints = false
-        runtimeCard.addSubview(runtimeColumns)
+        runtimeRowTop.orientation = .horizontal
+        runtimeRowTop.distribution = .fillEqually
+        runtimeRowTop.spacing = 6
+
+        let runtimeRowBottom = NSStackView(views: [
+            overviewInfoColumn(title: "当前路由", value: routingRuntimeValue,
+                               detail: "切换策略热重载生效", icon: "point.3.connected.trianglepath.dotted", color: HajimiAppearance.indigoAccent),
+            overviewInfoColumn(title: "数据面", value: dataPlaneRuntimeValue,
+                               detail: "C++20 零拷贝转发", icon: "speedometer", color: HajimiAppearance.accentText)
+        ])
+        runtimeRowBottom.orientation = .horizontal
+        runtimeRowBottom.distribution = .fillEqually
+        runtimeRowBottom.spacing = 6
+
+        let runtimeGrid = NSStackView(views: [runtimeRowTop, runtimeRowBottom])
+        runtimeGrid.orientation = .vertical
+        runtimeGrid.distribution = .fillEqually
+        runtimeGrid.spacing = 6
+        runtimeGrid.translatesAutoresizingMaskIntoConstraints = false
+        runtimeCard.addSubview(runtimeGrid)
+
+        let splitBar = HajimiTrafficSplitBarView()
+        splitBar.translatesAutoresizingMaskIntoConstraints = false
+        runtimeCard.addSubview(splitBar)
+
+        let bentoRow = NSStackView(views: [appTrafficWidget, runtimeCard])
+        bentoRow.orientation = .horizontal
+        bentoRow.alignment = .height
+        bentoRow.distribution = .fill
+        bentoRow.spacing = 14
+        bentoRow.translatesAutoresizingMaskIntoConstraints = false
+        dashboardView.addSubview(bentoRow)
+
+        let appWidthConstraint = appTrafficWidget.widthAnchor.constraint(
+            equalTo: bentoRow.widthAnchor, multiplier: 0.56, constant: -7
+        )
+        appWidthConstraint.priority = .defaultHigh
+        let bentoBottomConstraint = bentoRow.bottomAnchor.constraint(
+            equalTo: dashboardView.bottomAnchor, constant: -20
+        )
+        bentoBottomConstraint.priority = .defaultHigh
 
         NSLayoutConstraint.activate([
-            runtimeTitle.leadingAnchor.constraint(equalTo: dashboardView.leadingAnchor, constant: 30),
             nativeTrafficView.leadingAnchor.constraint(equalTo: stats.leadingAnchor),
             nativeTrafficView.trailingAnchor.constraint(equalTo: stats.trailingAnchor),
-            nativeTrafficView.topAnchor.constraint(equalTo: stats.bottomAnchor, constant: 16),
-            nativeTrafficView.heightAnchor.constraint(equalToConstant: 142),
-            runtimeTitle.topAnchor.constraint(equalTo: nativeTrafficView.bottomAnchor, constant: 20),
-            runtimeCard.leadingAnchor.constraint(equalTo: dashboardView.leadingAnchor, constant: 30),
-            runtimeCard.trailingAnchor.constraint(equalTo: dashboardView.trailingAnchor, constant: -30),
-            runtimeCard.topAnchor.constraint(equalTo: runtimeTitle.bottomAnchor, constant: 10),
-            runtimeCard.heightAnchor.constraint(equalToConstant: 112),
-            runtimeColumns.leadingAnchor.constraint(equalTo: runtimeCard.leadingAnchor, constant: 8),
-            runtimeColumns.trailingAnchor.constraint(equalTo: runtimeCard.trailingAnchor, constant: -8),
-            runtimeColumns.topAnchor.constraint(equalTo: runtimeCard.topAnchor, constant: 10),
-            runtimeColumns.bottomAnchor.constraint(equalTo: runtimeCard.bottomAnchor, constant: -10)
+            nativeTrafficView.topAnchor.constraint(equalTo: stats.bottomAnchor, constant: 12),
+            nativeTrafficView.heightAnchor.constraint(equalToConstant: 128),
+            bentoRow.leadingAnchor.constraint(equalTo: stats.leadingAnchor),
+            bentoRow.trailingAnchor.constraint(equalTo: stats.trailingAnchor),
+            bentoRow.topAnchor.constraint(equalTo: nativeTrafficView.bottomAnchor, constant: 14),
+            bentoRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 228),
+            bentoBottomConstraint,
+            appWidthConstraint,
+            runtimeHeader.leadingAnchor.constraint(equalTo: runtimeCard.leadingAnchor, constant: 14),
+            runtimeHeader.trailingAnchor.constraint(equalTo: runtimeCard.trailingAnchor, constant: -14),
+            runtimeHeader.topAnchor.constraint(equalTo: runtimeCard.topAnchor, constant: 12),
+            runtimeRowTop.widthAnchor.constraint(equalTo: runtimeGrid.widthAnchor),
+            runtimeRowBottom.widthAnchor.constraint(equalTo: runtimeGrid.widthAnchor),
+            runtimeGrid.leadingAnchor.constraint(equalTo: runtimeCard.leadingAnchor, constant: 10),
+            runtimeGrid.trailingAnchor.constraint(equalTo: runtimeCard.trailingAnchor, constant: -10),
+            runtimeGrid.topAnchor.constraint(equalTo: runtimeHeader.bottomAnchor, constant: 8),
+            runtimeGrid.bottomAnchor.constraint(equalTo: splitBar.topAnchor, constant: -8),
+            splitBar.leadingAnchor.constraint(equalTo: runtimeCard.leadingAnchor, constant: 12),
+            splitBar.trailingAnchor.constraint(equalTo: runtimeCard.trailingAnchor, constant: -12),
+            splitBar.bottomAnchor.constraint(equalTo: runtimeCard.bottomAnchor, constant: -10),
+            splitBar.heightAnchor.constraint(equalToConstant: 26)
         ])
         updateOverviewDetails()
     }
 
-    @objc private func showNetworkDiagnostics() {
+    @objc func showNetworkDiagnostics() {
         if diagnosticsPanel == nil {
+            NetworkPerformanceDiagnostics.shared.reset()
+            NetworkPerformanceDiagnostics.shared.setCollecting(true)
+            ProbeScheduler.shared.resetStatistics()
+            ProbeScheduler.shared.setCollectingStatistics(true)
             let capabilities = NetworkDiagnosticsAppAdapter.capabilities(contextProvider: { [weak self] in
                 self?.networkDiagnosticsContext ?? .unavailable
             }, startDiagnostics: { [weak self] update in
@@ -1236,21 +1372,32 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
                     onUpdate: update)
             })
             let panel = NetworkDiagnosticsPanelController(capabilities: capabilities)
+            panel.onVisibilityChanged = { visible in
+                NetworkPerformanceDiagnostics.shared.setCollecting(visible)
+                ProbeScheduler.shared.setCollectingStatistics(visible)
+            }
             panel.onClose = { [weak self, weak panel] in
+                NetworkPerformanceDiagnostics.shared.setCollecting(false)
+                NetworkPerformanceDiagnostics.shared.reset()
+                ProbeScheduler.shared.setCollectingStatistics(false)
+                ProbeScheduler.shared.resetStatistics()
                 guard let self, self.diagnosticsPanel === panel else { return }
                 self.diagnosticsPanel = nil
             }
             diagnosticsPanel = panel
+        } else {
+            NetworkPerformanceDiagnostics.shared.setCollecting(true)
+            ProbeScheduler.shared.setCollectingStatistics(true)
         }
         diagnosticsPanel?.showWindow(nil)
         diagnosticsPanel?.window?.makeKeyAndOrderFront(nil)
     }
 
-    private var networkDiagnosticsContext: NetworkDiagnosticsRuntimeContext {
+    var networkDiagnosticsContext: NetworkDiagnosticsRuntimeContext {
         networkRuntime.context(configuration: networkDiagnosticsConfiguration)
     }
 
-    private var networkDiagnosticsConfiguration: NetworkDiagnosticsConfiguration {
+    var networkDiagnosticsConfiguration: NetworkDiagnosticsConfiguration {
         NetworkDiagnosticsConfiguration(mode: selectedMode.displayName, selectedPolicy: selectedPolicy,
             groupSelections: groupSelections, profileRevision: profileRevision, systemProxy: isSystemProxyActive)
     }
@@ -1379,7 +1526,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         policyCollectionView.reloadData()
     }
 
-    private func configureProxyTable() {
+    func configureProxyTable() {
         proxyTableView.dataSource = self
         proxyTableView.delegate = self
         proxyTableView.headerView = nil
@@ -1397,7 +1544,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         proxyTableView.menu = menu
     }
 
-    private func configureGroupTable() {
+    func configureGroupTable() {
         groupTableView.dataSource = self
         groupTableView.delegate = self
         groupTableView.headerView = nil
@@ -1410,7 +1557,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         groupTableView.addTableColumn(column)
     }
 
-    private func buildRules() {
+    func buildRules() {
         let header = pageHeader(eyebrow: "RULES", title: "规则",
                                 subtitle: "管理主规则 · 多选操作与 RULE-SET 更新")
         rulesView.addSubview(header)
@@ -1522,7 +1669,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         ])
     }
 
-    private func configureRulesTable() {
+    func configureRulesTable() {
         rulesTableView.dataSource = self
         rulesTableView.delegate = self
         rulesTableView.allowsMultipleSelection = true
@@ -1532,7 +1679,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         rulesTableView.doubleAction = #selector(rulesDoubleClicked)
         rulesTableView.rowHeight = 34
         rulesTableView.backgroundColor = HajimiTheme.panel
-        rulesTableView.usesAlternatingRowBackgroundColors = true
+        rulesTableView.usesAlternatingRowBackgroundColors = false
         rulesTableView.headerView = NSTableHeaderView()
         let columns: [(String, String, CGFloat)] = [
             ("selected", "选择", 34),
@@ -1570,7 +1717,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         return stack
     }
 
-    private func buildProfileEditor() {
+    func buildProfileEditor() {
         let header = pageHeader(eyebrow: "PROFILE", title: "配置文件",
                                 subtitle: "Surge INI Profile")
         profileView.addSubview(header)
@@ -1620,6 +1767,8 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         profileTextView.isAutomaticSpellingCorrectionEnabled = false
         profileTextView.layoutManager?.allowsNonContiguousLayout = true
         profileTextView.font = .monospacedSystemFont(ofSize: 12.5, weight: .regular)
+        profileTextView.backgroundColor = HajimiAppearance.mutedPanel
+        profileTextView.insertionPointColor = HajimiAppearance.accentText
         profileTextView.textContainerInset = NSSize(width: 10, height: 10)
         profileTextView.minSize = NSSize(width: 0, height: 0)
         profileTextView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
@@ -1651,7 +1800,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         ])
     }
 
-    private func buildAbout() {
+    func buildAbout() {
         let header = pageHeader(eyebrow: "CAPABILITIES", title: "运行能力",
                                 subtitle: "协议能力与系统接管的实际边界")
         aboutView.addSubview(header)
@@ -1664,8 +1813,8 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             ("HTTP / HTTPS 出站", "CONNECT、正向转发、Basic 鉴权；TLS 默认验证证书", HajimiTheme.accent),
             ("SOCKS5 / SOCKS5-TLS", "支持用户名密码与本地 UDP；TLS 上游仅支持 TCP", HajimiTheme.accent),
             ("常见节点协议", "Swift 协议适配；C++ VLESS/Trojan 编码与 Objective-C TCP/TLS", HajimiTheme.accent),
-            ("QUIC 与 AnyTLS", "Hysteria v1/v2、TUIC v5、AnyTLS 经静态链接的 Go 核心", .systemBlue),
-            ("数据平面", "Objective-C++ 转发；C 报文；C++ 缓冲、重组、计时与规则", .systemIndigo),
+            ("QUIC 与 AnyTLS", "Hysteria v1/v2、TUIC v5、AnyTLS 经静态链接的 Go 核心", HajimiAppearance.uploadAccent),
+            ("数据平面", "Objective-C++ 转发；C 报文；C++ 缓冲、重组、计时与规则", HajimiAppearance.indigoAccent),
             ("macOS 系统代理", "手动启用；恢复前检查代理设置是否仍由哈基米管理", HajimiTheme.accent),
             ("增强模式 VIF", "root Helper 接管 utun；发现其他隧道时拒绝启动与断网自愈", HajimiTheme.accent),
             ("Network Extension", "Objective-C 接入；需签名、entitlement 与原生 Provider 引擎", .systemOrange),
@@ -1784,7 +1933,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
         let localProxyCard = cardView()
         localProxyCard.translatesAutoresizingMaskIntoConstraints = false
-        let localProxyIcon = HajimiTheme.iconTile(symbol: "network", color: .systemBlue,
+        let localProxyIcon = HajimiTheme.iconTile(symbol: "network", color: HajimiAppearance.uploadAccent,
                                                   size: 38, symbolSize: 17)
         let localProxyTitle = NSTextField(labelWithString: "本地代理")
         localProxyTitle.font = .systemFont(ofSize: 15, weight: .semibold)
@@ -1852,7 +2001,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
         let dnsCard = cardView()
         dnsCard.translatesAutoresizingMaskIntoConstraints = false
-        let dnsIcon = HajimiTheme.iconTile(symbol: "lock.shield", color: .systemIndigo,
+        let dnsIcon = HajimiTheme.iconTile(symbol: "lock.shield", color: HajimiAppearance.indigoAccent,
                                            size: 38, symbolSize: 17)
         let dnsTitle = NSTextField(labelWithString: "DNS")
         dnsTitle.font = .systemFont(ofSize: 15, weight: .semibold)
@@ -1921,7 +2070,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
         let extensionCard = cardView()
         extensionCard.translatesAutoresizingMaskIntoConstraints = false
-        let extensionIcon = HajimiTheme.iconTile(symbol: "puzzlepiece.extension", color: .systemOrange,
+        let extensionIcon = HajimiTheme.iconTile(symbol: "puzzlepiece.extension", color: HajimiAppearance.accentText,
                                                  size: 38, symbolSize: 17)
         let extensionTitle = NSTextField(labelWithString: "系统扩展")
         extensionTitle.font = .systemFont(ofSize: 15, weight: .semibold)
@@ -2038,9 +2187,10 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         ])
         dnsSettingsView.isHidden = true
         refreshDNSSettingsFields()
+        refreshThemeSettingsUI()
     }
 
-    private func refreshSettings() {
+    func refreshSettings() {
         refreshSubscriptionSettings()
         refreshLocalProxySettings()
         refreshDNSSettingsFields()
@@ -2095,7 +2245,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         refreshLocalProxySettings()
     }
 
-    private func refreshDNSSettingsFields() {
+    func refreshDNSSettingsFields() {
         // Navigation can happen while a DNS Save is preparing remote rules.
         // Do not replace its draft with the old profile until that request
         // finishes; only an actual user edit should change the displayed text.
@@ -2132,7 +2282,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         dnsSettingsStatus.stringValue = ""
     }
 
-    @objc private func installHelperFromSettings() {
+    @objc func installHelperFromSettings() {
         helperInstallButton.isEnabled = false
         helperUninstallButton.isEnabled = false
         helperStatusLabel.stringValue = "正在请求管理员授权并安装…"
@@ -2203,20 +2353,21 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    @objc private func openDNSSettings() {
+    @objc func openDNSSettings() {
         refreshDNSSettingsFields()
         settingsOverviewView.isHidden = true
+        themeSettingsView.isHidden = true
         dnsSettingsView.isHidden = false
     }
 
-    @objc private func closeDNSSettings() {
+    @objc func closeDNSSettings() {
         cancelDNSConnectivityTest()
         dnsSettingsView.isHidden = true
         settingsOverviewView.isHidden = false
         refreshDNSSettingsFields()
     }
 
-    @objc private func dnsProtectionChanged() {
+    @objc func dnsProtectionChanged() {
         let enabled = dnsForm.protectionButton.state == .on
         dnsSettingsStatus.stringValue = enabled
             ? "保存后启用保护；增强模式将接管系统 DNS"
@@ -2224,7 +2375,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         dnsSettingsStatus.textColor = enabled ? .secondaryLabelColor : .systemOrange
     }
 
-    @objc private func dnsProxyFallbackChanged() {
+    @objc func dnsProxyFallbackChanged() {
         let enabled = dnsForm.proxyFallbackButton.state == .on
         dnsSettingsStatus.stringValue = enabled
             ? "保存后仅经合格加密代理回退；节点可见域名，出口仍明文"
@@ -2232,7 +2383,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         dnsSettingsStatus.textColor = enabled ? .systemOrange : .secondaryLabelColor
     }
 
-    @objc private func saveDNSSettings() {
+    @objc func saveDNSSettings() {
         cancelDNSConnectivityTest()
         do {
             let submittedDraft = dnsForm.draft
@@ -2276,7 +2427,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private func validateDNSSettings(_ draft: DNSSettingsDraft) throws {
+    func validateDNSSettings(_ draft: DNSSettingsDraft) throws {
         let traditional = draft.traditionalServers
         guard traditional.count <= 8, draft.encryptedServers.count <= 8 else {
             throw ProfileApplyError.message("每类 DNS 最多配置 8 个服务器")
@@ -2298,14 +2449,14 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private func cancelDNSConnectivityTest() {
+    func cancelDNSConnectivityTest() {
         dnsConnectivityRequestID = nil
         dnsConnectivityResolver?.cancel()
         dnsConnectivityResolver = nil
         dnsForm.connectivityButton.isEnabled = true
     }
 
-    @objc private func testTraditionalDNSConnectivity() {
+    @objc func testTraditionalDNSConnectivity() {
         cancelDNSConnectivityTest()
         let draft = dnsForm.draft
         let servers = draft.traditionalServers
@@ -2383,7 +2534,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private func probeCaptivePortalIfNeeded() {
+    func probeCaptivePortalIfNeeded() {
         guard isEnhancedModeActive || isEngineActive else { return }
         CaptivePortalDetector.shared.checkPhysicalLink { [weak self] outcome in
             guard let self else { return }
@@ -2426,7 +2577,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         refreshConnectionStatus()
     }
 
-    private func restorePreferences() {
+    func restorePreferences() {
         let savedMode = UserDefaults.standard.string(forKey: "outboundMode")
         let mode = OutboundMode(rawValue: savedMode ?? "rule") ?? .rule
         if let saved = UserDefaults.standard.dictionary(forKey: "groupSelections") {
@@ -2434,8 +2585,24 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
                 if let value = item.value as? String { result[item.key] = value }
             }
         }
+        let restored = restoreProfileGroupSelectionsSnapshot(
+            text: profileTextView.string,
+            parsed: profile,
+            currentSelections: groupSelections,
+            preferredPolicy: UserDefaults.standard.string(forKey: "globalPolicy")
+        )
+        manualManagedGroupSelections = restored.manualGroups
+        groupSelections = restored.selections
+        UserDefaults.standard.set(groupSelections, forKey: "groupSelections")
         modePopup.selectItem(at: OutboundMode.allCases.firstIndex(of: mode) ?? 0)
-        refreshPolicies(preferred: UserDefaults.standard.string(forKey: "globalPolicy"))
+        refreshPolicies(preferred: restored.preferredGlobalPolicy)
+        saveCurrentProfileGroupSelectionsSnapshot(
+            text: profileTextView.string,
+            parsed: profile,
+            selections: groupSelections,
+            manualGroups: manualManagedGroupSelections,
+            globalPolicy: selectedPolicy
+        )
         refreshGroups(preferred: UserDefaults.standard.string(forKey: "selectedPolicyGroup"))
         refreshPolicyPage()
         refreshRulesPage()
@@ -2672,13 +2839,13 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private func refreshStartupSubscriptionsIfNeeded() {
+    func refreshStartupSubscriptionsIfNeeded() {
         guard startupSubscriptionsPending else { return }
         startupSubscriptionsPending = false
         updateSubscriptions(names: subscriptions.dueForRefresh().map(\.name), announce: false)
     }
 
-    private var ruleSetNetworkIsReady: Bool {
+    var ruleSetNetworkIsReady: Bool {
         RuleSetBackgroundRefreshPlan.isReady(
             restoringSession: restoringLaunchSession,
             engineRunning: engineStatus == .running,
@@ -2688,11 +2855,11 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     /// Capture on the main queue: configured ports may have been relocated.
     /// Enhanced-only sessions use their active TUN without starting a listener.
-    private var ruleSetDownloadProxy: ListenAddress? {
+    var ruleSetDownloadProxy: ListenAddress? {
         engineStatus == .running ? engine.activeHTTPListen : nil
     }
 
-    private func refreshRuleSetsAutomatically() {
+    func refreshRuleSetsAutomatically() {
         guard ruleSetNetworkIsReady, launchProfilePlan.profile != nil,
               ruleOperationID == nil, activeProfilePreparationGeneration == nil else { return }
         guard !profile.ruleSetReferences.isEmpty else {
@@ -2762,7 +2929,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     /// Rule bodies alone do not require rebinding HTTP/SOCKS or configuring
     /// node transports. Real TUN policy changes retain normal revalidation.
     @discardableResult
-    private func applyAutomaticallyRefreshedRuleSets(_ prepared: Profile) throws -> Bool {
+    func applyAutomaticallyRefreshedRuleSets(_ prepared: Profile) throws -> Bool {
         let previous = resolvedProfile ?? profile
         guard previous.ruleSetContents != prepared.ruleSetContents else {
             // Refresh warnings belong to the check's status. Changing the
@@ -2925,12 +3092,12 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private func persistEnhancedMode(_ enabled: Bool) {
+    func persistEnhancedMode(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: "enhancedModeEnabled")
         refreshConnectionStatus()
     }
 
-    private func persistSystemProxy(_ enabled: Bool) {
+    func persistSystemProxy(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: "systemProxyEnabled")
         refreshConnectionStatus()
     }
@@ -2940,14 +3107,14 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         return OutboundMode.allCases[index]
     }
 
-    private var selectedPolicy: String { policyPopup.titleOfSelectedItem ?? "DIRECT" }
+    var selectedPolicy: String { policyPopup.titleOfSelectedItem ?? "DIRECT" }
 
-    private var selectedGroup: String? {
+    var selectedGroup: String? {
         guard groupPopup.isEnabled else { return nil }
         return groupPopup.titleOfSelectedItem
     }
 
-    private func refreshPolicies(preferred: String?) {
+    func refreshPolicies(preferred: String?) {
         let old = preferred ?? policyPopup.titleOfSelectedItem
         let candidates = profile.globalProxyNodes.isEmpty ? profile.selectablePolicies : profile.globalProxyNodes
         policyPopup.removeAllItems()
@@ -2962,7 +3129,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         policyPopup.isEnabled = selectedMode == .proxy
     }
 
-    private func refreshGroups(preferred: String?) {
+    func refreshGroups(preferred: String?) {
         let names = profile.groupOrder.filter { name in
             guard let group = profile.groups[name], group.kind == .select else { return false }
             return group.parameters["hidden"].map(surgeBoolean) != true
@@ -2976,7 +3143,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         refreshGroupMembers()
     }
 
-    private func refreshGroupMembers() {
+    func refreshGroupMembers() {
         groupMemberPopup.removeAllItems()
         guard let selectedGroup, let group = profile.groups[selectedGroup] else {
             groupMemberPopup.isEnabled = false
@@ -2989,7 +3156,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         groupMemberPopup.isEnabled = !group.members.isEmpty
     }
 
-    private func refreshPolicyPage() {
+    func refreshPolicyPage() {
         pruneProxyCardMetadata()
         let groupPlan = PolicyListRefreshPlan(previousOrder: renderedGroupOrder,
                                              order: profile.groupOrder, changedNames: [])
@@ -3024,7 +3191,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private func scheduleProxySearch(after delay: TimeInterval = 0.15) {
+    func scheduleProxySearch(after delay: TimeInterval = 0.15) {
         proxySearchQueue.cancelAllOperations()
         proxySearchDebouncer.schedule(after: delay) { [weak self] generation in
             guard let self else { return }
@@ -3062,7 +3229,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private func applyProxySearch(names: [String], query: String, total: Int,
+    func applyProxySearch(names: [String], query: String, total: Int,
                                   immediately: Bool = false, forceFullReload: Bool = false) {
         let plan = PolicyListRefreshPlan(previousOrder: renderedProxyOrder, order: names, changedNames: [])
         filteredProxyNames = names
@@ -3085,9 +3252,9 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private var activeProxyCardName: String? { selectedMode == .proxy ? selectedPolicy : nil }
+    var activeProxyCardName: String? { selectedMode == .proxy ? selectedPolicy : nil }
 
-    private func pruneProxyCardMetadata() {
+    func pruneProxyCardMetadata() {
         let pruned = PolicyCardMetadataPruning.apply(metadata: renderedProxyPolicies, dirty: pendingProxyCards,
                                                      current: profile.proxies, order: profile.proxyOrder)
         renderedProxyPolicies = pruned.metadata
@@ -3095,7 +3262,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         proxyCardIdentities = pruned.identities
     }
 
-    private func syncDashboardRoutingControlsVisibility() {
+    func syncDashboardRoutingControlsVisibility() {
         let mode = selectedMode
         policyPopup.superview?.isHidden = (mode != .proxy)
         groupPopup.superview?.isHidden = (mode != .rule)
@@ -3105,7 +3272,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private func refreshActiveProxyCards() {
+    func refreshActiveProxyCards() {
         syncDashboardRoutingControlsVisibility()
         guard renderedActiveProxy != activeProxyCardName else { return }
         schedulePolicyCardUpdates(proxies: Set([renderedActiveProxy, activeProxyCardName].compactMap { $0 }))
@@ -3113,7 +3280,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     /// Keep dirty identities while the page/window is hidden; opening the page
     /// reconciles them once. This does not pause health checking or API updates.
-    private func schedulePolicyCardUpdates(proxies: Set<String> = [], groups: Set<String> = [],
+    func schedulePolicyCardUpdates(proxies: Set<String> = [], groups: Set<String> = [],
                                            immediately: Bool = false) {
         pendingProxyCards.formUnion(proxies.intersection(proxyCardIdentities))
         pendingProxyCards.formIntersection(proxyCardIdentities)
@@ -3133,7 +3300,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private func applyPendingPolicyCardUpdates() {
+    func applyPendingPolicyCardUpdates() {
         guard !policiesView.isHidden, window?.isVisible == true,
               !pendingProxyCards.isEmpty || !pendingGroupCards.isEmpty else { return }
         let proxies = pendingProxyCards.intersection(proxyCardIdentities)
@@ -3175,14 +3342,14 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private func refreshRulesPage(selecting selection: Set<Int>? = nil) {
+    func refreshRulesPage(selecting selection: Set<Int>? = nil) {
         if let selection {
             pendingRuleSelection = (profileTextView.string, profileRevision, selection)
         }
         scheduleRuleSearch(after: 0)
     }
 
-    private func scheduleRuleSearch(after delay: TimeInterval = 0.15) {
+    func scheduleRuleSearch(after delay: TimeInterval = 0.15) {
         ruleListQueue.cancelAllOperations()
         ruleSearchDebouncer.schedule(after: delay) { [weak self] generation in
             guard let self else { return }
@@ -3213,7 +3380,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         updateRuleSelectionControls()
     }
 
-    private func applyRuleList(_ snapshot: RuleListSnapshot, request: ListSearchRequest) {
+    func applyRuleList(_ snapshot: RuleListSnapshot, request: ListSearchRequest) {
         let previousText = rulesPageSourceText
         let selectedLines = selectedRuleSourceLines
         rulesPageSourceText = snapshot.sourceText
@@ -3262,12 +3429,12 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         updateRuleSelectionControls()
     }
 
-    private var selectedRuleSourceLines: Set<Int> {
+    var selectedRuleSourceLines: Set<Int> {
         RuleTableSelection.sourceLines(rows: rulesTableView.selectedRowIndexes,
                                        orderedSourceLines: filteredRuleSourceLines)
     }
 
-    private var selectedRuleSetLocations: Set<String> {
+    var selectedRuleSetLocations: Set<String> {
         let rows = rulesTableView.selectedRowIndexes
         guard !rows.isEmpty else { return rulesPageRuleSetLocations }
         return Set(rows.compactMap { row in
@@ -3277,12 +3444,12 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         })
     }
 
-    private var rulesPageIsEditable: Bool {
+    var rulesPageIsEditable: Bool {
         rulesPageSourceText == profileTextView.string && rulesPageRevision == profileRevision
             && rulesPageProfile != nil
     }
 
-    private func updateRuleSelectionControls() {
+    func updateRuleSelectionControls() {
         let count = selectedRuleSourceLines.count
         let editable = rulesPageIsEditable
         let available = editable && ruleOperationID == nil
@@ -3306,7 +3473,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         ruleSelectionCountLabel.stringValue = count == 0 ? "未选择" : "已选 \(count) 条"
     }
 
-    private func selectRuleSourceLines(_ lines: Set<Int>) {
+    func selectRuleSourceLines(_ lines: Set<Int>) {
         rulesTableView.selectRowIndexes(
             RuleTableSelection.rowIndexes(sourceLines: lines,
                                           orderedSourceLines: filteredRuleSourceLines),
@@ -3314,7 +3481,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         updateRuleSelectionControls()
     }
 
-    private func surgeBoolean(_ value: String) -> Bool {
+    func surgeBoolean(_ value: String) -> Bool {
         ["true", "yes", "on", "1"].contains(value.lowercased())
     }
 
@@ -3323,7 +3490,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     /// Automatic selections are seeded into `groupSelections` immediately so a
     /// managed group does not sit on its first declared member until the first
     /// probe round lands.
-    private func refreshPolicyHealth() {
+    func refreshPolicyHealth() {
         policyHealthEpoch &+= 1
         let epoch = policyHealthEpoch
         let selectionsChanged: ([String: String]) -> Void = { [weak self] selections in
@@ -3415,14 +3582,15 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    @objc private func navigate(_ sender: NSButton) { selectPage(sender.tag) }
+    @objc func navigate(_ sender: NSButton) { selectPage(sender.tag) }
 
-    private func selectPage(_ index: Int) {
+    func selectPage(_ index: Int) {
         let pages = [dashboardView, policiesView, rulesView, aboutView, settingsView]
         for (pageIndex, view) in pages.enumerated() { view.isHidden = pageIndex != index }
         for (buttonIndex, button) in navigationButtons.enumerated() {
             (button as? HajimiNavigationButton)?.isCurrentPage = buttonIndex == index
         }
+        if index == 0 { updateStatistics(force: true); nativeTrafficView.needsDisplay = true }
         if index == 1 { refreshPolicyPage(); applyPendingPolicyCardUpdates() }
         if index == 2 { refreshRulesPage() }
         if index == 4 { refreshSettings() }
@@ -3522,7 +3690,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private func prepareRuleSetsInBackground(
+    func prepareRuleSetsInBackground(
         _ source: Profile,
         completion: @escaping (Result<Profile, Error>) -> Void
     ) {
@@ -3864,29 +4032,36 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         refreshActiveProxyCards()
     }
 
-    @objc private func policyChanged() {
+    @objc func policyChanged() {
         UserDefaults.standard.set(selectedPolicy, forKey: "globalPolicy")
+        saveCurrentProfileGroupSelectionsSnapshot(
+            text: profileTextView.string,
+            parsed: profile,
+            selections: groupSelections,
+            manualGroups: manualManagedGroupSelections,
+            globalPolicy: selectedPolicy
+        )
         updateEngineRouting()
         updateOverviewDetails()
         refreshActiveProxyCards()
     }
 
-    @objc private func groupChanged() {
+    @objc func groupChanged() {
         if let selectedGroup {
             UserDefaults.standard.set(selectedGroup, forKey: "selectedPolicyGroup")
         }
         refreshGroupMembers()
     }
 
-    @objc private func groupMemberChanged() {
+    @objc func groupMemberChanged() {
         guard let selectedGroup, let member = groupMemberPopup.titleOfSelectedItem else { return }
         setGroupSelection(group: selectedGroup, member: member)
     }
 
-    @objc private func proxySearchChanged() { scheduleProxySearch() }
-    @objc private func ruleSearchChanged() { scheduleRuleSearch() }
+    @objc func proxySearchChanged() { scheduleProxySearch() }
+    @objc func ruleSearchChanged() { scheduleRuleSearch() }
 
-    @objc private func ruleMultiSelectionChanged() {
+    @objc func ruleMultiSelectionChanged() {
         let selection = selectedRuleSourceLines
         updateRuleSelectionControls()
         ruleSelectionRefreshInProgress = true
@@ -3895,19 +4070,19 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         selectRuleSourceLines(selection)
     }
 
-    @objc private func selectAllRules() {
+    @objc func selectAllRules() {
         guard rulesPageIsEditable else { refreshRulesPage(); return }
         rulesTableView.selectRowIndexes(IndexSet(integersIn: 0..<filteredRules.count),
                                         byExtendingSelection: false)
         updateRuleSelectionControls()
     }
 
-    @objc private func clearRuleSelection() {
+    @objc func clearRuleSelection() {
         rulesTableView.deselectAll(nil)
         updateRuleSelectionControls()
     }
 
-    @objc private func ruleRowSelectionChanged(_ sender: NSButton) {
+    @objc func ruleRowSelectionChanged(_ sender: NSButton) {
         guard rulesPageIsEditable,
               let row = filteredRules.firstIndex(where: { $0.sourceLine == sender.tag }) else {
             refreshRulesPage()
@@ -3920,14 +4095,14 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         updateRuleSelectionControls()
     }
 
-    @objc private func rulesDoubleClicked() {
+    @objc func rulesDoubleClicked() {
         let row = rulesTableView.clickedRow
         guard ruleOperationID == nil, filteredRules.indices.contains(row) else { return }
         rulesTableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         editSelectedRules()
     }
 
-    private var rulePolicyNames: [String] {
+    var rulePolicyNames: [String] {
         let source = rulesPageProfile ?? profile
         var names = ["DIRECT", "REJECT"]
         for name in source.groupOrder + source.proxyOrder where !names.contains(name) {
@@ -3936,7 +4111,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         return names
     }
 
-    private func ruleEditingSnapshot() throws -> (text: String, revision: Int) {
+    func ruleEditingSnapshot() throws -> (text: String, revision: Int) {
         guard ruleOperationID == nil else {
             throw ProfileApplyError.message("规则操作正在进行，请稍候")
         }
@@ -3948,7 +4123,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         return (profileTextView.string, profileRevision)
     }
 
-    private func verifyRuleEditingSnapshot(_ snapshot: (text: String, revision: Int)) throws {
+    func verifyRuleEditingSnapshot(_ snapshot: (text: String, revision: Int)) throws {
         guard snapshot.text == profileTextView.string, snapshot.revision == profileRevision else {
             throw ProfileApplyError.message("配置在编辑期间已变化，未覆盖新内容，请关闭编辑框后重新选择")
         }
@@ -3958,7 +4133,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         try verifyStoredProfileHasNotChanged(expected: lastKnownStoredProfileText)
     }
 
-    private func validateRulePolicy(_ rawPolicy: String, in text: String) throws {
+    func validateRulePolicy(_ rawPolicy: String, in text: String) throws {
         let source = try ProfileParser.parse(text)
         let policy = rawPolicy.trimmingCharacters(in: .whitespacesAndNewlines)
         guard policy == "DIRECT" || policy == "REJECT" ||
@@ -3967,767 +4142,8 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    @objc private func addRule() {
-        guard let window, ruleEditor == nil, rulePolicyEditor == nil else { return }
-        refreshRulesPage()
-        do {
-            let snapshot = try ruleEditingSnapshot()
-            let editor = RuleEditorSheetController(draft: nil, policyNames: rulePolicyNames) { [weak self] draft in
-                guard let self else { return }
-                try self.verifyRuleEditingSnapshot(snapshot)
-                try self.validateRulePolicy(draft.policy, in: snapshot.text)
-                var document = SurgeProfileDocument(snapshot.text)
-                let line = try document.insertRule(draft)
-                try self.applyRuleChange(document.text, snapshot: snapshot,
-                                         prefix: "已新增并应用规则", selection: [line])
-            }
-            ruleEditor = editor
-            guard let sheet = editor.window else { ruleEditor = nil; return }
-            window.beginSheet(sheet) { [weak self] _ in self?.ruleEditor = nil }
-        } catch {
-            showError(title: "无法新增规则", error: error)
-        }
-    }
 
-    @objc private func editSelectedRules() {
-        guard let window, ruleEditor == nil, rulePolicyEditor == nil else { return }
-        do {
-            let snapshot = try ruleEditingSnapshot()
-            let lines = selectedRuleSourceLines
-            guard !lines.isEmpty else { return }
-            if lines.count > 1 {
-                let editor = RulePolicySheetController(count: lines.count,
-                                                       policyNames: rulePolicyNames) { [weak self] policy in
-                    guard let self else { return }
-                    try self.verifyRuleEditingSnapshot(snapshot)
-                    try self.validateRulePolicy(policy, in: snapshot.text)
-                    var document = SurgeProfileDocument(snapshot.text)
-                    try document.setRulePolicies(atSourceLines: lines, policy: policy)
-                    try self.applyRuleChange(document.text, snapshot: snapshot,
-                                             prefix: "已更新并应用 \(lines.count) 条规则的策略",
-                                             selection: lines)
-                }
-                rulePolicyEditor = editor
-                guard let sheet = editor.window else { rulePolicyEditor = nil; return }
-                window.beginSheet(sheet) { [weak self] _ in self?.rulePolicyEditor = nil }
-            } else if let line = lines.first {
-                let draft = try SurgeProfileDocument(snapshot.text).ruleDraft(atSourceLine: line)
-                let editor = RuleEditorSheetController(draft: draft,
-                                                       policyNames: rulePolicyNames) { [weak self] updated in
-                    guard let self else { return }
-                    try self.verifyRuleEditingSnapshot(snapshot)
-                    try self.validateRulePolicy(updated.policy, in: snapshot.text)
-                    var document = SurgeProfileDocument(snapshot.text)
-                    try document.updateRule(atSourceLine: line, draft: updated)
-                    let changed = try ProfileParser.parse(document.text)
-                    let catchAll = ["FINAL", "MATCH"].contains(updated.type.uppercased())
-                    let selectedLine = catchAll
-                        ? changed.rules.first(where: { $0.kind == .final })?.sourceLine : line
-                    let selection = selectedLine.map { Set([$0]) } ?? []
-                    try self.applyRuleChange(document.text, snapshot: snapshot,
-                                             prefix: "已更新并应用规则",
-                                             selection: selection)
-                }
-                ruleEditor = editor
-                guard let sheet = editor.window else { ruleEditor = nil; return }
-                window.beginSheet(sheet) { [weak self] _ in self?.ruleEditor = nil }
-            }
-        } catch {
-            showError(title: "无法编辑规则", error: error)
-        }
-    }
-
-    @objc private func deleteSelectedRules() {
-        guard let window else { return }
-        do {
-            let snapshot = try ruleEditingSnapshot()
-            let lines = selectedRuleSourceLines
-            guard !lines.isEmpty else { return }
-            let selected = filteredRules.filter { lines.contains($0.sourceLine) }
-            let preview = selected.prefix(6).map { rule in
-                let description = ruleDescription(rule)
-                return "第 \(rule.sourceLine) 行 · \(description.type) · \(description.value.prefix(90))"
-            }.joined(separator: "\n")
-            let more = selected.count > 6 ? "\n…另有 \(selected.count - 6) 条" : ""
-            let finalWarning = selected.contains { $0.kind == .final }
-                ? "\n\n包含 FINAL / MATCH 兜底规则，删除会改变未命中流量的处理方式。" : ""
-            let alert = NSAlert()
-            alert.alertStyle = .warning
-            alert.messageText = "删除选中的 \(lines.count) 条规则？"
-            alert.informativeText = preview + more + finalWarning + "\n\n只删除选中主规则，保存后应用；不会删除远程规则集源文件。"
-            alert.addButton(withTitle: "删除")
-            alert.addButton(withTitle: "取消")
-            alert.buttons[0].keyEquivalent = ""
-            alert.buttons[1].keyEquivalent = "\r"
-            alert.beginSheetModal(for: window) { [weak self] response in
-                guard response == .alertFirstButtonReturn, let self else { return }
-                do {
-                    try self.verifyRuleEditingSnapshot(snapshot)
-                    var document = SurgeProfileDocument(snapshot.text)
-                    try document.deleteRules(atSourceLines: lines)
-                    try self.applyRuleChange(document.text, snapshot: snapshot,
-                                             prefix: "已删除并应用 \(lines.count) 条规则", selection: [])
-                } catch {
-                    self.showError(title: "无法删除规则", error: error)
-                }
-            }
-        } catch {
-            showError(title: "无法删除规则", error: error)
-        }
-    }
-
-    @objc private func updateRuleSets() {
-        do {
-            let snapshot = try ruleEditingSnapshot()
-            let locations = selectedRuleSetLocations
-            guard !locations.isEmpty else { return }
-            try applyRuleChange(snapshot.text, snapshot: snapshot,
-                                prefix: "已更新并应用 \(locations.count) 个规则集",
-                                selection: selectedRuleSourceLines,
-                                forceRefreshLocations: locations)
-        } catch {
-            showError(title: "无法更新规则集", error: error)
-        }
-    }
-
-    private func applyRuleChange(_ text: String, snapshot: (text: String, revision: Int),
-                                 prefix: String, selection: Set<Int>,
-                                 forceRefreshLocations: Set<String> = []) throws {
-        try verifyRuleEditingSnapshot(snapshot)
-        _ = try ProfileParser.parse(text)
-        let requestID = UUID()
-        ruleOperationID = requestID
-        ruleStatusLabel.stringValue = forceRefreshLocations.isEmpty
-            ? "正在后台保存并应用规则…"
-            : "正在后台更新 \(forceRefreshLocations.count) 个规则集，界面可继续使用…"
-        ruleStatusLabel.textColor = .systemBlue
-        ruleStatusLabel.toolTip = nil
-        updateRuleSelectionControls()
-        let recoveryGuard = ProfileApplyCommitGuard(generation: profileApplyGeneration &+ 1,
-                                                     revision: snapshot.revision,
-                                                     editorText: snapshot.text)
-        applyProfileTextInBackground(
-            text, prefix: prefix, keepEditorOnFailure: true,
-            forceRefreshRuleSetLocations: forceRefreshLocations,
-            stillApplicable: { [weak self] in self?.ruleOperationID == requestID }
-        ) { [weak self] result in
-            guard let self, self.ruleOperationID == requestID else { return }
-            self.ruleOperationID = nil
-            switch result {
-            case .success:
-                let warnings = (self.resolvedProfile?.warnings ?? [])
-                    .filter { $0.contains("RULE-SET") && $0.contains("更新失败") }
-                self.ruleStatusLabel.stringValue = warnings.isEmpty ? prefix
-                    : (forceRefreshLocations.isEmpty ? prefix + "；部分资源使用旧缓存"
-                       : "规则集检查已完成；部分更新失败，已继续使用旧缓存")
-                self.ruleStatusLabel.textColor = warnings.isEmpty ? .systemGreen : .systemOrange
-                self.ruleStatusLabel.toolTip = warnings.isEmpty ? nil : warnings.joined(separator: "\n")
-                self.refreshRulesPage(selecting: selection)
-            case .failure(let error):
-                // Keep a recoverable UI draft only if no newer edit replaced
-                // its baseline or superseded the save, even with identical text.
-                // The disk and running configuration stay intact.
-                let keepDraft = text != snapshot.text &&
-                    recoveryGuard.isCurrent(generation: self.profileApplyGeneration,
-                                            revision: self.profileRevision,
-                                            editorText: self.profileTextView.string)
-                if keepDraft { self.profileTextView.string = text }
-                self.refreshRulesPage()
-                self.ruleStatusLabel.stringValue = "未应用：\(error.localizedDescription)"
-                    
-                self.ruleStatusLabel.textColor = .systemRed
-                self.ruleStatusLabel.toolTip = error.localizedDescription
-            }
-            self.updateRuleSelectionControls()
-        }
-    }
-
-    @objc private func addProxy() {
-        presentProxyEditor(draft: nil, originalName: nil, isNew: true)
-    }
-
-    @objc private func importShareLinks() {
-        guard let window else { return }
-        ShareLinkImportSheetController.present(
-            on: window,
-            title: "导入分享链接",
-            confirmTitle: "导入节点",
-            allowMultiple: true
-        ) { [weak self] rawLinks in
-            guard let self else { return }
-            do {
-                let result = try self.commitShareLinks(rawLinks)
-                let shownNames = result.names.prefix(8).joined(separator: "、")
-                var message = "已添加 \(result.names.count) 个节点：\(shownNames)"
-                if result.names.count > 8 { message += " 等" }
-                if !result.warnings.isEmpty {
-                    message += "\n\n" + result.warnings.prefix(8).joined(separator: "\n")
-                    if result.warnings.count > 8 {
-                        message += "\n另有 \(result.warnings.count - 8) 条提示"
-                    }
-                }
-                if self.subscriptions.isActiveSubscriptionRemoteURL {
-                    message += "\n\n提示：当前使用的是 URL 下载的订阅配置，更新订阅会覆盖原文件中新增的节点或策略组信息。"
-                }
-                self.showMessage(title: "分享链接已导入", text: message)
-            } catch {
-                self.showError(title: "导入分享链接失败", error: error)
-            }
-        }
-    }
-
-    @objc private func addPolicyGroup() {
-        presentGroupEditor(draft: nil, originalName: nil, isNew: true)
-    }
-
-    @objc private func editSelectedProxy() {
-        let row = proxyTableView.clickedRow >= 0 ? proxyTableView.clickedRow : proxyTableView.selectedRow
-        guard filteredProxyNames.indices.contains(row) else { return }
-        editProxy(named: filteredProxyNames[row])
-    }
-
-    @objc private func proxyMenuEdit(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String else { return }
-        editProxy(named: name)
-    }
-
-    @objc private func proxyMenuDuplicate(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String,
-              let policy = profile.proxies[name] else { return }
-        var draft = SurgeProxyDraft(policy: policy)
-        draft.name = uniqueProxyName(basedOn: name)
-        presentProxyEditor(draft: draft, originalName: nil, isNew: true)
-    }
-
-    @objc private func proxyMenuDelete(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String else { return }
-        confirmDeleteProxy(named: name)
-    }
-
-    @objc private func proxyMenuUse(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String else { return }
-        useProxy(named: name)
-    }
-
-    @objc private func proxyMenuTest(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String else { return }
-        testNode(named: name)
-    }
-
-    @objc private func groupMenuEdit(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String,
-              let group = profile.groups[name] else { return }
-        presentGroupEditor(draft: SurgePolicyGroupDraft(group: group),
-                           originalName: name, isNew: false)
-    }
-
-    @objc private func groupMenuDuplicate(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String,
-              let group = profile.groups[name] else { return }
-        var draft = SurgePolicyGroupDraft(group: group)
-        draft.name = uniqueGroupName(basedOn: name)
-        presentGroupEditor(draft: draft, originalName: nil, isNew: true)
-    }
-
-    @objc private func groupMenuDelete(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String else { return }
-        confirmDeleteGroup(named: name)
-    }
-
-    @objc private func testAllNodes() {
-        cancelNodeTests(refresh: false)
-        for name in profile.proxyOrder { nodeLatencies[name] = .queued }
-        nodeProbeBatch = NodeProbeBatchCursor(names: profile.proxyOrder)
-        policyStatusLabel.stringValue = "正在测试 \(profile.proxyOrder.count) 个节点（独立并发队列 24，排队不计入延迟）…"
-        policyStatusLabel.textColor = .systemBlue
-        pumpNodeProbeBatch(refreshStarts: false)
-        schedulePolicyCardUpdates(proxies: Set(profile.proxyOrder), immediately: true)
-    }
-
-    private func isEditableProxy(named name: String) -> Bool {
-        guard let policy = profile.proxies[name],
-              policy.kind != .direct, policy.kind != .reject else { return false }
-        if policy.adapterType?.lowercased() == "wireguard" {
-            return SurgeProfileDocument(profileTextView.string).containsProxy(named: name)
-        }
-        return true
-    }
-
-    private func editProxy(named name: String) {
-        guard isEditableProxy(named: name) else {
-            showMessage(title: "请在原始配置中编辑",
-                        text: "“\(name)”来自 [WireGuard \(name)] 等独立配置段，暂不支持直接编辑；它仍可复制为新的 [Proxy] 节点。")
-            return
-        }
-        guard let policy = profile.proxies[name] else { return }
-        presentProxyEditor(draft: SurgeProxyDraft(policy: policy), originalName: name, isNew: false)
-    }
-
-    private func editPolicyGroup(named name: String) {
-        guard let group = profile.groups[name] else { return }
-        presentGroupEditor(draft: SurgePolicyGroupDraft(group: group), originalName: name, isNew: false)
-    }
-
-    private func presentProxyEditor(draft: SurgeProxyDraft?, originalName: String?, isNew: Bool) {
-        guard let window, nodeEditor == nil else { return }
-        let unavailable = Set(profile.proxies.keys).union(profile.groups.keys)
-        let editor = SurgeProxyEditorController(draft: draft, isNew: isNew,
-                                                unavailableNames: unavailable,
-                                                availableProxyNames: profile.proxyOrder) { [weak self] updated in
-            guard let self else { return }
-            try self.commitProxyDraft(updated, originalName: originalName)
-        }
-        nodeEditor = editor
-        guard let sheet = editor.window else { nodeEditor = nil; return }
-        window.beginSheet(sheet) { [weak self] _ in self?.nodeEditor = nil }
-    }
-
-    private func presentGroupEditor(draft: SurgePolicyGroupDraft?, originalName: String?, isNew: Bool) {
-        guard let window, groupEditor == nil, nodeEditor == nil else { return }
-        let unavailable = Set(profile.proxies.keys).union(profile.groups.keys)
-        var policies = profile.groupOrder + profile.proxyOrder
-        for builtin in ["DIRECT", "REJECT"] where !policies.contains(builtin) { policies.append(builtin) }
-        let editor = PolicyGroupEditorController(draft: draft, isNew: isNew,
-                                                 unavailableNames: unavailable,
-                                                 availablePolicies: policies) { [weak self] updated in
-            guard let self else { return }
-            try self.commitGroupDraft(updated, originalName: originalName)
-        }
-        groupEditor = editor
-        guard let sheet = editor.window else { groupEditor = nil; return }
-        window.beginSheet(sheet) { [weak self] _ in self?.groupEditor = nil }
-    }
-
-    private func notifyURLSubscriptionEditIfNeeded() {
-        guard subscriptions.isActiveSubscriptionRemoteURL,
-              let sub = subscriptions.activeSubscription else { return }
-        policyStatusLabel.stringValue += "（URL 订阅提示：更新订阅会覆盖新增或修改的节点/策略组）"
-        DispatchQueue.main.async { [weak self] in
-            guard let self, let window = self.window else { return }
-            let alert = NSAlert()
-            alert.alertStyle = .informational
-            alert.messageText = "已保存到配置文件（URL 订阅提示）"
-            alert.informativeText = "当前使用的是 URL 下载的订阅配置“\(sub.name)”，本次编辑的节点或策略组已直接保存到本地配置文件，下次打开应用无需重新添加。\n\n请注意：后续如果执行“更新订阅”，远程下载的订阅内容将会覆盖原文件中新增或修改的节点与策略组信息。"
-            alert.addButton(withTitle: "知道了")
-            alert.beginSheetModal(for: window, completionHandler: nil)
-        }
-    }
-
-    private func commitProxyDraft(_ draft: SurgeProxyDraft, originalName: String?) throws {
-        var document = SurgeProfileDocument(profileTextView.string)
-        try document.upsertProxy(originalName: originalName, draft: draft,
-                                 appendToSelectGroups: originalName == nil)
-
-        let oldSelectedPolicy = selectedPolicy
-        let preferredPolicy = oldSelectedPolicy == originalName ? draft.name : oldSelectedPolicy
-        let previousSelections = groupSelections
-        let oldLatency = originalName.flatMap { nodeLatencies[$0] }
-        let oldHost = originalName.flatMap { profile.proxies[$0]?.host }
-        let oldPort = originalName.flatMap { profile.proxies[$0]?.port }
-        let replacedPolicy: (from: String, to: String)? =
-            (originalName != nil && originalName != draft.name) ? (originalName!, draft.name) : nil
-        if let originalName, originalName != draft.name {
-            for (group, member) in groupSelections where member == originalName {
-                groupSelections[group] = draft.name
-            }
-        }
-        do {
-            try applyProfileText(document.text, prefix: originalName == nil ? "已添加并应用节点" : "已更新并应用节点",
-                                 preferredPolicy: preferredPolicy,
-                                 reusingRulesFrom: profile,
-                                 replacedRulePolicy: replacedPolicy)
-        } catch {
-            groupSelections = previousSelections
-            throw error
-        }
-        if let originalName, originalName != draft.name,
-           let oldLatency, oldHost == draft.host, oldPort == draft.port {
-            nodeLatencies[draft.name] = oldLatency
-            schedulePolicyCardUpdates(proxies: [draft.name])
-        }
-        policyStatusLabel.stringValue = "✓ \(draft.name) 已保存到配置文件" +
-            ((engineStatus == .running || engineStatus == .starting) ? "，代理引擎已热重载" : "")
-        policyStatusLabel.textColor = .systemGreen
-        notifyURLSubscriptionEditIfNeeded()
-    }
-
-    private func commitShareLinks(_ text: String) throws
-        -> (names: [String], warnings: [String]) {
-        let parsed = try ShareLinkSubscription.parse(text)
-        var document = SurgeProfileDocument(profileTextView.string)
-        var used = Set(profile.proxies.keys).union(profile.groups.keys)
-        var names: [String] = []
-        var drafts: [SurgeProxyDraft] = []
-        var warnings = parsed.warnings
-
-        for policy in parsed.proxies {
-            var draft = SurgeProxyDraft(policy: policy)
-            let original = draft.name
-            var candidate = original
-            var suffix = 2
-            while used.contains(candidate) {
-                candidate = "\(original) \(suffix)"
-                suffix += 1
-            }
-            if candidate != original {
-                warnings.append("节点名已调整：\(original) → \(candidate)")
-            }
-            draft.name = candidate
-            drafts.append(draft)
-            used.insert(candidate)
-            names.append(candidate)
-        }
-        try document.insertProxies(drafts, appendToSelectGroups: true)
-
-        try applyProfileText(document.text, prefix: "已导入分享链接",
-                             preferredPolicy: selectedPolicy,
-                             reusingRulesFrom: profile)
-        policyStatusLabel.stringValue = "✓ 已从分享链接导入 \(names.count) 个节点并保存到配置文件"
-        policyStatusLabel.textColor = .systemGreen
-        notifyURLSubscriptionEditIfNeeded()
-        return (names, warnings)
-    }
-
-    private func commitGroupDraft(_ draft: SurgePolicyGroupDraft, originalName: String?) throws {
-        var document = SurgeProfileDocument(profileTextView.string)
-        try document.upsertGroup(originalName: originalName, draft: draft)
-        let preferredPolicy = selectedPolicy == originalName ? draft.name : selectedPolicy
-        let previousSelections = groupSelections
-        let replacedPolicy: (from: String, to: String)? =
-            (originalName != nil && originalName != draft.name) ? (originalName!, draft.name) : nil
-        if let originalName, originalName != draft.name {
-            let oldSelection = groupSelections.removeValue(forKey: originalName)
-            if let oldSelection, draft.members.contains(oldSelection) {
-                groupSelections[draft.name] = oldSelection
-            }
-            for (group, member) in groupSelections where member == originalName {
-                groupSelections[group] = draft.name
-            }
-        }
-        do {
-            try applyProfileText(document.text,
-                                 prefix: originalName == nil ? "已添加并应用策略组" : "已更新并应用策略组",
-                                 preferredPolicy: preferredPolicy,
-                                 preferredGroup: draft.name,
-                                 reusingRulesFrom: profile,
-                                 replacedRulePolicy: replacedPolicy)
-        } catch {
-            groupSelections = previousSelections
-            throw error
-        }
-        policyStatusLabel.stringValue = "✓ 策略组 \(draft.name) 已保存到配置文件并应用"
-        policyStatusLabel.textColor = .systemGreen
-        notifyURLSubscriptionEditIfNeeded()
-    }
-
-    private func confirmDeleteProxy(named name: String) {
-        guard isEditableProxy(named: name) else {
-            showMessage(title: "不能在节点列表删除",
-                        text: "该节点来自独立的 WireGuard 配置段，请通过更新或更换订阅移除。")
-            return
-        }
-        let groupReferences = profile.groups.values.filter { $0.members.contains(name) }.count
-        let ruleReferences = profile.rules.filter { $0.policy == name }.count
-        let dialerReferences = profile.adapterPolicies.filter {
-            $0.parameters["underlying-proxy"] == name || $0.parameters["dialer-proxy"] == name
-        }.count
-        let alert = NSAlert()
-        alert.messageText = "删除节点“\(name)”？"
-        alert.informativeText = "将从 \(groupReferences) 个策略组移除，并把 \(ruleReferences) 条规则、\(dialerReferences) 个底层代理引用改为 DIRECT。修改会立即写入并应用。"
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "删除")
-        alert.addButton(withTitle: "取消")
-        guard let window else { return }
-        alert.beginSheetModal(for: window) { [weak self] response in
-            guard response == .alertFirstButtonReturn, let self else { return }
-            do {
-                var updated = SurgeProfileDocument(self.profileTextView.string)
-                try updated.deleteProxy(named: name)
-                let preferred = self.selectedPolicy == name ? "DIRECT" : self.selectedPolicy
-                try self.applyProfileText(updated.text, prefix: "已删除并应用节点",
-                                          preferredPolicy: preferred,
-                                          reusingRulesFrom: self.profile,
-                                          replacedRulePolicy: (name, "DIRECT"))
-                self.policyStatusLabel.stringValue = "✓ 已删除 \(name)，相关引用已安全更新"
-                self.policyStatusLabel.textColor = .systemGreen
-                self.notifyURLSubscriptionEditIfNeeded()
-            } catch {
-                self.showError(title: "删除节点失败", error: error)
-            }
-        }
-    }
-
-    private func confirmDeleteGroup(named name: String) {
-        let nestedReferences = profile.groups.values.filter { $0.name != name && $0.members.contains(name) }.count
-        let ruleReferences = profile.rules.filter { $0.policy == name }.count
-        let alert = NSAlert()
-        alert.messageText = "删除策略组“\(name)”？"
-        alert.informativeText = "将从 \(nestedReferences) 个上级策略组移除，并把 \(ruleReferences) 条规则引用切换到 DIRECT。"
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "删除")
-        alert.addButton(withTitle: "取消")
-        guard let window else { return }
-        alert.beginSheetModal(for: window) { [weak self] response in
-            guard response == .alertFirstButtonReturn, let self else { return }
-            do {
-                var document = SurgeProfileDocument(self.profileTextView.string)
-                try document.deleteGroup(named: name)
-                let preferred = self.selectedPolicy == name ? "DIRECT" : self.selectedPolicy
-                try self.applyProfileText(document.text, prefix: "已删除并应用策略组",
-                                          preferredPolicy: preferred,
-                                          reusingRulesFrom: self.profile,
-                                          replacedRulePolicy: (name, "DIRECT"))
-                self.policyStatusLabel.stringValue = "✓ 已删除策略组 \(name)"
-                self.policyStatusLabel.textColor = .systemGreen
-                self.notifyURLSubscriptionEditIfNeeded()
-            } catch { self.showError(title: "删除策略组失败", error: error) }
-        }
-    }
-
-    private func useProxy(named name: String) {
-        guard profile.groups[name] == nil, profile.selectablePolicies.contains(name) else { return }
-        modePopup.selectItem(at: OutboundMode.allCases.firstIndex(of: .proxy) ?? 2)
-        policyPopup.selectItem(withTitle: name)
-        policyPopup.isEnabled = true
-        UserDefaults.standard.set(OutboundMode.proxy.rawValue, forKey: "outboundMode")
-        UserDefaults.standard.set(name, forKey: "globalPolicy")
-        updateEngineRouting()
-        updateOverviewDetails()
-        refreshActiveProxyCards()
-        policyStatusLabel.stringValue = "✓ 全局代理已切换到 \(name)，新连接立即使用"
-        policyStatusLabel.textColor = .systemGreen
-    }
-
-    private func testNode(named name: String) {
-        // A new manual test supersedes a running bulk round. No old queued or
-        // late callback may overwrite the fresh per-node request identifier.
-        if nodeProbeBatch != nil { cancelNodeTests() }
-        policyStatusLabel.stringValue = "正在测试节点 TCP 建连延迟（排队不计入延迟）…"
-        policyStatusLabel.textColor = .systemBlue
-        startNodeProbe(named: name, requestID: UUID(), batchID: nil, refreshStart: true)
-    }
-
-    private func startNodeProbe(named name: String, requestID: UUID, batchID: UUID?, refreshStart: Bool) {
-        nodeProbeTickets.removeValue(forKey: name)?.cancel()
-        nodeProbeRequests[name] = requestID
-        let epoch = nodeProbeEpoch
-        guard let policy = profile.proxies[name], let host = policy.host, let port = policy.port else {
-            // Keep even invalid-node completions asynchronous so a large
-            // invalid profile cannot recursively refill the entire batch.
-            DispatchQueue.main.async { [weak self] in
-                self?.finishNodeProbe(named: name, requestID: requestID, batchID: batchID,
-                                      epoch: epoch, result: .failure(NWError.posix(.EINVAL)))
-            }
-            return
-        }
-        nodeLatencies[name] = .testing
-        if refreshStart { schedulePolicyCardUpdates(proxies: [name]) }
-        let isUDP = TCPNodeLatencyProbe.usesUDPTransport(policy)
-        nodeProbeTickets[name] = TCPNodeLatencyProbe.measure(host: host, port: port, udp: isUDP) { [weak self] result in
-            self?.finishNodeProbe(named: name, requestID: requestID, batchID: batchID, epoch: epoch, result: result)
-        }
-    }
-
-    private func finishNodeProbe(named name: String, requestID: UUID, batchID: UUID?, epoch: UInt64,
-                                 result: Result<Int, Error>) {
-        guard nodeProbeEpoch == epoch, nodeProbeRequests[name] == requestID else { return }
-        nodeProbeRequests.removeValue(forKey: name)
-        nodeProbeTickets.removeValue(forKey: name)
-        switch result {
-        case .success(let milliseconds): nodeLatencies[name] = .success(milliseconds)
-        case .failure(let error):
-            nodeLatencies[name] = NodeLatency.from(error: error)
-        }
-        schedulePolicyCardUpdates(proxies: [name])
-        if let batchID, nodeProbeBatch?.id == batchID {
-            nodeProbeBatch?.finish(requestID)
-            pumpNodeProbeBatch()
-        } else if nodeProbeRequests.isEmpty, nodeProbeBatch == nil {
-            policyStatusLabel.stringValue = "节点 TCP 延迟测试完成；超限或排队超时不代表节点不可达"
-            policyStatusLabel.textColor = .secondaryLabelColor
-        }
-        onStatusBarStateChanged?()
-    }
-
-    private func pumpNodeProbeBatch(refreshStarts: Bool = true) {
-        guard let batchID = nodeProbeBatch?.id else { return }
-        while let request = nodeProbeBatch?.takeNext() {
-            startNodeProbe(named: request.name, requestID: request.id, batchID: batchID,
-                           refreshStart: refreshStarts)
-        }
-        if nodeProbeBatch?.isComplete == true {
-            let names = nodeProbeBatch?.names ?? []
-            let successes = names.reduce(0) { count, name in
-                if case .success? = nodeLatencies[name] { return count + 1 }; return count
-            }
-            let deferred = names.reduce(0) { count, name in
-                if case .unavailable(let failure)? = nodeLatencies[name], failure != .requestExpired {
-                    return count + 1
-                }; return count
-            }
-            nodeProbeBatch = nil
-            policyStatusLabel.stringValue = "延迟测试完成：\(successes) 个可建立 TCP 连接，\(deferred) 个未测试（资源或排队限制）"
-            policyStatusLabel.textColor = .secondaryLabelColor
-        }
-    }
-
-    private func cancelNodeTests(refresh: Bool = true) {
-        let wasTesting = !nodeProbeRequests.isEmpty || nodeProbeBatch != nil
-        nodeProbeEpoch &+= 1
-        let tickets = Array(nodeProbeTickets.values)
-        nodeProbeTickets.removeAll(); nodeProbeRequests.removeAll(); nodeProbeBatch = nil
-        var changed = Set<String>()
-        for (name, latency) in nodeLatencies where latency == .testing || latency == .queued {
-            nodeLatencies[name] = .untested
-            changed.insert(name)
-        }
-        tickets.forEach { $0.cancel() }
-        if wasTesting {
-            policyStatusLabel.stringValue = "上一轮测速已取消，旧结果不会覆盖当前配置"
-            policyStatusLabel.textColor = .secondaryLabelColor
-        }
-        if refresh { schedulePolicyCardUpdates(proxies: changed) }
-        else { pendingProxyCards.formUnion(changed) }
-    }
-
-    private func uniqueProxyName(basedOn name: String) -> String {
-        let base = name + " 副本"
-        if profile.proxies[base] == nil, profile.groups[base] == nil { return base }
-        var index = 2
-        while profile.proxies["\(base) \(index)"] != nil || profile.groups["\(base) \(index)"] != nil {
-            index += 1
-        }
-        return "\(base) \(index)"
-    }
-
-    private func uniqueGroupName(basedOn name: String) -> String {
-        let base = name + " 副本"
-        if profile.groups[base] == nil, profile.proxies[base] == nil { return base }
-        var index = 2
-        while profile.groups["\(base) \(index)"] != nil || profile.proxies["\(base) \(index)"] != nil {
-            index += 1
-        }
-        return "\(base) \(index)"
-    }
-
-    private func setGroupSelection(group name: String, member: String?) {
-        if let member {
-            if let group = profile.groups[name], PolicyHealthMonitor.managesSelection(of: group) {
-                manualManagedGroupSelections.insert(name)
-            }
-            groupSelections[name] = member
-        } else {
-            manualManagedGroupSelections.remove(name)
-            if let autoMember = policyHealth.currentSelections[name] {
-                groupSelections[name] = autoMember
-            } else {
-                groupSelections.removeValue(forKey: name)
-            }
-        }
-        UserDefaults.standard.set(groupSelections, forKey: "groupSelections")
-        if selectedGroup == name { refreshGroupMembers() }
-        updateEngineRouting()
-        updateOverviewDetails()
-        schedulePolicyCardUpdates(groups: [name])
-        policyStatusLabel.stringValue = member.map { "✓ \(name) 已切换到 \($0)" } ?? "✓ \(name) 已恢复配置默认行为"
-        policyStatusLabel.textColor = .systemGreen
-        onStatusBarStateChanged?()
-    }
-
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        if menu === rulesTableView.menu {
-            menu.removeAllItems()
-            let row = rulesTableView.clickedRow
-            if filteredRules.indices.contains(row), !rulesTableView.selectedRowIndexes.contains(row) {
-                rulesTableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-            }
-            updateRuleSelectionControls()
-            func add(_ title: String, _ action: Selector, enabled: Bool) {
-                let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
-                item.target = self
-                item.isEnabled = enabled
-                menu.addItem(item)
-            }
-            add("新增规则…", #selector(addRule), enabled: ruleAddButton.isEnabled)
-            add(ruleEditButton.title + "…", #selector(editSelectedRules), enabled: ruleEditButton.isEnabled)
-            add("删除选中规则…", #selector(deleteSelectedRules), enabled: ruleDeleteButton.isEnabled)
-            menu.addItem(.separator())
-            add(selectedRuleSourceLines.isEmpty ? "更新全部规则集" : "更新选中规则集",
-                #selector(updateRuleSets), enabled: ruleUpdateButton.isEnabled)
-            menu.addItem(.separator())
-            add("全选当前搜索结果", #selector(selectAllRules), enabled: ruleSelectAllButton.isEnabled)
-            add("取消选择", #selector(clearRuleSelection), enabled: ruleClearSelectionButton.isEnabled)
-            return
-        }
-        guard menu === proxyTableView.menu else { return }
-        menu.removeAllItems()
-        let row = proxyTableView.clickedRow >= 0 ? proxyTableView.clickedRow : proxyTableView.selectedRow
-        guard filteredProxyNames.indices.contains(row) else { return }
-        populateProxyMenu(menu, name: filteredProxyNames[row])
-    }
-
-    private func makeProxyMenu(name: String) -> NSMenu {
-        let menu = NSMenu(title: name)
-        populateProxyMenu(menu, name: name)
-        return menu
-    }
-
-    @objc private func groupMenuToggleStatusBar(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String,
-              let group = profile.groups[name] else { return }
-        var draft = SurgePolicyGroupDraft(group: group)
-        if group.showsInStatusBar {
-            draft.parameters["show-in-status-bar"] = "false"
-        } else if draft.parameters["hidden"].map({ ["true", "yes", "on", "1"].contains($0.lowercased()) }) == true {
-            draft.parameters["show-in-status-bar"] = "true"
-        } else {
-            draft.parameters.removeValue(forKey: "show-in-status-bar")
-        }
-        do {
-            try commitGroupDraft(draft, originalName: name)
-            onStatusBarStateChanged?()
-        } catch {
-            showError(title: "无法更新状态栏显示设置", error: error)
-        }
-    }
-
-    private func makeGroupMenu(name: String) -> NSMenu {
-        let menu = NSMenu(title: name)
-        func item(_ title: String, _ action: Selector) -> NSMenuItem {
-            let value = NSMenuItem(title: title, action: action, keyEquivalent: "")
-            value.target = self
-            value.representedObject = name
-            return value
-        }
-        let statusItemToggle = item("在顶部状态栏菜单中显示", #selector(groupMenuToggleStatusBar(_:)))
-        statusItemToggle.state = (profile.groups[name]?.showsInStatusBar ?? true) ? .on : .off
-        menu.addItem(statusItemToggle)
-        menu.addItem(.separator())
-        menu.addItem(item("编辑成员与选项…", #selector(groupMenuEdit(_:))))
-        menu.addItem(item("复制策略组…", #selector(groupMenuDuplicate(_:))))
-        menu.addItem(.separator())
-        menu.addItem(item("删除策略组…", #selector(groupMenuDelete(_:))))
-        return menu
-    }
-
-    private func populateProxyMenu(_ menu: NSMenu, name: String) {
-        let editable = isEditableProxy(named: name)
-        func item(_ title: String, _ action: Selector, enabled: Bool = true) -> NSMenuItem {
-            let value = NSMenuItem(title: title, action: action, keyEquivalent: "")
-            value.target = self
-            value.representedObject = name
-            value.isEnabled = enabled
-            return value
-        }
-        menu.addItem(item("作为全局代理使用", #selector(proxyMenuUse(_:))))
-        menu.addItem(item("测试 TCP 延迟", #selector(proxyMenuTest(_:))))
-        menu.addItem(.separator())
-        menu.addItem(item("编辑…", #selector(proxyMenuEdit(_:)), enabled: editable))
-        menu.addItem(item("复制…", #selector(proxyMenuDuplicate(_:))))
-        menu.addItem(item("删除…", #selector(proxyMenuDelete(_:)), enabled: editable))
-    }
-
-    @objc private func validateProfile() {
+    @objc func validateProfile() {
         let text = profileTextView.string
         let proxy = ruleSetDownloadProxy
         profileValidationGeneration += 1
@@ -4761,14 +4177,14 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    @objc private func saveProfile() {
+    @objc func saveProfile() {
         applyProfileTextInBackground(profileTextView.string, prefix: "已保存并重载")
     }
 
     /// Resolve remote RULE-SETs away from AppKit's main thread. The editor,
     /// running profile and subscription definitions are checked again before
     /// anything is written, since preparation may outlive a user's next edit.
-    private func applyProfileTextInBackground(
+    func applyProfileTextInBackground(
         _ text: String, prefix: String, keepEditorOnFailure: Bool = false,
         allowExternalChanges: Bool = false,
         forceRefreshRuleSetLocations: Set<String> = [],
@@ -4849,13 +4265,13 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private func reportProfileApplyFailure(_ error: Error) {
+    func reportProfileApplyFailure(_ error: Error) {
         profileStatus.stringValue = "✕ \(error.localizedDescription)"
         profileStatus.textColor = .systemRed
         profileStatus.toolTip = error.localizedDescription
     }
 
-    private func verifyStoredProfileHasNotChanged(expected: String?) throws {
+    func verifyStoredProfileHasNotChanged(expected: String?) throws {
         guard let expected else { return } // Allow repair when the initial file was unreadable.
         let actual = try configurationStore.loadTextThrowing()
         guard ProfileApplyCommitGuard.diskTextMatches(expected: expected, actual: actual) else {
@@ -4864,7 +4280,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private func autoManagedHealthGroupsChanged(from oldProfile: Profile, to newProfile: Profile) -> Bool {
+    func autoManagedHealthGroupsChanged(from oldProfile: Profile, to newProfile: Profile) -> Bool {
         let oldManaged = oldProfile.groups.filter { PolicyHealthMonitor.managesSelection(of: $0.value) }
         let newManaged = newProfile.groups.filter { PolicyHealthMonitor.managesSelection(of: $0.value) }
         guard oldManaged == newManaged else { return true }
@@ -4880,7 +4296,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         return false
     }
 
-    private func applyProfileText(_ text: String, prefix: String,
+    func applyProfileText(_ text: String, prefix: String,
                                   preferredPolicy: String?,
                                   preferredGroup: String? = nil,
                                   keepEditorOnFailure: Bool = false,
@@ -4925,7 +4341,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
                                      alreadyVerifiedStoredText: true)
     }
 
-    private func applyPreparedProfileText(_ text: String, parsed: Profile,
+    func applyPreparedProfileText(_ text: String, parsed: Profile,
                                           resolved: Profile, prefix: String,
                                           preferredPolicy: String?,
                                           preferredGroup: String? = nil,
@@ -4957,6 +4373,16 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         let oldSelectedPolicy = selectedPolicy
         let oldSelectedGroup = selectedGroup
         let oldGroupSelections = groupSelections
+        let oldManualManagedGroups = manualManagedGroupSelections
+        if !oldProfile.groups.isEmpty {
+            saveCurrentProfileGroupSelectionsSnapshot(
+                text: oldStoredText,
+                parsed: oldProfile,
+                selections: oldGroupSelections,
+                manualGroups: oldManualManagedGroups,
+                globalPolicy: oldSelectedPolicy
+            )
+        }
         let oldLatencies = nodeLatencies.mapValues { $0 == .testing || $0 == .queued ? .untested : $0 }
         let oldPolicyLatencies = policyLatencies
         try configurationStore.save(text)
@@ -4969,12 +4395,24 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         if profileTextView.string != text {
             profileTextView.string = text
         }
-        refreshPolicies(preferred: preferredPolicy)
+        let restored = restoreProfileGroupSelectionsSnapshot(
+            text: text,
+            parsed: parsed,
+            currentSelections: oldGroupSelections,
+            preferredPolicy: preferredPolicy
+        )
+        manualManagedGroupSelections = restored.manualGroups
+        groupSelections = restored.selections
+        refreshPolicies(preferred: restored.preferredGlobalPolicy)
         UserDefaults.standard.set(selectedPolicy, forKey: "globalPolicy")
-        groupSelections = groupSelections.filter { name, member in
-            parsed.groups[name]?.members.contains(member) == true
-        }
         UserDefaults.standard.set(groupSelections, forKey: "groupSelections")
+        saveCurrentProfileGroupSelectionsSnapshot(
+            text: text,
+            parsed: parsed,
+            selections: groupSelections,
+            manualGroups: manualManagedGroupSelections,
+            globalPolicy: selectedPolicy
+        )
         refreshGroups(preferred: preferredGroup ?? oldSelectedGroup)
         nodeLatencies = nodeLatencies.filter { name, _ in
             parsed.proxies[name] != nil && parsed.proxies[name] == oldProfile.proxies[name]
@@ -5025,6 +4463,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
                 }
                 refreshPolicies(preferred: oldSelectedPolicy)
                 UserDefaults.standard.set(selectedPolicy, forKey: "globalPolicy")
+                manualManagedGroupSelections = oldManualManagedGroups
                 groupSelections = oldGroupSelections
                 UserDefaults.standard.set(groupSelections, forKey: "groupSelections")
                 nodeLatencies = oldLatencies
@@ -5073,693 +4512,10 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    @objc private func revealProfile() {
+    @objc func revealProfile() {
         NSWorkspace.shared.activateFileViewerSelecting([configurationStore.profileURL])
     }
 
-    // MARK: Subscriptions
-
-    /// Ensures that on launch, if a subscription is selected and cached, the
-    /// profile does not retain mixed nodes or groups from other subscriptions
-    /// or previous unbracketed imports.
-    private func reconcileStartupActiveSubscription() {
-        let current = profileTextView.string
-        if !profile.globalProxyNodes.isEmpty || !profile.groups.isEmpty {
-            subscriptions.syncEditedProfileText(current, proxyCount: profile.globalProxyNodes.count)
-            return
-        }
-        guard let activeName = subscriptions.selectedName,
-              let prepared = try? subscriptions.prepareSelection(name: activeName) else { return }
-        let cleaned = SubscriptionRefreshMerge.activate(
-            (name: prepared.name, contents: prepared.contents),
-            toCurrentText: { current })
-        guard cleaned != current,
-              let parsed = try? ProfileParser.parse(cleaned) else { return }
-        profile = parsed
-        launchProfilePlan = .ready(parsed)
-        profileTextView.string = cleaned
-        try? configurationStore.save(cleaned)
-        lastKnownStoredProfileText = cleaned
-    }
-
-    private func refreshSubscriptionSettings(preferredSelection: String? = nil) {
-        let all = subscriptions.all
-        let activeName = subscriptions.selectedName
-        let currentPopupSelection = preferredSelection ?? subscriptionSelectPopup.titleOfSelectedItem ?? activeName
-        subscriptionSelectPopup.removeAllItems()
-        guard !all.isEmpty else {
-            subscriptionSelectPopup.addItem(withTitle: "暂无订阅")
-            subscriptionSelectPopup.isEnabled = false
-            subscriptionUseButton.isEnabled = false
-            subscriptionEditButton.isEnabled = false
-            subscriptionUpdateButton.isEnabled = false
-            subscriptionDeleteButton.isEnabled = false
-            subscriptionSummaryLabel.stringValue = "尚未添加订阅 · 点击“导入配置…”导入本地配置文件，或点击“URL 下载…”添加远程订阅。"
-            subscriptionSummaryLabel.textColor = .secondaryLabelColor
-            subscriptionSummaryLabel.toolTip = subscriptionSummaryLabel.stringValue
-            return
-        }
-        subscriptionSelectPopup.addItems(withTitles: all.map(\.name))
-        if let target = currentPopupSelection, all.contains(where: { $0.name == target }) {
-            subscriptionSelectPopup.selectItem(withTitle: target)
-        } else if let activeName, all.contains(where: { $0.name == activeName }) {
-            subscriptionSelectPopup.selectItem(withTitle: activeName)
-        }
-        subscriptionSelectPopup.isEnabled = true
-        let highlightedName = subscriptionSelectPopup.titleOfSelectedItem ?? activeName ?? all[0].name
-        let highlighted = all.first(where: { $0.name == highlightedName }) ?? all[0]
-        let managedInProfile = SubscriptionMerge.managedNames(in: profileTextView.string)
-        let isUsingHighlighted = highlighted.name == activeName
-            && managedInProfile == [highlighted.name]
-        let isLocalFile = URL(string: highlighted.url)?.isFileURL == true
-        subscriptionUseButton.isEnabled = true
-        subscriptionUseButton.title = isUsingHighlighted ? "正在使用" : "选择使用"
-        subscriptionEditButton.isEnabled = !isLocalFile
-        subscriptionEditButton.toolTip = isLocalFile
-            ? "仅 URL 订阅支持编辑 URL 与自动更新时间"
-            : "编辑订阅名称、替换 URL、设置是否自动更新及更新时间"
-        subscriptionUpdateButton.isEnabled = !isLocalFile
-        subscriptionUpdateButton.toolTip = isLocalFile
-            ? "本地导入的配置文件无需 URL 更新，编辑节点与策略组会自动保存"
-            : "从远程 URL 拉取最新订阅内容"
-        subscriptionDeleteButton.isEnabled = true
-
-        let formatter = DateFormatter()
-        formatter.dateStyle = .short
-        formatter.timeStyle = .short
-        let sourceKind = isLocalFile ? "本地导入" : "URL 订阅"
-        var summary = isUsingHighlighted ? "✓ 当前使用：\(highlighted.name)" : "已选择：\(highlighted.name)（当前使用：\(activeName ?? "无")）"
-        summary += " · \(sourceKind)"
-        if !isLocalFile {
-            if highlighted.updateInterval > 0 {
-                let hours = highlighted.updateInterval / 3600
-                let hoursText = hours.truncatingRemainder(dividingBy: 1) == 0
-                    ? "\(Int(hours))" : String(format: "%.1f", hours)
-                summary += " · 自动更新 \(hoursText)h"
-            } else {
-                summary += " · 仅手动更新"
-            }
-        }
-        if let format = highlighted.lastFormat { summary += " · \(format.rawValue)" }
-        summary += " · \(highlighted.lastProxyCount) 个节点"
-        if isLocalFile {
-            summary += " · 已保存到本地配置（无需 URL 更新）"
-        } else if let updated = highlighted.lastUpdated {
-            summary += " · 更新于 \(formatter.string(from: updated))"
-        } else {
-            summary += " · 尚未更新"
-        }
-        if let error = highlighted.lastError {
-            summary += " · ⚠︎ \(error)"
-            subscriptionSummaryLabel.textColor = .systemOrange
-        } else {
-            subscriptionSummaryLabel.textColor = isUsingHighlighted ? .systemGreen : .secondaryLabelColor
-        }
-        subscriptionSummaryLabel.stringValue = summary
-        subscriptionSummaryLabel.toolTip = summary
-    }
-
-    @objc private func subscriptionSelectionPopupChanged() {
-        guard let name = subscriptionSelectPopup.titleOfSelectedItem,
-              subscriptions.all.contains(where: { $0.name == name }) else {
-            refreshSubscriptionSettings()
-            return
-        }
-        activateSubscription(name: name, announce: false)
-    }
-
-    @objc private func useSelectedSubscriptionAction() {
-        guard let name = subscriptionSelectPopup.titleOfSelectedItem,
-              subscriptions.all.contains(where: { $0.name == name }) else { return }
-        activateSubscription(name: name, announce: false)
-    }
-
-    @objc private func updateSelectedSubscriptionAction() {
-        let selected = subscriptionSelectPopup.titleOfSelectedItem ?? subscriptions.selectedName
-        guard let name = selected, subscriptions.all.contains(where: { $0.name == name }) else {
-            if let first = subscriptions.selectedName ?? subscriptions.all.first?.name {
-                updateSubscriptions(names: [first], announce: true)
-            }
-            return
-        }
-        updateSubscriptions(names: [name], announce: true)
-    }
-
-    @objc private func deleteSelectedSubscriptionAction() {
-        let selected = subscriptionSelectPopup.titleOfSelectedItem ?? subscriptions.selectedName
-        guard let name = selected, subscriptions.all.contains(where: { $0.name == name }) else { return }
-        let alert = NSAlert()
-        alert.messageText = "删除订阅“\(name)”？"
-        alert.informativeText = "删除后，该订阅的节点与策略组将从当前配置中移除。"
-        alert.addButton(withTitle: "删除")
-        alert.addButton(withTitle: "取消")
-        guard let window else { return }
-        alert.beginSheetModal(for: window) { [weak self] response in
-            guard response == .alertFirstButtonReturn, let self else { return }
-            self.removeSubscriptionByName(name)
-        }
-    }
-
-    private func removeSubscriptionByName(_ name: String) {
-        let remaining = subscriptions.all.map(\.name).filter { $0 != name }
-        let initialEditorText = profileTextView.string
-        let wasActive = subscriptions.selectedName == name
-            || SubscriptionMerge.managedNames(in: initialEditorText).contains(name)
-        if wasActive, let nextName = remaining.first {
-            subscriptionSummaryLabel.stringValue = "正在删除订阅并切换到“\(nextName)”…"
-            subscriptionSummaryLabel.textColor = .systemBlue
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let self else { return }
-                let nextPrepared = try? self.subscriptions.prepareSelection(name: nextName)
-                let precomputedText: String
-                if let nextPrepared {
-                    precomputedText = SubscriptionRefreshMerge.activate(
-                        (name: nextPrepared.name, contents: nextPrepared.contents),
-                        toCurrentText: { initialEditorText })
-                } else {
-                    let removed = SubscriptionMerge.remove(name: name, from: initialEditorText)
-                    precomputedText = SubscriptionMerge.reconcileDanglingRulePolicies(in: removed)
-                }
-                DispatchQueue.main.async {
-                    let currentEditorText = self.profileTextView.string
-                    if let nextPrepared {
-                        let text = currentEditorText == initialEditorText
-                            ? precomputedText
-                            : SubscriptionRefreshMerge.activate(
-                                (name: nextPrepared.name, contents: nextPrepared.contents),
-                                toCurrentText: { currentEditorText })
-                        self.applyProfileTextInBackground(text, prefix: "已删除订阅并切换到 \(nextName)",
-                                                          stillApplicable: { [weak self] in
-                            self?.subscriptions.all.contains(where: { $0.name == name }) == true
-                        }) { [weak self] result in
-                            guard let self else { return }
-                            switch result {
-                            case .success:
-                                self.subscriptions.remove(name: name)
-                                self.subscriptions.select(name: nextName)
-                                self.subscriptions.recordApplied(nextPrepared)
-                                self.refreshSubscriptionSettings(preferredSelection: nextName)
-                            case .failure(let error):
-                                self.refreshSubscriptionSettings()
-                                self.showError(title: "删除订阅失败", error: error)
-                            }
-                        }
-                    } else {
-                        let text = currentEditorText == initialEditorText
-                            ? precomputedText
-                            : SubscriptionMerge.reconcileDanglingRulePolicies(
-                                in: SubscriptionMerge.remove(name: name, from: currentEditorText))
-                        self.applyProfileTextInBackground(text, prefix: "删除订阅",
-                                                          stillApplicable: { [weak self] in
-                            self?.subscriptions.all.contains(where: { $0.name == name }) == true
-                        }) { [weak self] result in
-                            guard let self else { return }
-                            switch result {
-                            case .success:
-                                self.subscriptions.remove(name: name)
-                                self.subscriptions.select(name: nextName)
-                                self.refreshSubscriptionSettings(preferredSelection: nextName)
-                            case .failure(let error):
-                                self.refreshSubscriptionSettings()
-                                self.showError(title: "删除订阅失败", error: error)
-                            }
-                        }
-                    }
-                }
-            }
-            return
-        }
-        subscriptionSummaryLabel.stringValue = "正在删除订阅“\(name)”…"
-        subscriptionSummaryLabel.textColor = .systemBlue
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            let removed = SubscriptionMerge.remove(name: name, from: initialEditorText)
-            let precomputedText = SubscriptionMerge.reconcileDanglingRulePolicies(in: removed)
-            DispatchQueue.main.async {
-                let currentEditorText = self.profileTextView.string
-                let text = currentEditorText == initialEditorText
-                    ? precomputedText
-                    : SubscriptionMerge.reconcileDanglingRulePolicies(
-                        in: SubscriptionMerge.remove(name: name, from: currentEditorText))
-                self.applyProfileTextInBackground(text, prefix: "删除订阅",
-                                                  stillApplicable: { [weak self] in
-                    self?.subscriptions.all.contains(where: { $0.name == name }) == true
-                }) { [weak self] result in
-                    guard let self else { return }
-                    switch result {
-                    case .success:
-                        self.subscriptions.remove(name: name)
-                        self.refreshSubscriptionSettings()
-                    case .failure(let error):
-                        self.refreshSubscriptionSettings()
-                        self.showError(title: "删除订阅失败", error: error)
-                    }
-                }
-            }
-        }
-    }
-
-    @objc private func importSubscriptionFileAction() {
-        let panel = NSOpenPanel()
-        panel.title = "导入本地订阅或配置文件"
-        panel.prompt = "导入并使用"
-        panel.allowsOtherFileTypes = true
-        panel.allowedContentTypes = ["conf", "yaml", "yml", "ini", "txt"]
-            .compactMap { UTType(filenameExtension: $0) }
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        guard let window else { return }
-        panel.beginSheetModal(for: window) { [weak self] response in
-            guard response == .OK, let url = panel.url, let self else { return }
-            self.importSubscription(fromFileURL: url)
-        }
-    }
-
-    private func importSubscription(fromFileURL url: URL, customName: String? = nil) {
-        let suggested = customName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let rawName = suggested.isEmpty ? url.deletingPathExtension().lastPathComponent : suggested
-        let initialEditorText = profileTextView.string
-        subscriptionSummaryLabel.stringValue = "正在导入配置 \(url.lastPathComponent)…"
-        subscriptionSummaryLabel.textColor = .systemBlue
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            let imported = Result { () -> (SubscriptionManager.PreparedUpdate, String) in
-                let prepared = try self.subscriptions.importFile(name: rawName, sourceURL: url)
-                let precomputed = SubscriptionRefreshMerge.activate(
-                    (name: prepared.name, contents: prepared.contents),
-                    toCurrentText: { initialEditorText })
-                return (prepared, precomputed)
-            }
-            DispatchQueue.main.async {
-                switch imported {
-                case .failure(let error):
-                    self.refreshSubscriptionSettings()
-                    self.showError(title: "导入配置失败", error: error)
-                case .success(let (prepared, precomputed)):
-                    let currentEditorText = self.profileTextView.string
-                    let merged = currentEditorText == initialEditorText
-                        ? precomputed
-                        : SubscriptionRefreshMerge.activate(
-                            (name: prepared.name, contents: prepared.contents),
-                            toCurrentText: { currentEditorText })
-                    self.applyProfileTextInBackground(merged, prefix: "导入并使用订阅 \(prepared.name)",
-                                                      keepEditorOnFailure: true,
-                                                      stillApplicable: { [weak self] in
-                        self?.subscriptions.isCurrent(prepared) == true
-                    }) { [weak self] result in
-                        guard let self else { return }
-                        switch result {
-                        case .success:
-                            self.subscriptions.select(name: prepared.name)
-                            self.subscriptions.recordApplied(prepared)
-                            self.refreshSubscriptionSettings(preferredSelection: prepared.name)
-                        case .failure(let error):
-                            self.subscriptions.recordFailure(name: prepared.name, error: error)
-                            self.refreshSubscriptionSettings(preferredSelection: prepared.name)
-                            self.showError(title: "应用导入的订阅失败", error: error)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private func activateSubscription(name: String, announce: Bool) {
-        let initialEditorText = profileTextView.string
-        subscriptionSummaryLabel.stringValue = "正在切换并加载订阅“\(name)”…"
-        subscriptionSummaryLabel.textColor = .systemBlue
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            let preparedResult = Result { () -> (SubscriptionManager.PreparedUpdate, String) in
-                let prepared = try self.subscriptions.prepareSelection(name: name)
-                let precomputed = SubscriptionRefreshMerge.activate(
-                    (name: prepared.name, contents: prepared.contents),
-                    toCurrentText: { initialEditorText })
-                return (prepared, precomputed)
-            }
-            DispatchQueue.main.async {
-                switch preparedResult {
-                case .failure(let error):
-                    self.subscriptions.recordFailure(name: name, error: error)
-                    self.refreshSubscriptionSettings(preferredSelection: name)
-                    self.showError(title: "切换订阅失败", error: error)
-                case .success(let (prepared, precomputed)):
-                    guard self.subscriptions.isCurrent(prepared) else {
-                        self.refreshSubscriptionSettings()
-                        return
-                    }
-                    let currentEditorText = self.profileTextView.string
-                    let merged = currentEditorText == initialEditorText
-                        ? precomputed
-                        : SubscriptionRefreshMerge.activate(
-                            (name: prepared.name, contents: prepared.contents),
-                            toCurrentText: { currentEditorText })
-                    self.applyProfileTextInBackground(merged, prefix: "已切换到订阅 \(prepared.name)",
-                                                      keepEditorOnFailure: true,
-                                                      stillApplicable: { [weak self] in
-                        self?.subscriptions.isCurrent(prepared) == true
-                    }) { [weak self] result in
-                        guard let self else { return }
-                        switch result {
-                        case .success:
-                            self.subscriptions.select(name: prepared.name)
-                            self.subscriptions.recordApplied(prepared)
-                            self.refreshSubscriptionSettings(preferredSelection: prepared.name)
-                            if announce {
-                                self.reportSubscriptionOutcome(results: [prepared.result], failures: [])
-                            }
-                        case .failure(let error):
-                            self.subscriptions.recordFailure(name: prepared.name, error: error)
-                            self.refreshSubscriptionSettings(preferredSelection: prepared.name)
-                            self.showError(title: "应用订阅失败", error: error)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private final class URLSubscriptionFormView: NSView {
-        let nameField = NSTextField()
-        let urlField = NSTextField()
-        let autoUpdateCheckbox: NSButton
-        let intervalField = NSTextField()
-
-        init(name: String, url: String, updateInterval: TimeInterval) {
-            autoUpdateCheckbox = NSButton(checkboxWithTitle: "自动更新订阅", target: nil, action: nil)
-            super.init(frame: NSRect(x: 0, y: 0, width: 390, height: 118))
-
-            let nameLabel = NSTextField(labelWithString: "订阅名称")
-            nameLabel.font = .systemFont(ofSize: 11.5, weight: .medium)
-            nameLabel.frame = NSRect(x: 0, y: 92, width: 64, height: 18)
-
-            nameField.frame = NSRect(x: 68, y: 89, width: 322, height: 22)
-            nameField.placeholderString = "名称，例如 机场A（留空则自动根据地址命名）"
-            nameField.stringValue = name
-
-            let urlLabel = NSTextField(labelWithString: "订阅 URL")
-            urlLabel.font = .systemFont(ofSize: 11.5, weight: .medium)
-            urlLabel.frame = NSRect(x: 0, y: 58, width: 64, height: 18)
-
-            urlField.frame = NSRect(x: 68, y: 55, width: 322, height: 22)
-            urlField.placeholderString = "https://example.com/subscribe?token=…"
-            urlField.stringValue = url
-
-            let isAuto = updateInterval > 0
-            autoUpdateCheckbox.state = isAuto ? .on : .off
-            autoUpdateCheckbox.target = self
-            autoUpdateCheckbox.action = #selector(autoUpdateToggled)
-            autoUpdateCheckbox.frame = NSRect(x: 68, y: 24, width: 112, height: 20)
-
-            let intervalLabel = NSTextField(labelWithString: "更新时间（小时）：")
-            intervalLabel.font = .systemFont(ofSize: 11.5, weight: .regular)
-            intervalLabel.textColor = .secondaryLabelColor
-            intervalLabel.frame = NSRect(x: 186, y: 25, width: 110, height: 18)
-
-            let hours = isAuto ? (updateInterval / 3600) : 24
-            let hoursString = hours.truncatingRemainder(dividingBy: 1) == 0
-                ? "\(Int(hours))" : String(format: "%.1f", hours)
-            intervalField.frame = NSRect(x: 298, y: 23, width: 92, height: 22)
-            intervalField.placeholderString = "小时（如 24）"
-            intervalField.stringValue = hoursString
-            intervalField.isEnabled = isAuto
-
-            let hintLabel = NSTextField(labelWithString: "勾选“自动更新订阅”后，将按设定的小时数定期拉取最新节点。")
-            hintLabel.font = .systemFont(ofSize: 10.5)
-            hintLabel.textColor = .tertiaryLabelColor
-            hintLabel.frame = NSRect(x: 68, y: 2, width: 322, height: 16)
-
-            [nameLabel, nameField, urlLabel, urlField,
-             autoUpdateCheckbox, intervalLabel, intervalField, hintLabel].forEach(addSubview)
-        }
-
-        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-        @objc private func autoUpdateToggled() {
-            let enabled = autoUpdateCheckbox.state == .on
-            intervalField.isEnabled = enabled
-            if enabled, (Double(intervalField.stringValue.trimmingCharacters(in: .whitespaces)) ?? 0) <= 0 {
-                intervalField.stringValue = "24"
-            }
-        }
-
-        var effectiveUpdateInterval: TimeInterval {
-            guard autoUpdateCheckbox.state == .on else { return 0 }
-            let hours = Double(intervalField.stringValue.trimmingCharacters(in: .whitespaces)) ?? 24
-            return max(0.1, hours) * 3600
-        }
-    }
-
-    @objc private func addSubscriptionAction() {
-        let alert = NSAlert()
-        alert.messageText = "增加订阅（URL 下载或导入配置）"
-        alert.informativeText = "支持 Clash YAML、Surge .conf 与分享链接列表（可为 base64 包装）。"
-            + "输入订阅 URL 点击“添加并使用”，或点击“导入本地配置文件…”直接从文件创建订阅。"
-        alert.addButton(withTitle: "添加并使用")
-        alert.addButton(withTitle: "导入本地配置文件…")
-        alert.addButton(withTitle: "取消")
-
-        let form = URLSubscriptionFormView(name: "", url: "", updateInterval: 24 * 3600)
-        alert.accessoryView = form
-        alert.window.initialFirstResponder = form.nameField
-
-        guard let window else { return }
-        alert.beginSheetModal(for: window) { [weak self] response in
-            guard let self else { return }
-            if response == .alertSecondButtonReturn {
-                self.importSubscriptionFileAction()
-                return
-            }
-            guard response == .alertFirstButtonReturn else { return }
-            let rawName = form.nameField.stringValue.trimmingCharacters(in: .whitespaces)
-            let url = form.urlField.stringValue.trimmingCharacters(in: .whitespaces)
-            let fallbackHost = URL(string: url)?.host ?? "订阅"
-            let name = rawName.isEmpty ? self.subscriptions.uniqueName(basedOn: fallbackHost) : rawName
-            do {
-                try self.subscriptions.add(name: name, url: url,
-                                           updateInterval: form.effectiveUpdateInterval)
-                self.subscriptions.select(name: name)
-                self.refreshSubscriptionSettings(preferredSelection: name)
-            } catch {
-                self.showError(title: "添加订阅失败", error: error)
-                return
-            }
-            self.updateSubscriptions(names: [name], announce: true)
-        }
-    }
-
-    @objc private func editSelectedSubscriptionAction() {
-        let selected = subscriptionSelectPopup.titleOfSelectedItem ?? subscriptions.selectedName
-        guard let originalName = selected,
-              let current = subscriptions.all.first(where: { $0.name == originalName }) else { return }
-        guard URL(string: current.url)?.isFileURL != true else {
-            showMessage(title: "本地导入的订阅不支持编辑 URL",
-                        text: "当前选择的是本地导入配置，如需更换请点击“导入配置…”或“URL 下载…”。")
-            return
-        }
-
-        let alert = NSAlert()
-        alert.messageText = "编辑 URL 订阅“\(current.name)”"
-        alert.informativeText = "可更换订阅名称、替换订阅 URL、勾选是否自动更新并设置自动更新时间（小时）。若替换了 URL，保存后将立即拉取并切换为新订阅内容。"
-        alert.addButton(withTitle: "保存")
-        alert.addButton(withTitle: "保存并立即更新")
-        alert.addButton(withTitle: "取消")
-
-        let form = URLSubscriptionFormView(name: current.name,
-                                           url: current.url,
-                                           updateInterval: current.updateInterval)
-        alert.accessoryView = form
-        alert.window.initialFirstResponder = form.nameField
-
-        guard let window else { return }
-        alert.beginSheetModal(for: window) { [weak self] response in
-            guard let self else { return }
-            guard response == .alertFirstButtonReturn || response == .alertSecondButtonReturn else { return }
-            let forceRefresh = response == .alertSecondButtonReturn
-            let rawName = form.nameField.stringValue.trimmingCharacters(in: .whitespaces)
-            let url = form.urlField.stringValue.trimmingCharacters(in: .whitespaces)
-            let fallbackHost = URL(string: url)?.host ?? current.name
-            let requestedName = rawName.isEmpty ? fallbackHost : rawName
-            do {
-                let outcome = try self.subscriptions.updateSubscription(
-                    originalName: originalName,
-                    newName: requestedName,
-                    url: url,
-                    updateInterval: form.effectiveUpdateInterval)
-                let newName = outcome.subscription.name
-                let wasUsingOriginal = SubscriptionMerge.managedNames(in: self.profileTextView.string)
-                    .contains(originalName)
-                if outcome.nameChanged && wasUsingOriginal {
-                    self.profileTextView.string = SubscriptionMerge.renameManagedBlock(
-                        from: originalName, to: newName, in: self.profileTextView.string)
-                }
-                if outcome.urlChanged || forceRefresh {
-                    self.subscriptions.select(name: newName)
-                    self.refreshSubscriptionSettings(preferredSelection: newName)
-                    self.updateSubscriptions(names: [newName], announce: true)
-                } else if outcome.nameChanged && wasUsingOriginal {
-                    self.applyProfileTextInBackground(self.profileTextView.string,
-                                                      prefix: "已更新订阅名称为 \(newName)",
-                                                      keepEditorOnFailure: true,
-                                                      completion: { [weak self] _ in
-                        self?.refreshSubscriptionSettings(preferredSelection: newName)
-                    })
-                } else {
-                    self.refreshSubscriptionSettings(preferredSelection: newName)
-                }
-            } catch {
-                self.showError(title: "编辑订阅失败", error: error)
-            }
-        }
-    }
-
-    @objc private func manageSubscriptionsAction() {
-        selectPage(4)
-    }
-
-    private func promptRemoveSubscription(_ names: [String]) {
-        guard let first = names.first else { return }
-        removeSubscriptionByName(first)
-    }
-
-    /// Fetches named subscriptions off the main thread, then applies the active
-    /// subscription into the latest profile text in one transaction on the main thread.
-    private func updateSubscriptions(names: [String], announce: Bool) {
-        guard !names.isEmpty else { return }
-        let initialEditorText = profileTextView.string
-        let initialSelectedName = subscriptions.selectedName
-        subscriptionSummaryLabel.stringValue = "正在更新订阅：\(names.joined(separator: "、"))…"
-        subscriptionSummaryLabel.textColor = .systemBlue
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            var updates: [SubscriptionManager.PreparedUpdate] = []
-            var failures: [String] = []
-            for name in names {
-                do {
-                    updates.append(try self.subscriptions.prepareUpdate(name: name))
-                } catch {
-                    self.subscriptions.recordFailure(name: name, error: error)
-                    failures.append("• \(name)：\(error.localizedDescription)")
-                }
-            }
-            let downloadFailures = failures
-            let preparedUpdates = updates
-            let precomputedTarget = preparedUpdates.first(where: { $0.name == initialSelectedName }) ?? preparedUpdates.first
-            let precomputedMerged = precomputedTarget.map { target in
-                SubscriptionRefreshMerge.activate(
-                    (name: target.name, contents: target.contents),
-                    toCurrentText: { initialEditorText })
-            }
-            DispatchQueue.main.async {
-                var failures = downloadFailures
-                let current = preparedUpdates.filter { update in
-                    guard self.subscriptions.isCurrent(update) else {
-                        failures.append("• \(update.name)：订阅已移除或更换，未应用旧下载结果")
-                        return false
-                    }
-                    return true
-                }
-                guard !current.isEmpty else {
-                    self.refreshSubscriptionSettings()
-                    if announce { self.reportSubscriptionOutcome(results: [], failures: failures) }
-                    return
-                }
-                let activeTarget = current.first(where: { $0.name == self.subscriptions.selectedName }) ?? current[0]
-                let currentEditorText = self.profileTextView.string
-                let merged: String
-                if let precomputedMerged, precomputedTarget?.name == activeTarget.name,
-                   currentEditorText == initialEditorText {
-                    merged = precomputedMerged
-                } else {
-                    merged = SubscriptionRefreshMerge.activate(
-                        (name: activeTarget.name, contents: activeTarget.contents),
-                        toCurrentText: { currentEditorText })
-                }
-                self.applyProfileTextInBackground(merged, prefix: "更新订阅",
-                                                  keepEditorOnFailure: true,
-                                                  stillApplicable: { [weak self] in
-                    guard let self else { return false }
-                    return current.allSatisfy(self.subscriptions.isCurrent)
-                }) { [weak self] result in
-                    guard let self else { return }
-                    switch result {
-                    case .success:
-                        self.subscriptions.select(name: activeTarget.name)
-                        for update in current { self.subscriptions.recordApplied(update) }
-                        self.refreshSubscriptionSettings(preferredSelection: activeTarget.name)
-                        if announce {
-                            self.reportSubscriptionOutcome(results: current.map(\.result),
-                                                           failures: failures)
-                        }
-                    case .failure(let error):
-                        for update in current {
-                            self.subscriptions.recordFailure(name: update.name, error: error)
-                        }
-                        self.refreshSubscriptionSettings(preferredSelection: activeTarget.name)
-                        self.showError(title: "应用订阅失败", error: error)
-                    }
-                }
-            }
-        }
-    }
-
-    private func reportSubscriptionOutcome(results: [SubscriptionManager.UpdateResult],
-                                           failures: [String]) {
-        let alert = NSAlert()
-        alert.messageText = failures.isEmpty ? "订阅已更新" : "订阅更新部分失败"
-        alert.alertStyle = failures.isEmpty ? .informational : .warning
-        var lines = results.map { result -> String in
-            "• \(result.name)（\(result.format.rawValue)）："
-                + "\(result.proxyCount) 个节点、\(result.groupCount) 个策略组"
-        }
-        lines.append(contentsOf: failures)
-        let warnings = results.flatMap(\.warnings)
-        let skipCert = warnings.filter { $0.contains("跳过服务器证书验证") }
-        let other = warnings.filter { !$0.contains("跳过服务器证书验证") }
-        if !skipCert.isEmpty {
-            alert.alertStyle = .warning
-            lines.append("")
-            lines.append("证书风险：")
-            lines.append(contentsOf: skipCert.prefix(5).map { "· \($0)" })
-        }
-        if !other.isEmpty {
-            lines.append("")
-            lines.append(contentsOf: other.prefix(10).map { "· \($0)" })
-            if other.count > 10 { lines.append("· 另有 \(other.count - 10) 条提示") }
-        }
-        alert.informativeText = lines.joined(separator: "\n")
-        alert.addButton(withTitle: "好")
-        if let window { alert.beginSheetModal(for: window) { _ in } } else { alert.runModal() }
-    }
-
-    @objc private func importSurgeProfile() {
-        importSubscriptionFileAction()
-    }
-
-    private func loadProfileText(_ text: String) {
-        profileTextView.string = text
-        profileStatus.stringValue = "配置将在启动时加载"
-    }
-
-    private func applyProfileValidationStatus(_ value: Profile, prefix: String) {
-        let loadedRules = value.ruleSetContents.values.reduce(0) { $0 + $1.count }
-        let ruleSetText = value.ruleSetReferences.isEmpty
-            ? "" : "，\(value.ruleSetReferences.count) 个 RULE-SET / \(loadedRules) 条子规则"
-        let skipCertCount = value.proxiesSkippingCertificateVerification.count
-        let skipCertText = skipCertCount == 0 ? "" : "，\(skipCertCount) 个节点跳过证书验证"
-        let otherWarnings = value.warnings.filter { !$0.contains("跳过服务器证书验证") }
-        let warningText = otherWarnings.isEmpty ? "" : "，\(otherWarnings.count) 项兼容提示"
-        profileStatus.stringValue = "✓ \(prefix)：\(value.rules.count) 条主规则，\(value.proxyOrder.count) 个代理\(ruleSetText)\(skipCertText)\(warningText)"
-        profileStatus.textColor = skipCertCount > 0
-            ? .systemOrange
-            : (value.warnings.isEmpty ? .systemGreen : .systemOrange)
-        var tips = value.warnings
-        if skipCertCount > 0, !tips.contains(where: { $0.contains("跳过服务器证书验证") }) {
-            tips.insert(SkipCertificateWarning.message(
-                names: value.proxiesSkippingCertificateVerification), at: 0)
-        }
-        profileStatus.toolTip = tips.isEmpty ? nil : tips.joined(separator: "\n")
-    }
 
     /// A queued Core status belongs to the session observed at emission, and
     /// must still match the Core. Old terminal events cannot release a newer
@@ -5866,7 +4622,8 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private func apply(event: ProxyEngineEvent) {
+    func apply(event: ProxyEngineEvent) {
+        AppTrafficTelemetryCenter.shared.observe(event: event)
         switch event {
         case .opened(let snapshot):
             if activeConnectionIDs.insert(snapshot.id).inserted { totalConnections += 1 }
@@ -5880,17 +4637,17 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         scheduleStatisticsUpdate()
     }
 
-    private func scheduleStatisticsUpdate() {
+    func scheduleStatisticsUpdate() {
         guard !statisticsUpdateScheduled else { return }
         statisticsUpdateScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(200)) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) { [weak self] in
             guard let self else { return }
             self.statisticsUpdateScheduled = false
             self.updateStatistics()
         }
     }
 
-    @objc private func checkNetworkExtension() {
+    @objc func checkNetworkExtension() {
         let alert = NSAlert()
         alert.messageText = "Network Extension 接入条件"
         if let error = networkExtensionController.availabilityError {
@@ -5903,11 +4660,46 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         alert.runModal()
     }
 
-    private func updateStatistics() {
-        activeValue.stringValue = String(activeConnectionIDs.count + enhancedActiveConnections)
-        totalValue.stringValue = String(totalConnections + enhancedTotalConnections)
-        uploadValue.stringValue = byteString(uploaded + Int(min(enhancedUploaded, UInt64(Int.max))))
-        downloadValue.stringValue = byteString(downloaded + Int(min(enhancedDownloaded, UInt64(Int.max))))
+    func updateStatistics(force: Bool = false) {
+        if !force {
+            guard !dashboardView.isHidden, window?.isVisible != false else { return }
+        }
+        let nextActive = String(activeConnectionIDs.count + enhancedActiveConnections)
+        if activeValue.stringValue != nextActive { activeValue.stringValue = nextActive }
+        let nextTotal = String(totalConnections + enhancedTotalConnections)
+        if totalValue.stringValue != nextTotal { totalValue.stringValue = nextTotal }
+        let nextUpload = byteString(uploaded + Int(min(enhancedUploaded, UInt64(Int.max))))
+        if uploadValue.stringValue != nextUpload { uploadValue.stringValue = nextUpload }
+        let nextDownload = byteString(downloaded + Int(min(enhancedDownloaded, UInt64(Int.max))))
+        if downloadValue.stringValue != nextDownload { downloadValue.stringValue = nextDownload }
+        refreshTrafficWidgets(force: force)
+    }
+
+    func resetTrafficTelemetry() {
+        AppTrafficTelemetryCenter.shared.reset()
+        nativeTrafficView.reset()
+        refreshTrafficWidgets(force: true)
+    }
+
+    func refreshTrafficWidgets(force: Bool = false) {
+        if !force {
+            guard !dashboardView.isHidden, window?.isVisible != false else { return }
+        }
+        guard let appWidget = HajimiAppTrafficWidgetView.activeInstance else { return }
+        let modeName = selectedMode.displayName
+        let policyName = selectedMode == .direct ? "DIRECT" : selectedPolicy
+        let snapshot = AppTrafficTelemetryCenter.shared.buildPresentation(
+            enhancedActive: enhancedActiveConnections,
+            enhancedTotal: enhancedTotalConnections,
+            enhancedUploaded: enhancedUploaded,
+            enhancedDownloaded: enhancedDownloaded,
+            selectedModeName: modeName,
+            selectedPolicyName: policyName
+        )
+        appWidget.update(appEntries: snapshot.appEntries,
+                         policyEntries: snapshot.policyEntries,
+                         split: snapshot.split)
+        HajimiTrafficSplitBarView.activeInstance?.snapshot = snapshot.split
     }
 
     func numberOfSections(in collectionView: NSCollectionView) -> Int { 2 }
@@ -6010,116 +4802,16 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         collectionView.deselectItems(at: indexPaths)
     }
 
-    func numberOfRows(in tableView: NSTableView) -> Int {
-        if tableView === proxyTableView { return filteredProxyNames.count }
-        if tableView === groupTableView { return profile.groupOrder.count }
-        if tableView === rulesTableView { return filteredRules.count }
-        return 0
-    }
 
-    func tableViewSelectionDidChange(_ notification: Notification) {
-        guard let table = notification.object as? NSTableView, table === rulesTableView,
-              !ruleSelectionRefreshInProgress else { return }
-        updateRuleSelectionControls()
-        if ruleMultiSelectButton.state == .on,
-           let column = rulesTableView.tableColumns.firstIndex(where: { $0.identifier.rawValue == "selected" }),
-           !filteredRules.isEmpty {
-            ruleSelectionRefreshInProgress = true
-            rulesTableView.reloadData(forRowIndexes: IndexSet(integersIn: 0..<filteredRules.count),
-                                      columnIndexes: IndexSet(integer: column))
-            ruleSelectionRefreshInProgress = false
-        }
-    }
-
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        if tableView === proxyTableView {
-            guard filteredProxyNames.indices.contains(row),
-                  let policy = profile.proxies[filteredProxyNames[row]] else { return nil }
-            let name = policy.name
-            let cell = ProxyNodeCellView()
-            cell.configure(policy: policy, latency: nodeLatencies[name] ?? .untested,
-                           isActive: selectedMode == .proxy && selectedPolicy == name,
-                           onUse: { [weak self] in self?.useProxy(named: name) })
-            return cell
-        }
-        if tableView === groupTableView {
-            guard profile.groupOrder.indices.contains(row),
-                  let group = profile.groups[profile.groupOrder[row]] else { return nil }
-            let cell = PolicyGroupCellView()
-            cell.configure(group: group, selected: groupSelections[group.name]) { [weak self] member in
-                self?.setGroupSelection(group: group.name, member: member)
-            }
-            return cell
-        }
-        if tableView === rulesTableView {
-            guard filteredRules.indices.contains(row), let identifier = tableColumn?.identifier else { return nil }
-            let rule = filteredRules[row]
-            if identifier.rawValue == "selected" {
-                let checkbox = NSButton(checkboxWithTitle: "", target: self,
-                                        action: #selector(ruleRowSelectionChanged(_:)))
-                checkbox.tag = rule.sourceLine
-                checkbox.isEnabled = rulesPageIsEditable
-                checkbox.state = rulesTableView.selectedRowIndexes.contains(row) ? .on : .off
-                checkbox.toolTip = "选择第 \(rule.sourceLine) 行规则"
-                checkbox.setAccessibilityLabel("选择第 \(rule.sourceLine) 行规则")
-                return checkbox
-            }
-            let description = filteredRuleRows[row]
-            let cell = NSTextField(labelWithString: "")
-            cell.font = identifier.rawValue == "value"
-                ? .monospacedSystemFont(ofSize: 10.5, weight: .regular)
-                : .systemFont(ofSize: 11)
-            cell.lineBreakMode = .byTruncatingMiddle
-            switch identifier.rawValue {
-            case "line":
-                cell.stringValue = String(rule.sourceLine)
-                cell.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
-                cell.textColor = .tertiaryLabelColor
-            case "type":
-                cell.stringValue = description.type
-                cell.font = .systemFont(ofSize: 11, weight: .semibold)
-                cell.textColor = HajimiAppearance.accentText
-            case "value":
-                cell.stringValue = description.value
-                cell.toolTip = description.value
-            case "policy":
-                cell.stringValue = rule.policy
-                cell.font = .systemFont(ofSize: 11, weight: .semibold)
-                let upper = rule.policy.uppercased()
-                if upper == "REJECT" || upper == "REJECT-TINYGIF" {
-                    cell.textColor = .systemRed
-                } else if upper == "DIRECT" {
-                    cell.textColor = HajimiAppearance.accentText
-                } else {
-                    cell.textColor = .systemIndigo
-                }
-            case "loaded":
-                cell.font = .systemFont(ofSize: 11, weight: .medium)
-                if case .ruleSet(let reference) = rule.kind {
-                    let count = (rulesPageProfile ?? resolvedProfile ?? profile).ruleSetContents[reference.location]?.count
-                    cell.stringValue = count.map { "\($0) 条" } ?? "未加载"
-                    cell.textColor = count == nil ? .systemOrange : HajimiAppearance.accentText
-                } else {
-                    cell.stringValue = "本地"
-                    cell.textColor = .secondaryLabelColor
-                }
-            default: break
-            }
-            return cell
-        }
-
-        return nil
-    }
-
-    private func ruleDescription(_ rule: RoutingRule) -> (type: String, value: String) {
+    func ruleDescription(_ rule: RoutingRule) -> (type: String, value: String) {
         RuleListRow.description(of: rule.kind)
     }
 
-    private func restartExternalController() {
+    func restartExternalController() {
         externalController.start(profile: resolvedProfile ?? profile)
     }
 
-    private func byteString(_ bytes: Int) -> String {
+    func byteString(_ bytes: Int) -> String {
         if bytes < 1024 { return "\(bytes) B" }
         return byteFormatter.string(fromByteCount: Int64(bytes))
     }
@@ -6150,7 +4842,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     private func statCard(title: String, value: NSTextField, color: NSColor) -> NSView {
         let card = cardView()
-        let accentBar = HajimiSurfaceView(fill: color.withAlphaComponent(0.85), cornerRadius: 1.5)
+        let accentBar = HajimiSurfaceView(fill: color.themedAlpha(0.85), cornerRadius: 1.5)
         accentBar.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(accentBar)
 
@@ -6197,39 +4889,41 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
                                     icon: String, color: NSColor) -> NSView {
         let container = NSView()
         let well = HajimiSurfaceView(
-            fill: HajimiTheme.mutedPanel.withAlphaComponent(0.55),
+            fill: HajimiTheme.mutedPanel.themedAlpha(0.55),
             border: HajimiTheme.subtleDivider,
-            cornerRadius: 10
+            cornerRadius: 9
         )
         well.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(well)
 
-        let badge = HajimiTheme.iconTile(symbol: icon, color: color, size: 34, symbolSize: 15)
-        value.font = .monospacedSystemFont(ofSize: 13, weight: .semibold)
+        let badge = HajimiTheme.iconTile(symbol: icon, color: color, size: 30, symbolSize: 13.5)
+        value.font = .monospacedSystemFont(ofSize: 12, weight: .semibold)
         value.lineBreakMode = .byTruncatingMiddle
+        value.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = .systemFont(ofSize: 10.5, weight: .semibold)
+        titleLabel.font = .systemFont(ofSize: 10, weight: .semibold)
         titleLabel.textColor = .secondaryLabelColor
         let detailLabel = NSTextField(labelWithString: detail)
-        detailLabel.font = .systemFont(ofSize: 10)
-        detailLabel.textColor = .secondaryLabelColor
+        detailLabel.font = .systemFont(ofSize: 9.5)
+        detailLabel.textColor = .tertiaryLabelColor
         detailLabel.lineBreakMode = .byTruncatingTail
+        detailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let text = NSStackView(views: [titleLabel, value, detailLabel])
         text.orientation = .vertical
         text.alignment = .leading
-        text.spacing = 3
+        text.spacing = 2
         text.translatesAutoresizingMaskIntoConstraints = false
         well.addSubview(badge)
         well.addSubview(text)
         NSLayoutConstraint.activate([
-            well.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 4),
-            well.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -4),
+            well.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 2),
+            well.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -2),
             well.topAnchor.constraint(equalTo: container.topAnchor, constant: 2),
             well.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -2),
-            badge.leadingAnchor.constraint(equalTo: well.leadingAnchor, constant: 10),
+            badge.leadingAnchor.constraint(equalTo: well.leadingAnchor, constant: 8),
             badge.centerYAnchor.constraint(equalTo: well.centerYAnchor),
-            text.leadingAnchor.constraint(equalTo: badge.trailingAnchor, constant: 10),
-            text.trailingAnchor.constraint(lessThanOrEqualTo: well.trailingAnchor, constant: -8),
+            text.leadingAnchor.constraint(equalTo: badge.trailingAnchor, constant: 8),
+            text.trailingAnchor.constraint(lessThanOrEqualTo: well.trailingAnchor, constant: -6),
             text.centerYAnchor.constraint(equalTo: well.centerYAnchor)
         ])
         return container
@@ -6277,7 +4971,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         return box
     }
 
-    private func capabilityRow(_ title: String, detail: String, color: NSColor) -> NSView {
+    func capabilityRow(_ title: String, detail: String, color: NSColor) -> NSView {
         let card = cardView()
         card.translatesAutoresizingMaskIntoConstraints = false
         card.heightAnchor.constraint(equalToConstant: 64).isActive = true
@@ -6336,9 +5030,9 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         return card
     }
 
-    private func showError(title: String, error: Error) { showMessage(title: title, text: error.localizedDescription) }
+    func showError(title: String, error: Error) { showMessage(title: title, text: error.localizedDescription) }
 
-    private func promptToEnableProxyEngineForSystemProxy() {
+    func promptToEnableProxyEngineForSystemProxy() {
         if listenerLifecycle.snapshot.startupPending {
             pendingSystemProxyRestore = true
             refreshConnectionStatus()
@@ -6368,7 +5062,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    private func showMessage(title: String, text: String) {
+    func showMessage(title: String, text: String) {
         if title == "请先开启本地代理" {
             promptToEnableProxyEngineForSystemProxy()
             return
@@ -6383,96 +5077,10 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         alert.addButton(withTitle: "好")
         if let window { alert.beginSheetModal(for: window) }
     }
-}
 
-extension MainWindowController: ExternalControllerBackend {
-    func controllerSnapshot() -> ExternalControllerSnapshot {
-        let runtime = engine.runtimeSnapshot()
-        return ExternalControllerSnapshot(
-            mode: selectedMode,
-            globalPolicy: selectedPolicy,
-            groupSelections: groupSelections,
-            profile: resolvedProfile ?? profile,
-            engineStatus: engineStatus,
-            httpListen: runtime.httpListen,
-            socksListen: runtime.socksListen,
-            uploaded: runtime.uploaded + enhancedUploaded,
-            downloaded: runtime.downloaded + enhancedDownloaded,
-            startedAt: runtime.startedAt,
-            active: runtime.active,
-            recent: runtime.recent,
-            systemProxyEnabled: isSystemProxyActive,
-            enhancedModeEnabled: isEnhancedModeActive,
-            fakeIP: enhancedMode.fakeIPEntries(),
-            policyLatencies: policyLatencies)
-    }
-
-    func controllerSetOutboundMode(_ mode: OutboundMode) {
-        DispatchQueue.main.async { self.selectOutboundModeFromStatusItem(mode) }
-    }
-
-    func controllerSetGlobalPolicy(_ name: String) -> Bool {
-        let known = profile.groups[name] == nil && profile.selectablePolicies.contains(name)
-        if known {
-            DispatchQueue.main.async { self.selectGlobalPolicyFromStatusItem(name) }
-        }
-        return known
-    }
-
-    func controllerSetGroupSelection(group: String, policy: String) -> Bool {
-        guard profile.groups[group]?.members.contains(policy) == true else { return false }
-        DispatchQueue.main.async { self.setGroupSelection(group: group, member: policy) }
-        return true
-    }
-
-    func controllerSetSystemProxy(_ enabled: Bool) {
-        DispatchQueue.main.async {
-            guard enabled != self.isSystemProxyActive else { return }
-            self.systemProxyButton.state = enabled ? .on : .off
-            self.toggleSystemProxy()
-        }
-    }
-
-    func controllerSetEnhancedMode(_ enabled: Bool) {
-        DispatchQueue.main.async {
-            guard enabled != self.isEnhancedModeActive else { return }
-            self.enhancedModeButton.state = enabled ? .on : .off
-            self.toggleEnhancedMode()
-        }
-    }
-
-    func controllerReloadProfile() {
-        DispatchQueue.main.async {
-            do {
-                let text = try self.configurationStore.loadTextThrowing()
-                self.applyProfileTextInBackground(text, prefix: "控制器已重载",
-                                                  allowExternalChanges: true,
-                                                  completion: { [weak self] result in
-                    guard let self, case .failure(let error) = result else { return }
-                    self.showError(title: "控制器重载配置失败", error: error)
-                })
-            } catch {
-                self.showError(title: "控制器重载配置失败", error: error)
-            }
-        }
-    }
-
-    func controllerFlushDNS() {
-        engine.flushDNS()
-        enhancedMode.flushDNS()
-    }
-
-    func controllerFlushFakeIP() {
-        enhancedMode.flushFakeIP()
-    }
-
-    func controllerKillRequest(id: String) -> Bool {
-        guard let uuid = UUID(uuidString: id) else { return false }
-        return engine.killConnection(id: uuid)
-    }
-
-    func controllerTestGroup(_ name: String) {
-        DispatchQueue.main.async { self.policyHealth.refresh() }
-        _ = name
-    }
+    func updateEngineRoutingForExtension() { updateEngineRouting() }
+    func toggleEnhancedModeForExtension() { toggleEnhancedMode() }
+    func toggleSystemProxyForExtension() { toggleSystemProxy() }
+    func updateOverviewDetailsForExtension() { updateOverviewDetails() }
+    var selectedModeForExtension: OutboundMode { selectedMode }
 }

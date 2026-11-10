@@ -9,6 +9,8 @@ void connectTrustTunnel(const Node &node, const Target &target,
                         std::shared_ptr<TransportFactory> factory, StreamCallback completion);
 void makeTrustTunnelDatagram(const Node &node, std::shared_ptr<TransportFactory> factory,
                              DatagramCallback completion);
+void resetTrustTunnelClients();
+void resetTrustTunnelClient(const std::shared_ptr<TransportFactory> &factory);
 bool trustTunnelProtocolSelfTest();
 
 } // namespace hajimi

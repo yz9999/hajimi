@@ -29,6 +29,10 @@ SPLIT_CORE_DNS_FILES = (
     "EncryptedDNSFrontierEndpoints.swift",
     "EncryptedDNSSelfTest.swift",
     "DNSProtocolRouterAdapter.swift",
+    "DNSSecurityRoutingSelfTest.swift",
+    "ProxyInboundHandlers.swift",
+    "NetworkConnectivityDiagnosticsRouting.swift",
+    "LocalProcessSocketCache.swift",
 )
 _INPUTS: dict[Path, str] = {}
 

@@ -125,6 +125,9 @@ public final class NativeTunnel {
     private var totalFlowCount = 0
     private var uploadedByteCount: UInt64 = 0
     private var downloadedByteCount: UInt64 = 0
+    private var maintenanceTickParity: UInt8 = 0
+    private var pendingFlowEvents: [ProxyEngineEvent] = []
+    private var pendingFlowCloses: [UUID] = []
     /// Explicit CLI-only memory regression hook. Ordinary initializers never
     /// install a connector or override transport sequence numbers.
     private var streamRegressionConnector: (() -> NativeOutboundByteStream)?
@@ -183,6 +186,14 @@ public final class NativeTunnel {
             // release the handoff rather than attaching an unsafe reader.
             Darwin.close(fileDescriptor)
             throw NativeTunnelError.utun("无法配置 utun 非阻塞描述符")
+        }
+        for candidate in [Int32(4 * 1024 * 1024), Int32(2 * 1024 * 1024), Int32(1 * 1024 * 1024)] {
+            var bufSize = candidate
+            if setsockopt(fileDescriptor, SOL_SOCKET, SO_RCVBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size)) == 0 { break }
+        }
+        for candidate in [Int32(4 * 1024 * 1024), Int32(2 * 1024 * 1024), Int32(1 * 1024 * 1024)] {
+            var bufSize = candidate
+            if setsockopt(fileDescriptor, SOL_SOCKET, SO_SNDBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size)) == 0 { break }
         }
         descriptor = fileDescriptor
         self.interfaceName = interfaceName
@@ -257,6 +268,7 @@ public final class NativeTunnel {
             self.udpFlows.removeAll(keepingCapacity: false)
             tcp.forEach { $0.close(sendReset: false, removeFromOwner: false) }
             udp.forEach { $0.close(removeFromOwner: false) }
+            self.flushFlowEventsIfNeeded()
             if self.descriptor >= 0 { Darwin.close(self.descriptor); self.descriptor = -1 }
             self.interfaceName = nil
         }
@@ -284,6 +296,7 @@ public final class NativeTunnel {
             icmpRelay.stop()
             tcp.forEach { $0.close(sendReset: true, removeFromOwner: false) }
             udp.forEach { $0.close(removeFromOwner: false) }
+            flushFlowEventsIfNeeded()
         }
     }
 
@@ -356,15 +369,28 @@ public final class NativeTunnel {
         totalFlowCount += 1
         let flow = TCPFlow(key: key, initial: segment, owner: self)
         tcpFlows[key] = flow
+        recordFlowOpened(id: flow.id, key: key, isTCP: true)
         flow.start()
     }
 
     private func handleUDP(_ packet: ParsedIPPacket, datagram: ParsedUDPDatagram,
                            originalBytes: UnsafeRawBufferPointer) {
+        let key = FlowKey(version: packet.version, transportProtocol: 17,
+                          clientAddress: packet.source, clientPort: datagram.sourcePort,
+                          remoteAddress: packet.destination, remotePort: datagram.destinationPort)
+        let currentGen = router.currentConfigurationGeneration
+        if let existing = udpFlows[key], existing.routingGeneration == currentGen {
+            existing.send(datagram.payload)
+            uploadedByteCount &+= UInt64(datagram.payload.count)
+            existing.unreportedUploadBytes &+= datagram.payload.count
+            return
+        }
         func rejectWithICMP() {
             guard let quoted = ParsedIPPacket(copying: originalBytes) else { return }
             writeICMPPortUnreachable(for: quoted)
         }
+        let destHost = packet.destination.hostString
+        let srcHost = packet.source.hostString
         // QUIC loses its loss-recovery advantage when a stream-only proxy
         // (VMess/VLESS/Trojan/Snell/AnyTLS) carries every UDP packet over a
         // reliable TCP byte stream.  One lost outer TCP segment then blocks
@@ -373,40 +399,39 @@ public final class NativeTunnel {
         // HTTPS/TCP.  Native UDP transports (DIRECT, SS/SSR, HY/TUIC) keep
         // QUIC enabled.
         if datagram.destinationPort == 443,
-           router.prefersTCPFallbackForQUIC(host: packet.destination.hostString,
-               sourceHost: packet.source.hostString, sourcePort: datagram.sourcePort) {
+           router.prefersTCPFallbackForQUIC(host: destHost,
+               sourceHost: srcHost, sourcePort: datagram.sourcePort) {
+            if let stale = udpFlows.removeValue(forKey: key) { stale.close(removeFromOwner: false) }
             rejectWithICMP()
             return
         }
         // The outbound cannot carry this datagram. Saying so costs one packet;
         // staying silent costs the application its full timeout on every
         // attempt, which is indistinguishable from a dead network.
-        if router.rejectsUDP(host: packet.destination.hostString,
+        if router.rejectsUDP(host: destHost,
                              port: datagram.destinationPort,
-                             sourceHost: packet.source.hostString, sourcePort: datagram.sourcePort) {
+                             sourceHost: srcHost, sourcePort: datagram.sourcePort) {
+            if let stale = udpFlows.removeValue(forKey: key) { stale.close(removeFromOwner: false) }
             rejectWithICMP()
             return
         }
-        let key = FlowKey(version: packet.version, transportProtocol: 17,
-                          clientAddress: packet.source, clientPort: datagram.sourcePort,
-                          remoteAddress: packet.destination, remotePort: datagram.destinationPort)
-        let flow: UDPFlow
-        if let existing = udpFlows[key] {
-            flow = existing
-        } else {
-            if udpFlows.count >= FlowAdmission.maximumUDPFlows {
-                if !evictIdleUDP() {
-                    rejectWithICMP()
-                    return
-                }
-            }
-            totalFlowCount += 1
-            flow = UDPFlow(key: key, owner: self)
-            udpFlows[key] = flow
-            flow.start()
+        if let stale = udpFlows.removeValue(forKey: key) {
+            stale.close(removeFromOwner: false)
         }
+        if udpFlows.count >= FlowAdmission.maximumUDPFlows {
+            if !evictIdleUDP() {
+                rejectWithICMP()
+                return
+            }
+        }
+        totalFlowCount += 1
+        let flow = UDPFlow(key: key, routingGeneration: currentGen, owner: self)
+        udpFlows[key] = flow
+        recordFlowOpened(id: flow.id, key: key, isTCP: false)
+        flow.start()
         flow.send(datagram.payload)
         uploadedByteCount &+= UInt64(datagram.payload.count)
+        flow.unreportedUploadBytes &+= datagram.payload.count
     }
 
     fileprivate func connectTCPFlow(_ flow: TCPFlow) {
@@ -546,6 +571,65 @@ public final class NativeTunnel {
 
     fileprivate func rewrite(_ packet: Data, version: IPVersion) {
         _ = writeReturningOK(packet, version: version)
+    }
+
+    private func recordFlowOpened(id: UUID, key: FlowKey, isTCP: Bool) {
+        guard NativePacketRouter.onTunnelFlowEvents != nil else { return }
+        let destHost = router.displayDestinationHost(key.remoteAddress.hostString)
+        let policy = key.remotePort == 53 ? "DNS" : "TUN"
+        let client = "198.18.0.1:\(key.clientPort)"
+        let snapshot = ConnectionSnapshot(id: id, openedAt: Date(), client: client,
+                                          method: isTCP ? "TCP" : "UDP",
+                                          host: destHost, port: key.remotePort,
+                                          policy: policy)
+        if pendingFlowEvents.count < 2048 {
+            pendingFlowEvents.append(.opened(snapshot))
+        }
+    }
+
+    fileprivate func recordFlowClosed(id: UUID, remainingUp: Int, remainingDown: Int) {
+        guard NativePacketRouter.onTunnelFlowEvents != nil else { return }
+        if (remainingUp > 0 || remainingDown > 0), pendingFlowEvents.count < 4096 {
+            pendingFlowEvents.append(.traffic(id: id, uploaded: remainingUp, downloaded: remainingDown))
+        }
+        if pendingFlowCloses.count < 2048 {
+            pendingFlowCloses.append(id)
+        }
+    }
+
+    private func flushFlowEventsIfNeeded() {
+        guard let handler = NativePacketRouter.onTunnelFlowEvents else {
+            if !pendingFlowEvents.isEmpty { pendingFlowEvents.removeAll() }
+            if !pendingFlowCloses.isEmpty { pendingFlowCloses.removeAll() }
+            return
+        }
+        var batch = pendingFlowEvents
+        pendingFlowEvents.removeAll(keepingCapacity: true)
+        for flow in tcpFlows.values {
+            let up = flow.unreportedUploadBytes
+            let down = flow.unreportedDownloadBytes
+            if up > 0 || down > 0 {
+                flow.unreportedUploadBytes = 0
+                flow.unreportedDownloadBytes = 0
+                batch.append(.traffic(id: flow.id, uploaded: up, downloaded: down))
+            }
+        }
+        for flow in udpFlows.values {
+            let up = flow.unreportedUploadBytes
+            let down = flow.unreportedDownloadBytes
+            if up > 0 || down > 0 {
+                flow.unreportedUploadBytes = 0
+                flow.unreportedDownloadBytes = 0
+                batch.append(.traffic(id: flow.id, uploaded: up, downloaded: down))
+            }
+        }
+        for id in pendingFlowCloses {
+            batch.append(.closed(id: id, error: nil))
+        }
+        pendingFlowCloses.removeAll(keepingCapacity: true)
+        if !batch.isEmpty {
+            handler(batch)
+        }
     }
 
     fileprivate func recordTCPUpload(_ count: Int) { uploadedByteCount &+= UInt64(count) }
@@ -750,6 +834,10 @@ public final class NativeTunnel {
         // live table. Mutating the dictionary while iterating it is illegal.
         for flow in Array(tcpFlows.values) { flow.tick(now: now) }
         for flow in Array(udpFlows.values) { flow.tick(now: now) }
+        maintenanceTickParity &+= 1
+        if (maintenanceTickParity & 3) == 0 {
+            flushFlowEventsIfNeeded()
+        }
         if tcpFlows.count > (FlowAdmission.maximumTCPFlows * 3) / 4 {
             for flow in Array(tcpFlows.values) {
                 let elapsed = now.timeIntervalSince(flow.lastActivityDate)
@@ -1377,6 +1465,9 @@ struct TCPHandshakeAcknowledgmentState {
 }
 
 fileprivate final class TCPFlow {
+    fileprivate let id = UUID()
+    fileprivate var unreportedUploadBytes: Int = 0
+    fileprivate var unreportedDownloadBytes: Int = 0
     fileprivate let key: FlowKey
     fileprivate let upstreamQueue: DispatchQueue
     private weak var owner: NativeTunnel?
@@ -1438,6 +1529,7 @@ fileprivate final class TCPFlow {
         guard let context, let bytes else { return 0 }
         let flow = Unmanaged<TCPFlow>.fromOpaque(context).takeUnretainedValue()
         guard flow.remoteWrites.append(UnsafeRawBufferPointer(start: bytes, count: count)) else { return 0 }
+        flow.unreportedUploadBytes &+= count
         flow.owner?.recordTCPUpload(count)
         return 1
     }
@@ -1644,6 +1736,11 @@ fileprivate final class TCPFlow {
         remoteWrites.clear()
         remoteDeliveryBuffer.removeAll(keepingCapacity: false)
         outstanding.removeAll(keepingCapacity: false)
+        let remUp = unreportedUploadBytes
+        let remDown = unreportedDownloadBytes
+        unreportedUploadBytes = 0
+        unreportedDownloadBytes = 0
+        owner?.recordFlowClosed(id: id, remainingUp: remUp, remainingDown: remDown)
         if removeFromOwner { owner?.removeTCP(self) }
     }
 
@@ -1854,6 +1951,7 @@ fileprivate final class TCPFlow {
                                                   sentAt: Date(), retries: 0))
             recordOutstandingAppend()
             outstandingPayloadByteCount += count
+            unreportedDownloadBytes &+= count
             owner?.recordTCPDownload(count)
             remoteDeliveryOffset += count
             available -= count
@@ -1973,7 +2071,11 @@ extension NativeTunnel {
 }
 
 fileprivate final class UDPFlow {
+    fileprivate let id = UUID()
+    fileprivate var unreportedUploadBytes: Int = 0
+    fileprivate var unreportedDownloadBytes: Int = 0
     fileprivate let key: FlowKey
+    fileprivate let routingGeneration: UInt64
     fileprivate let upstreamQueue: DispatchQueue
     private weak var owner: NativeTunnel?
     private var session: NativeRoutedDatagram?
@@ -1985,8 +2087,9 @@ fileprivate final class UDPFlow {
 
     fileprivate var lastActivityDate: Date { lastActivity }
 
-    init(key: FlowKey, owner: NativeTunnel) {
+    init(key: FlowKey, routingGeneration: UInt64 = 0, owner: NativeTunnel) {
         self.key = key
+        self.routingGeneration = routingGeneration
         self.owner = owner
         self.upstreamQueue = owner.upstreamQueue(for: key)
     }
@@ -2029,6 +2132,11 @@ fileprivate final class UDPFlow {
         guard !closed else { return }
         closed = true
         session?.cancel(); session = nil
+        let remUp = unreportedUploadBytes
+        let remDown = unreportedDownloadBytes
+        unreportedUploadBytes = 0
+        unreportedDownloadBytes = 0
+        owner?.recordFlowClosed(id: id, remainingUp: remUp, remainingDown: remDown)
         if removeFromOwner { owner?.removeUDP(self) }
     }
 
@@ -2039,6 +2147,7 @@ fileprivate final class UDPFlow {
     func received(_ payload: Data) {
         guard !closed else { return }
         lastActivity = Date()
+        unreportedDownloadBytes &+= payload.count
         owner?.writeUDP(key: key, remoteAddress: key.remoteAddress,
                         remotePort: key.remotePort, payload: payload)
     }
@@ -3131,6 +3240,7 @@ fileprivate final class ICMPEchoRelay {
     private let queue: DispatchQueue
     private weak var owner: NativeTunnel?
     private var descriptor: Int32 = -1
+    private var boundInterfaceName: String?
     private var readSource: DispatchSourceRead?
     private var pending: [PendingKey: Pending] = [:]
 
@@ -3141,14 +3251,26 @@ fileprivate final class ICMPEchoRelay {
 
     /// Opens the socket lazily: a session that never pings should not hold one.
     private func ensureSocket() -> Bool {
-        if descriptor >= 0 { return true }
+        let currentInterface = NativeTunnel.physicalInterfaceName
+        if descriptor >= 0 {
+            if boundInterfaceName == currentInterface { return true }
+            if let source = readSource {
+                readSource = nil
+                descriptor = -1
+                source.cancel()
+            } else {
+                Darwin.close(descriptor)
+                descriptor = -1
+            }
+        }
         // SOCK_DGRAM/IPPROTO_ICMP sends echo without the raw-socket privileges,
         // and the kernel handles the outer IP header for us.
         let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
         guard fd >= 0 else { return false }
+        _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
         // The reply must not come back through the tunnel that produced the
         // request, or the relay would feed itself.
-        if let name = NativeTunnel.physicalInterfaceName {
+        if let name = currentInterface {
             var index = UInt32(if_nametoindex(name))
             if index > 0 {
                 _ = setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &index,
@@ -3158,9 +3280,10 @@ fileprivate final class ICMPEchoRelay {
         let flags = fcntl(fd, F_GETFL, 0)
         if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
         descriptor = fd
+        boundInterfaceName = currentInterface
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         source.setEventHandler { [weak self] in self?.drainReplies() }
-        source.setCancelHandler {}
+        source.setCancelHandler { Darwin.close(fd) }
         readSource = source
         source.resume()
         return true
@@ -3231,8 +3354,19 @@ fileprivate final class ICMPEchoRelay {
     }
 
     func stop() {
-        readSource?.cancel(); readSource = nil
-        if descriptor >= 0 { Darwin.close(descriptor); descriptor = -1 }
+        if let source = readSource {
+            readSource = nil
+            descriptor = -1
+            source.cancel()
+        } else if descriptor >= 0 {
+            Darwin.close(descriptor)
+            descriptor = -1
+        }
+        boundInterfaceName = nil
         pending.removeAll()
+    }
+
+    deinit {
+        stop()
     }
 }

@@ -684,9 +684,10 @@ public enum NativeOutboundFactory {
 
     static func connect(policy: ProxyPolicy, target: RequestTarget, plainHTTP: Bool = false,
                         queue: DispatchQueue,
+                        recordSetup: Bool = true,
                         completion: @escaping (Result<any OutboundByteStream, Error>) -> Void) {
         _ = beginConnection(policy: policy, target: target, plainHTTP: plainHTTP,
-                            queue: queue, completion: completion)
+                            queue: queue, recordSetup: recordSetup, completion: completion)
     }
 
     /// Request-local cancellation is available for an ordinary C++ dial.
@@ -696,6 +697,7 @@ public enum NativeOutboundFactory {
     static func beginConnection(policy: ProxyPolicy, target: RequestTarget, plainHTTP: Bool = false,
                                 queue: DispatchQueue,
                                 waitForSetupAcknowledgement: Bool = false,
+                                recordSetup: Bool = true,
                                 completion: @escaping (Result<any OutboundByteStream, Error>) -> Void)
         -> (() -> Void)? {
         // Multiplexing is transparent to every caller: it hands back the same
@@ -705,7 +707,7 @@ public enum NativeOutboundFactory {
               target.protocolName.uppercased() != "UDP" else {
             return beginDirectConnection(policy: policy, target: target, plainHTTP: plainHTTP,
                                          queue: queue, waitForSetupAcknowledgement: waitForSetupAcknowledgement,
-                                         completion: completion)
+                                         recordSetup: recordSetup, completion: completion)
         }
         MuxSessionPool.shared.openStream(
             policy: policy, target: target, queue: queue,
@@ -714,7 +716,7 @@ public enum NativeOutboundFactory {
                 // reusing connectDirect keeps TLS, WebSocket and proxy chaining
                 // identical to the non-multiplexed path.
                 connectDirect(policy: policy, target: MuxApplicability.carrierTarget,
-                              queue: queue, completion: carrierCompletion)
+                              queue: queue, recordSetup: recordSetup, completion: carrierCompletion)
             },
             completion: completion)
         return nil
@@ -722,14 +724,16 @@ public enum NativeOutboundFactory {
 
     private static func connectDirect(policy: ProxyPolicy, target: RequestTarget, plainHTTP: Bool = false,
                                       queue: DispatchQueue,
+                                      recordSetup: Bool = true,
                                       completion: @escaping (Result<any OutboundByteStream, Error>) -> Void) {
         _ = beginDirectConnection(policy: policy, target: target, plainHTTP: plainHTTP,
-                                  queue: queue, completion: completion)
+                                  queue: queue, recordSetup: recordSetup, completion: completion)
     }
 
     private static func beginDirectConnection(policy: ProxyPolicy, target: RequestTarget, plainHTTP: Bool = false,
                                               queue: DispatchQueue,
                                               waitForSetupAcknowledgement: Bool = false,
+                                              recordSetup: Bool = true,
                                               completion: @escaping (Result<any OutboundByteStream, Error>) -> Void)
         -> (() -> Void)? {
         guard supports(policy) else {
@@ -741,7 +745,8 @@ public enum NativeOutboundFactory {
         }
         let operation = NativeCXXOutbound.connect(policy: policy, target: target, plainHTTP: plainHTTP, queue: queue,
             preparedDialer: cppPreparedDialer(for: policy, queue: queue),
-            waitForSetupAcknowledgement: waitForSetupAcknowledgement, completion: completion)
+            waitForSetupAcknowledgement: waitForSetupAcknowledgement,
+            recordSetup: recordSetup, completion: completion)
         return operation.cancel
     }
 
@@ -3097,7 +3102,11 @@ private final class ShadowsocksRDatagramSession: NativeOutboundDatagramSession {
     }
 
     func send(_ payload: Data, to target: RequestTarget) {
-        guard !cancelled else { return }; guard ready else { pending.append((payload, target)); return }
+        guard !cancelled else { return }
+        guard ready else {
+            if pending.count < 256 { pending.append((payload, target)) }
+            return
+        }
         do {
             let iv = secureRandom(count: spec.ivLength)
             let cryptor = try AESCFBState(operation: CCOperation(kCCEncrypt), key: key, iv: iv)
@@ -3109,7 +3118,7 @@ private final class ShadowsocksRDatagramSession: NativeOutboundDatagramSession {
         } catch { fail(error) }
     }
 
-    func cancel() { cancelled = true; connection.cancel(); pending.removeAll() }
+    func cancel() { guard !cancelled else { return }; cancelled = true; connection.stateUpdateHandler = nil; connection.cancel(); pending.removeAll() }
 
     private func receiveNext() {
         connection.receiveMessage { [weak self] data, _, _, error in
@@ -3127,7 +3136,8 @@ private final class ShadowsocksRDatagramSession: NativeOutboundDatagramSession {
             } catch { self.fail(error) }
         }
     }
-    private func fail(_ error: Error) { guard !cancelled else { return }; cancelled = true; connection.cancel(); failureHandler(error) }
+    private func fail(_ error: Error) { guard !cancelled else { return }; cancelled = true; connection.stateUpdateHandler = nil; connection.cancel(); pending.removeAll(); failureHandler(error) }
+    deinit { connection.stateUpdateHandler = nil; connection.cancel() }
 }
 
 /// VMess/VLESS/Trojan carry UDP packets in authenticated streams. One stream
@@ -3373,7 +3383,10 @@ private final class ShadowsocksAEADDatagramSession: NativeOutboundDatagramSessio
 
     func send(_ payload: Data, to target: RequestTarget) {
         guard !cancelled else { return }
-        guard ready else { pending.append((payload, target)); return }
+        guard ready else {
+            if pending.count < 256 { pending.append((payload, target)) }
+            return
+        }
         do {
             var plaintext = try socksProtocolAddress(target.host, port: target.port)
             plaintext.append(payload)
@@ -3390,7 +3403,7 @@ private final class ShadowsocksAEADDatagramSession: NativeOutboundDatagramSessio
 
     func cancel() {
         guard !cancelled else { return }
-        cancelled = true; pending.removeAll(); connection.cancel()
+        cancelled = true; pending.removeAll(); connection.stateUpdateHandler = nil; connection.cancel()
     }
 
     private func receiveNext() {
@@ -3418,7 +3431,12 @@ private final class ShadowsocksAEADDatagramSession: NativeOutboundDatagramSessio
 
     private func fail(_ error: Error) {
         guard !cancelled else { return }
-        cancelled = true; connection.cancel(); failureHandler(error)
+        cancelled = true; pending.removeAll(); connection.stateUpdateHandler = nil; connection.cancel(); failureHandler(error)
+    }
+
+    deinit {
+        connection.stateUpdateHandler = nil
+        connection.cancel()
     }
 }
 
@@ -3573,211 +3591,6 @@ func vlessRequestHeader(uuid: UUID, target: RequestTarget,
         addons: flow.map(VLESSVisionAddons.recognizes) == true ? VLESSVisionAddons.requestBytes : Data())
 }
 
-private final class VLESSStream: OutboundByteStream {
-    private let transport: any ByteTransport
-    private let reader: BufferedByteReader
-    private let requestHeader: Data
-    private var responseHeaderRead = false
-    private var cancelled = false
-    private let isUDP: Bool
-    private let visionEncoder: VLESSVisionEncoder?
-    private let visionDecoder: VLESSVisionDecoder?
-    private var visionReceiveBuffer = Data()
-
-    init(policy: ProxyPolicy, target: RequestTarget, transport: any ByteTransport) throws {
-        guard let rawUUID = policy.parameters["uuid"] ?? policy.parameters["username"],
-              let uuid = UUID(uuidString: rawUUID) else {
-            throw NativeOutboundError.protocolError("VLESS UUID 无效")
-        }
-        self.transport = transport
-        isUDP = target.protocolName == "UDP"
-        let flow = (policy.parameters["flow"] ?? "").lowercased()
-        if VLESSVisionAddons.recognizes(flow) {
-            guard !isUDP else {
-                throw NativeOutboundError.unsupported("VLESS Vision 不直接承载 UDP；请使用 XUDP 或普通 VLESS UDP")
-            }
-            let reality = policy.parameters["reality-public-key"] != nil
-                || (policy.parameters["security"] ?? "").lowercased() == "reality"
-            if reality, !(transport is any VisionDirectByteTransport) {
-                throw NativeOutboundError.unsupported("VLESS Vision direct-copy 需要 REALITY 原始 TCP 承载")
-            }
-            var tuple = uuid.uuid
-            let uuidBytes = withUnsafeBytes(of: &tuple) { Data($0) }
-            let traffic = VLESSVisionTrafficState()
-            // XUDP uses command=mux but its contents are datagrams rather than
-            // an inner TLS stream, so it must stay in the framed Vision body.
-            visionEncoder = VLESSVisionEncoder(
-                uuid: uuidBytes, traffic: traffic,
-                canDirect: !MuxApplicability.isCarrierTarget(target) && (transport is any VisionDirectByteTransport))
-            visionDecoder = VLESSVisionDecoder(uuid: uuidBytes, traffic: traffic)
-        } else {
-            visionEncoder = nil; visionDecoder = nil
-        }
-        reader = BufferedByteReader(transport)
-        let command: VMessRequestCommand = MuxApplicability.isCarrierTarget(target)
-            ? .mux : (isUDP ? .udp : .tcp)
-        requestHeader = try vlessRequestHeader(uuid: uuid, target: target,
-                                               command: command, flow: flow)
-    }
-
-    func start(completion: @escaping (Result<VLESSStream, Error>) -> Void) {
-        var firstFlight = requestHeader
-        if let visionEncoder { firstFlight.append(visionEncoder.initialPaddingFrame()) }
-        transport.send(firstFlight) { error in
-            if let error { self.cancel(); completion(.failure(error)) }
-            else { nativeDebug("VLESS request header sent"); completion(.success(self)) }
-        }
-    }
-
-    func send(_ data: Data, completion: @escaping (Error?) -> Void) {
-        guard !cancelled else {
-            completion(NativeOutboundError.connection("连接已关闭")); return
-        }
-        if let visionEncoder {
-            let encoded = visionEncoder.encode(data)
-            transport.send(encoded.bytes) { error in
-                if error == nil, encoded.switchesToDirectAfterWrite {
-                    (self.transport as? any VisionDirectByteTransport)?.enableVisionDirectWrite()
-                }
-                completion(error)
-            }
-        } else if isUDP {
-            guard data.count <= Int(UInt16.max) else { completion(NativeOutboundError.protocolError("VLESS UDP 数据报过大")); return }
-            var framed = Data(); append16(UInt16(data.count), to: &framed); framed.append(data)
-            transport.send(framed, completion: completion)
-        } else { transport.send(data, completion: completion) }
-    }
-
-    func receive(maximum: Int, completion: @escaping (Data?, Bool, Error?) -> Void) {
-        guard responseHeaderRead else {
-            reader.readExactly(2) { [weak self] result in
-                guard let self else { return }
-                switch result {
-                case .failure(let error): completion(nil, true, error)
-                case .success(let header):
-                    guard header[0] == 0 else {
-                        completion(nil, true,
-                                   NativeOutboundError.protocolError("VLESS 响应版本无效"))
-                        return
-                    }
-                    self.reader.readExactly(Int(header[1])) { addonResult in
-                        switch addonResult {
-                        case .failure(let error): completion(nil, true, error)
-                        case .success:
-                            self.responseHeaderRead = true
-                            self.receive(maximum: maximum, completion: completion)
-                        }
-                    }
-                }
-            }
-            return
-        }
-        if let visionDecoder {
-            if !visionReceiveBuffer.isEmpty {
-                let count = min(maximum, visionReceiveBuffer.count)
-                let value = Data(visionReceiveBuffer.prefix(count))
-                visionReceiveBuffer.removeFirst(count)
-                completion(value, false, nil); return
-            }
-            reader.readAvailable(maximum: max(maximum, 65_536)) { [weak self] data, complete, error in
-                guard let self else { return }
-                if let error { completion(nil, true, error); return }
-                guard let data, !data.isEmpty else { completion(nil, complete, nil); return }
-                do {
-                    let decoded = try visionDecoder.feed(data)
-                    if decoded.switchesToDirect {
-                        (self.transport as? any VisionDirectByteTransport)?.enableVisionDirectRead()
-                    }
-                    for chunk in decoded.chunks { self.visionReceiveBuffer.append(chunk) }
-                    self.receive(maximum: maximum, completion: completion)
-                } catch { completion(nil, true, error) }
-            }
-        } else if isUDP {
-            reader.readExactly(2) { [weak self] result in
-                guard let self else { return }
-                switch result {
-                case .failure(let error):
-                    completion(nil, true, isCleanByteStreamEOF(error) ? nil : error)
-                case .success(let length): self.reader.readExactly(Int(read16(length))) {
-                    switch $0 { case .success(let data): completion(data, false, nil)
-                    case .failure(let error): completion(nil, true, error) }
-                }
-                }
-            }
-        } else { reader.readAvailable(maximum: maximum, completion: completion) }
-    }
-
-    func cancel() {
-        guard !cancelled else { return }
-        cancelled = true; transport.cancel()
-    }
-}
-
-private final class TrojanStream: OutboundByteStream {
-    private let transport: any ByteTransport
-    private let reader: BufferedByteReader
-    private let requestHeader: Data
-    private var cancelled = false
-    private let isUDP: Bool
-    private let udpAddress: Data
-
-    init(policy: ProxyPolicy, target: RequestTarget, transport: any ByteTransport) throws {
-        guard let password = policy.parameters["password"], !password.isEmpty else {
-            throw NativeOutboundError.protocolError("Trojan 密码为空")
-        }
-        self.transport = transport
-        isUDP = target.protocolName == "UDP"
-        udpAddress = try socksProtocolAddress(target.host, port: target.port)
-        reader = BufferedByteReader(transport)
-        requestHeader = try NativeProtocolCodec.trojan(digest: sha224Hex(password), target: target, udp: isUDP)
-    }
-
-    func start(completion: @escaping (Result<TrojanStream, Error>) -> Void) {
-        transport.send(requestHeader) { error in
-            if let error { self.cancel(); completion(.failure(error)) }
-            else { nativeDebug("Trojan request header sent"); completion(.success(self)) }
-        }
-    }
-
-    func send(_ data: Data, completion: @escaping (Error?) -> Void) {
-        guard !cancelled else {
-            completion(NativeOutboundError.connection("连接已关闭")); return
-        }
-        if isUDP {
-            guard data.count <= Int(UInt16.max) else { completion(NativeOutboundError.protocolError("Trojan UDP 数据报过大")); return }
-            var framed = udpAddress; append16(UInt16(data.count), to: &framed)
-            framed.append(contentsOf: [0x0d, 0x0a]); framed.append(data)
-            transport.send(framed, completion: completion)
-        } else { transport.send(data, completion: completion) }
-    }
-
-    func receive(maximum: Int, completion: @escaping (Data?, Bool, Error?) -> Void) {
-        // Trojan UDP responses are address + length + CRLF + payload. The
-        // destination is fixed for this retained stream, so its address size
-        // is known and can be authenticated then discarded.
-        if isUDP {
-            reader.readExactly(udpAddress.count + 4) { [weak self] result in
-                guard let self else { return }
-                switch result {
-                case .failure(let error):
-                    completion(nil, true, isCleanByteStreamEOF(error) ? nil : error)
-                case .success(let header):
-                    let lengthOffset = self.udpAddress.count
-                    let count = Int(UInt16(header[lengthOffset]) << 8 | UInt16(header[lengthOffset + 1]))
-                    guard header.suffix(2) == Data([0x0d, 0x0a]) else { completion(nil, true, NativeOutboundError.protocolError("Trojan UDP 帧无效")); return }
-                    self.reader.readExactly(count) { switch $0 {
-                    case .success(let data): completion(data, false, nil)
-                    case .failure(let error): completion(nil, true, error) } }
-                }
-            }
-        } else { reader.readAvailable(maximum: maximum, completion: completion) }
-    }
-
-    func cancel() {
-        guard !cancelled else { return }
-        cancelled = true; transport.cancel()
-    }
-}
 
 /// Builds the plaintext VMess command block that is later AEAD-sealed.
 ///
@@ -3803,169 +3616,6 @@ func vmessCommandBlock(requestBodyIV: Data, requestBodyKey: Data,
     return block
 }
 
-private final class VMessAEADStream: OutboundByteStream {
-    private let transport: any ByteTransport
-    private let reader: BufferedByteReader
-    private let requestBodyIV: Data
-    private let requestBodyKey: Data
-    private let responseBodyIV: Data
-    private let responseBodyKey: Data
-    private let responseVerification: UInt8
-    private let requestHeader: Data
-    private var requestCounter: UInt16 = 0
-    private var responseCounter: UInt16 = 0
-    private var responseHeaderRead = false
-    private var receiveBuffer = Data()
-    private var cancelled = false
-
-    init(policy: ProxyPolicy, target: RequestTarget, transport: any ByteTransport) throws {
-        self.transport = transport
-        reader = BufferedByteReader(transport)
-        guard let rawUUID = policy.parameters["uuid"] ?? policy.parameters["username"],
-              let uuid = UUID(uuidString: rawUUID) else {
-            throw NativeOutboundError.protocolError("VMess UUID 无效")
-        }
-        requestBodyIV = secureRandom(count: 16)
-        requestBodyKey = secureRandom(count: 16)
-        responseVerification = secureRandom(count: 1).first!
-        responseBodyKey = Data(SHA256.hash(data: requestBodyKey).prefix(16))
-        responseBodyIV = Data(SHA256.hash(data: requestBodyIV).prefix(16))
-
-        let requestCommand: VMessRequestCommand = MuxApplicability.isCarrierTarget(target)
-            ? .mux : (target.protocolName == "UDP" ? .udp : .tcp)
-        let command = try vmessCommandBlock(requestBodyIV: requestBodyIV,
-                                            requestBodyKey: requestBodyKey,
-                                            responseVerification: responseVerification,
-                                            paddingLength: Int.random(in: 0..<16),
-                                            target: target, command: requestCommand)
-
-        var uuidTuple = uuid.uuid
-        let uuidData = withUnsafeBytes(of: &uuidTuple) { Data($0) }
-        var commandKeyInput = uuidData
-        commandKeyInput.append(Data("c48619fe-8f02-49e0-b9e9-edf763e17e21".utf8))
-        let commandKey = Data(Insecure.MD5.hash(data: commandKeyInput))
-        requestHeader = try sealHeader(command, commandKey: commandKey)
-    }
-
-    func start(completion: @escaping (Result<VMessAEADStream, Error>) -> Void) {
-        nativeDebug("sending VMess request header bytes=\(requestHeader.count)")
-        transport.send(requestHeader) { error in
-            if let error { self.cancel(); completion(.failure(error)) }
-            else { nativeDebug("VMess request header sent"); completion(.success(self)) }
-        }
-    }
-
-    func send(_ data: Data, completion: @escaping (Error?) -> Void) {
-        guard !cancelled else {
-            completion(NativeOutboundError.connection("连接已关闭")); return
-        }
-        do {
-            var output = Data(); var offset = 0
-            while offset < data.count {
-                let count = min(16_368, data.count - offset)
-                let chunk = Data(data[offset..<(offset + count)])
-                let nonce = bodyNonce(counter: requestCounter, iv: requestBodyIV)
-                let sealed = try aesGCMSeal(chunk, key: requestBodyKey, nonce: nonce)
-                append16(UInt16(sealed.count), to: &output)
-                output.append(sealed)
-                requestCounter &+= 1; offset += count
-            }
-            nativeDebug("VMess body send plain=\(data.count) wire=\(output.count)")
-            transport.send(output, completion: completion)
-        } catch { completion(error) }
-    }
-
-    func receive(maximum: Int, completion: @escaping (Data?, Bool, Error?) -> Void) {
-        if !receiveBuffer.isEmpty {
-            let count = min(maximum, receiveBuffer.count)
-            let value = Data(receiveBuffer.prefix(count)); receiveBuffer.removeFirst(count)
-            completion(value, false, nil); return
-        }
-        guard responseHeaderRead else {
-            readResponseHeader { [weak self] result in
-                switch result {
-                case .failure(let error): completion(nil, true, error)
-                case .success: self?.receive(maximum: maximum, completion: completion)
-                }
-            }
-            return
-        }
-        reader.readExactly(2) { [weak self] lengthResult in
-            guard let self else { return }
-            switch lengthResult {
-            case .failure(let error):
-                completion(nil, true, isCleanByteStreamEOF(error) ? nil : error)
-            case .success(let lengthData):
-                let size = Int(read16(lengthData))
-                guard size >= 16, size <= 17 * 1024 else {
-                    completion(nil, true, NativeOutboundError.protocolError("VMess 数据块长度无效")); return
-                }
-                self.reader.readExactly(size) { encryptedResult in
-                    switch encryptedResult {
-                    case .failure(let error): completion(nil, true, error)
-                    case .success(let encrypted):
-                        do {
-                            let nonce = bodyNonce(counter: self.responseCounter, iv: self.responseBodyIV)
-                            self.responseCounter &+= 1
-                            self.receiveBuffer = try aesGCMOpen(encrypted,
-                                                               key: self.responseBodyKey, nonce: nonce)
-                            self.receive(maximum: maximum, completion: completion)
-                        } catch { completion(nil, true, error) }
-                    }
-                }
-            }
-        }
-    }
-
-    func cancel() {
-        guard !cancelled else { return }
-        cancelled = true; transport.cancel()
-    }
-
-    private func readResponseHeader(completion: @escaping (Result<Void, Error>) -> Void) {
-        nativeDebug("VMess waiting response header")
-        reader.readExactly(18) { [weak self] lengthResult in
-            guard let self else { return }
-            switch lengthResult {
-            case .failure(let error): completion(.failure(error))
-            case .success(let encryptedLength):
-                do {
-                    let lengthKey = Data(vmessKDF(key: self.responseBodyKey,
-                                                  path: [Data("AEAD Resp Header Len Key".utf8)]).prefix(16))
-                    let lengthIV = Data(vmessKDF(key: self.responseBodyIV,
-                                                 path: [Data("AEAD Resp Header Len IV".utf8)]).prefix(12))
-                    let plainLength = try aesGCMOpen(encryptedLength, key: lengthKey, nonce: lengthIV)
-                    guard plainLength.count == 2 else {
-                        throw NativeOutboundError.protocolError("VMess 响应头长度无效")
-                    }
-                    let size = Int(read16(plainLength))
-                    guard size >= 4, size <= 4_096 else {
-                        throw NativeOutboundError.protocolError("VMess 响应头过大")
-                    }
-                    self.reader.readExactly(size + 16) { payloadResult in
-                        switch payloadResult {
-                        case .failure(let error): completion(.failure(error))
-                        case .success(let encryptedPayload):
-                            do {
-                                let key = Data(vmessKDF(key: self.responseBodyKey,
-                                                       path: [Data("AEAD Resp Header Key".utf8)]).prefix(16))
-                                let iv = Data(vmessKDF(key: self.responseBodyIV,
-                                                      path: [Data("AEAD Resp Header IV".utf8)]).prefix(12))
-                                let payload = try aesGCMOpen(encryptedPayload, key: key, nonce: iv)
-                                guard payload.count >= 4, payload[0] == self.responseVerification,
-                                      payload[2] == 0 else {
-                                    throw NativeOutboundError.protocolError("VMess 响应校验失败")
-                                }
-                                self.responseHeaderRead = true
-                                completion(.success(()))
-                            } catch { completion(.failure(error)) }
-                        }
-                    }
-                } catch { completion(.failure(error)) }
-            }
-        }
-    }
-}
 
 func nativeDebug(_ value: @autoclosure () -> String) {
     guard ProcessInfo.processInfo.environment["HAJIMI_NATIVE_DEBUG"] == "1" else { return }

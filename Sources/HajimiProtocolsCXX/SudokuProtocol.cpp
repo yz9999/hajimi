@@ -1016,10 +1016,17 @@ Buffer computeX25519Shared(const Buffer &priv32, const Buffer &peerPub32) {
 constexpr uint8_t kKIPTypeClientHello = 0x01;
 constexpr uint8_t kKIPTypeServerHello = 0x02;
 constexpr uint8_t kKIPTypeOpenTCP     = 0x10;
-[[maybe_unused]] constexpr uint8_t kKIPTypeStartMux    = 0x11;
+constexpr uint8_t kKIPTypeStartMux    = 0x11;
 constexpr uint8_t kKIPTypeStartUoT    = 0x12;
 constexpr uint8_t kKIPTypeKeepAlive   = 0x14;
 constexpr uint32_t kKIPFeatureAll     = 0x1F;
+
+// SUDOKU-ASCII/sudoku pkg/mux/session.go frame types:
+// Header: [1B frameType][4B streamID (BE)][2B payloadLen (BE)][payload]
+constexpr uint8_t kSudokuMuxFrameOpen  = 0x01;
+constexpr uint8_t kSudokuMuxFrameData  = 0x02;
+constexpr uint8_t kSudokuMuxFrameClose = 0x03;
+constexpr uint8_t kSudokuMuxFrameReset = 0x04;
 
 Buffer buildKIPMessage(uint8_t type, const Buffer &payload) {
     Buffer out{'k', 'i', 'p', type};
@@ -1028,39 +1035,7 @@ Buffer buildKIPMessage(uint8_t type, const Buffer &payload) {
     return out;
 }
 
-bool getLearnedSudokuPureDownlink(const std::string &masterPubKey, bool defaultVal) {
-    static std::mutex m;
-    static std::unordered_map<std::string, bool> learned;
-    std::lock_guard<std::mutex> lock(m);
-    auto it = learned.find(masterPubKey);
-    return it != learned.end() ? it->second : defaultVal;
-}
 
-void setLearnedSudokuPureDownlink(const std::string &masterPubKey, bool val) {
-    static std::mutex m;
-    static std::unordered_map<std::string, bool> learned;
-    std::lock_guard<std::mutex> lock(m);
-    if (learned.size() > 128) learned.clear();
-    learned[masterPubKey] = val;
-}
-
-bool getLearnedSudokuPadMarker(const std::string &masterPubKey, uint8_t &outMarker) {
-    static std::mutex m;
-    static std::unordered_map<std::string, uint8_t> learned;
-    std::lock_guard<std::mutex> lock(m);
-    auto it = learned.find(masterPubKey);
-    if (it == learned.end()) return false;
-    outMarker = it->second;
-    return true;
-}
-
-void setLearnedSudokuPadMarker(const std::string &masterPubKey, uint8_t marker) {
-    static std::mutex m;
-    static std::unordered_map<std::string, uint8_t> learned;
-    std::lock_guard<std::mutex> lock(m);
-    if (learned.size() > 128) learned.clear();
-    learned[masterPubKey] = marker;
-}
 
 // Sudoku obfuscated + RecordConn + KIP stream
 class SudokuStream final : public Stream, public std::enable_shared_from_this<SudokuStream> {
@@ -1071,15 +1046,9 @@ public:
                  std::string endpointTag = {})
         : raw_(std::move(raw)), writer_(std::make_shared<OrderedWriter>(raw_)), cfg_(std::move(cfg)), masterPubKey_(std::move(masterPubKey)),
           userHash8_(std::move(userHash8)), upTable_(std::move(upTable)), downTable_(std::move(downTable)) {
-        cacheKey_ = endpointTag + "|" + masterPubKey_ + "|" + cfg_.tableType + "|" + cfg_.customTable;
-        cfg_.enablePureDownlink = getLearnedSudokuPureDownlink(cacheKey_, cfg_.enablePureDownlink);
+        (void)endpointTag;
         if (downTable_ && !downTable_->layout.paddingPool.empty()) {
             padMarker_ = downTable_->layout.paddingPool[0];
-        }
-        uint8_t learnedMarker = 0;
-        if (getLearnedSudokuPadMarker(cacheKey_, learnedMarker)) {
-            padMarker_ = learnedMarker;
-            padMarkerKnown_ = true;
         }
         httpMaskResponseDone_ = cfg_.disableHttpMask;
         deriveSudokuPSKDirectionalBases(masterPubKey_, txBaseKey_, rxBaseKey_);
@@ -1158,8 +1127,6 @@ public:
                     }
                     try {
                         self->handshakeDone_ = true;
-                        self->handshakeWire_.clear();
-                        setLearnedSudokuPureDownlink(self->cacheKey_, self->cfg_.enablePureDownlink);
                         Buffer serverPub(payload.begin() + 16, payload.begin() + 48);
                         Buffer shared = computeX25519Shared(self->clientPriv32_, serverPub);
                         Buffer sessC2S, sessS2C;
@@ -1172,6 +1139,103 @@ public:
                         } else {
                             postCmd = buildKIPMessage(kKIPTypeOpenTCP, socksAddress(target));
                         }
+                        Buffer recCmd = self->sealRecord(postCmd);
+                        Buffer obfsCmd = sudokuEncodeBytes(recCmd, *self->upTable_, self->cfg_.paddingMin, self->cfg_.paddingMax);
+                        self->writer_->write(std::move(obfsCmd), [self, ready = std::move(ready)](Error cmdErr) mutable {
+                            if (!cmdErr.empty()) {
+                                self->close();
+                                ready(nullptr, cmdErr);
+                                return;
+                            }
+                            ready(self, {});
+                        });
+                    } catch (const std::exception &e) {
+                        self->close();
+                        ready(nullptr, e.what());
+                    }
+                });
+            });
+        } catch (const std::exception &e) {
+            close();
+            ready(nullptr, e.what());
+        }
+    }
+
+    void startMuxHandshake(StreamCallback rawReady, std::shared_ptr<TransportFactory> factory = nullptr) {
+        auto readyFlag = std::make_shared<bool>(false);
+        StreamCallback ready = [rawReady = std::move(rawReady), readyFlag](std::shared_ptr<Stream> s, Error e) mutable {
+            if (*readyFlag) {
+                if (s) s->close();
+                return;
+            }
+            *readyFlag = true;
+            if (rawReady) rawReady(std::move(s), std::move(e));
+        };
+        if (factory && factory->after) {
+            auto self = shared_from_this();
+            factory->after(10.0, [self, ready]() mutable {
+                if (!self->handshakeDone_ && !self->closed_) {
+                    self->close();
+                    ready(nullptr, "Sudoku mux handshake timed out");
+                }
+            });
+        }
+        try {
+            generateX25519KeyPair(clientPriv32_, clientPub32_);
+            clientNonce16_ = crypto::randomBytes(16);
+
+            Buffer wirePreface;
+            if (!cfg_.disableHttpMask) {
+                std::string path = cfg_.pathRoot.empty() ? "/stream" : ("/" + cfg_.pathRoot + "/stream");
+                std::string host = formatHostHeaderAuthority(cfg_.httpMaskHost.empty() ? std::string("example.com") : cfg_.httpMaskHost);
+                std::string httpReq = "POST " + path + " HTTP/1.1\r\n"
+                    "Host: " + host + "\r\n"
+                    "User-Agent: Mozilla/5.0\r\n"
+                    "Content-Type: application/octet-stream\r\n"
+                    "Connection: close\r\n"
+                    "X-Sudoku-Tunnel: legacy\r\n\r\n";
+                wirePreface.insert(wirePreface.end(), httpReq.begin(), httpReq.end());
+            }
+
+            Buffer chPayload;
+            appendBE64(chPayload, uint64_t(unixSeconds()));
+            chPayload.insert(chPayload.end(), userHash8_.begin(), userHash8_.end());
+            chPayload.insert(chPayload.end(), clientNonce16_.begin(), clientNonce16_.end());
+            chPayload.insert(chPayload.end(), clientPub32_.begin(), clientPub32_.end());
+            appendBE32(chPayload, kKIPFeatureAll);
+
+            Buffer kipHello = buildKIPMessage(kKIPTypeClientHello, chPayload);
+            Buffer recHello = sealRecord(kipHello);
+            Buffer obfsHello = sudokuEncodeBytes(recHello, *upTable_, cfg_.paddingMin, cfg_.paddingMax);
+            wirePreface.insert(wirePreface.end(), obfsHello.begin(), obfsHello.end());
+
+            auto self = shared_from_this();
+            writer_->write(std::move(wirePreface), [self, ready = std::move(ready)](Error writeErr) mutable {
+                if (!writeErr.empty()) {
+                    self->close();
+                    ready(nullptr, writeErr);
+                    return;
+                }
+                self->readKIPMessage([self, ready = std::move(ready)](uint8_t msgType, Buffer payload, Error err) mutable {
+                    if (!err.empty()) {
+                        self->close();
+                        ready(nullptr, err);
+                        return;
+                    }
+                    if (msgType != kKIPTypeServerHello || payload.size() < 52) {
+                        self->close();
+                        ready(nullptr, "Invalid Sudoku KIP ServerHello");
+                        return;
+                    }
+                    try {
+                        self->handshakeDone_ = true;
+                        Buffer serverPub(payload.begin() + 16, payload.begin() + 48);
+                        Buffer shared = computeX25519Shared(self->clientPriv32_, serverPub);
+                        Buffer sessC2S, sessS2C;
+                        deriveSudokuSessionDirectionalBases(self->masterPubKey_, shared, self->clientNonce16_, sessC2S, sessS2C);
+                        self->rekey(std::move(sessC2S), std::move(sessS2C));
+
+                        Buffer postCmd = buildKIPMessage(kKIPTypeStartMux, {});
                         Buffer recCmd = self->sealRecord(postCmd);
                         Buffer obfsCmd = sudokuEncodeBytes(recCmd, *self->upTable_, self->cfg_.paddingMin, self->cfg_.paddingMax);
                         self->writer_->write(std::move(obfsCmd), [self, ready = std::move(ready)](Error cmdErr) mutable {
@@ -1370,18 +1434,10 @@ private:
             for (uint8_t b : wire) {
                 uint8_t grp = 0;
                 if (!downTable_->layout.decodeGroup(b, grp)) {
-                    // Per SUDOKU-ASCII/sudoku pkg/obfs/sudoku/packed_decode.go:
-                    // When flushing residual bits at the end of a Write, PackedConn emits
-                    // layout.encodeGroup(group) followed immediately by pc.padMarker,
-                    // and the decoder resets rBuf = 0, rBits = 0 upon seeing padMarker.
-                    if (captureNextNonHintAsPadMarker_) {
-                        padMarker_ = b;
-                        padMarkerKnown_ = true;
-                        captureNextNonHintAsPadMarker_ = false;
-                        setLearnedSudokuPadMarker(cacheKey_, padMarker_);
-                        bitAcc_ = 0;
-                        bitCount_ = 0;
-                    } else if (padMarkerKnown_ && b == padMarker_) {
+                    // Per SUDOKU-ASCII/sudoku pkg/obfs/sudoku/packed.go:
+                    // PackedConn uses layout.PaddingPool[0] as padMarker; seeing padMarker
+                    // resets residual 6-bit accumulator (rBuf = 0, rBits = 0).
+                    if (b == padMarker_) {
                         bitAcc_ = 0;
                         bitCount_ = 0;
                     }
@@ -1402,38 +1458,12 @@ private:
                         if (bitCount_ > 0) {
                             bitAcc_ = 0;
                             bitCount_ = 0;
-                            if (!padMarkerKnown_) {
-                                captureNextNonHintAsPadMarker_ = true;
-                            }
                         }
                         recordScanOffset_ = nextRecordBoundary_;
                         nextRecordBoundary_ = 0;
                     }
                 }
             }
-        }
-    }
-
-    bool tryFlipDownlinkAndRedecode() {
-        if (handshakeDone_ || triedFlipDownlink_ || handshakeWire_.empty()) return false;
-        triedFlipDownlink_ = true;
-        cfg_.enablePureDownlink = !cfg_.enablePureDownlink;
-        hintCount_ = 0;
-        bitAcc_ = 0;
-        bitCount_ = 0;
-        recordScanOffset_ = 0;
-        nextRecordBoundary_ = 0;
-        captureNextNonHintAsPadMarker_ = false;
-        decodedBuf_.clear();
-        pendingPlain_.clear();
-        recvInitialized_ = false;
-        cachedRxEpoch_ = 0;
-        cachedRxKey_.clear();
-        try {
-            feedObfsBytes(handshakeWire_);
-            return true;
-        } catch (...) {
-            return false;
         }
     }
 
@@ -1507,17 +1537,11 @@ private:
                 }
             }
             if (!chunk.empty()) {
-                if (!self->handshakeDone_ && self->handshakeWire_.size() < 16384) {
-                    size_t cap = std::min<size_t>(chunk.size(), 16384 - self->handshakeWire_.size());
-                    self->handshakeWire_.insert(self->handshakeWire_.end(), chunk.begin(), chunk.begin() + cap);
-                }
                 try {
                     self->feedObfsBytes(chunk);
                 } catch (const std::exception &e) {
-                    if (!self->tryFlipDownlinkAndRedecode()) {
-                        completion(e.what());
-                        return;
-                    }
+                    completion(e.what());
+                    return;
                 }
             }
             if (self->decodedBuf_.size() >= needed) {
@@ -1541,18 +1565,8 @@ private:
                 return;
             }
             uint16_t bodyLen = readBE16(self->decodedBuf_.data());
-            if (!self->handshakeDone_ && (bodyLen < 28 || bodyLen > 2048)) {
-                if (self->tryFlipDownlinkAndRedecode()) {
-                    self->readNextRecord(std::move(completion));
-                    return;
-                }
-            }
             self->ensureDecodedBytes(2 + size_t(bodyLen), [self, bodyLen, completion = std::move(completion)](Error berr) mutable {
                 if (!berr.empty()) {
-                    if (!self->handshakeDone_ && self->tryFlipDownlinkAndRedecode()) {
-                        self->readNextRecord(std::move(completion));
-                        return;
-                    }
                     completion({}, true, berr);
                     return;
                 }
@@ -1598,10 +1612,6 @@ private:
                     }
                     completion(std::move(plain), false, {});
                 } catch (const std::exception &e) {
-                    if (!self->handshakeDone_ && self->tryFlipDownlinkAndRedecode()) {
-                        self->readNextRecord(std::move(completion));
-                        return;
-                    }
                     self->close();
                     completion({}, true, e.what());
                 }
@@ -1681,18 +1691,267 @@ private:
     size_t recordScanOffset_ = 0;
     size_t nextRecordBoundary_ = 0;
     uint8_t padMarker_ = 0;
-    bool padMarkerKnown_ = false;
-    bool captureNextNonHintAsPadMarker_ = false;
-    std::string cacheKey_;
     Buffer httpMaskBuf_;
     bool httpMaskResponseDone_ = true;
     CursorBuffer decodedBuf_;
     CursorBuffer pendingPlain_;
-    Buffer handshakeWire_;
     bool handshakeDone_ = false;
-    bool triedFlipDownlink_ = false;
     bool closed_ = false;
 };
+
+// Sudoku KIP StartMux (0x11) Multiplexed Session & SubStream
+class SudokuMuxSession final : public std::enable_shared_from_this<SudokuMuxSession> {
+public:
+    explicit SudokuMuxSession(std::shared_ptr<SudokuStream> carrier)
+        : carrier_(std::move(carrier)), reader_(std::make_shared<Reader>(carrier_)),
+          writer_(std::make_shared<OrderedWriter>(carrier_)) {}
+
+    bool isClosed() const noexcept { return closed_; }
+
+    void startReadLoop() {
+        pumpRead();
+    }
+
+    void openSubStream(const Target &target, StreamCallback completion);
+
+    void writeMuxFrame(uint8_t frameType, uint32_t streamID, const uint8_t *payload, size_t len, WriteCallback completion) {
+        if (closed_) {
+            if (completion) completion(terminal_.empty() ? Error("Sudoku mux session closed") : terminal_);
+            return;
+        }
+        Buffer frame;
+        frame.reserve(7 + len);
+        frame.push_back(frameType);
+        appendBE32(frame, streamID);
+        appendBE16(frame, uint16_t(len));
+        if (len > 0) frame.insert(frame.end(), payload, payload + len);
+        writer_->write(std::move(frame), std::move(completion));
+    }
+
+    void unregisterStream(uint32_t streamID) {
+        streams_.erase(streamID);
+    }
+
+    void closeAll(Error err) {
+        if (closed_) return;
+        closed_ = true;
+        terminal_ = err.empty() ? Error("Sudoku mux session closed") : err;
+        writer_->close();
+        reader_->close();
+        if (carrier_) carrier_->close();
+        auto active = std::move(streams_);
+        streams_.clear();
+        for (auto &kv : active) {
+            if (auto sub = kv.second.lock()) {
+                sub->onRemoteReset(terminal_);
+            }
+        }
+    }
+
+    class SubStream final : public Stream, public std::enable_shared_from_this<SubStream> {
+    public:
+        SubStream(std::shared_ptr<SudokuMuxSession> session, uint32_t streamID)
+            : session_(std::move(session)), streamID_(streamID) {}
+        ~SubStream() override { close(); }
+
+        void write(Buffer data, WriteCallback completion) override {
+            if (closed_) { completion(terminal_.empty() ? Error("Sudoku mux stream closed") : terminal_); return; }
+            if (data.empty()) { completion({}); return; }
+            auto sess = session_.lock();
+            if (!sess || sess->isClosed()) { completion("Sudoku mux session closed"); return; }
+            size_t offset = 0;
+            while (offset < data.size()) {
+                size_t chunk = std::min<size_t>(32768, data.size() - offset);
+                bool isLast = (offset + chunk == data.size());
+                sess->writeMuxFrame(kSudokuMuxFrameData, streamID_, data.data() + offset, chunk,
+                                    isLast ? std::move(completion) : WriteCallback([](Error) {}));
+                offset += chunk;
+            }
+        }
+
+        void read(size_t maximum, ReadCallback completion) override {
+            if (!buffered_.empty()) {
+                Buffer out = buffered_.consume(maximum);
+                bool done = buffered_.empty() && remoteClosed_;
+                completion(std::move(out), done, {});
+                return;
+            }
+            if (remoteClosed_) {
+                completion({}, true, terminal_);
+                return;
+            }
+            if (closed_) {
+                completion({}, true, terminal_.empty() ? Error("Sudoku mux stream closed") : terminal_);
+                return;
+            }
+            pendingMax_ = maximum;
+            pendingRead_ = std::move(completion);
+        }
+
+        void close() override {
+            if (closed_) return;
+            closed_ = true;
+            if (auto sess = session_.lock()) {
+                sess->unregisterStream(streamID_);
+                if (!remoteClosed_ && !sess->isClosed()) {
+                    sess->writeMuxFrame(kSudokuMuxFrameClose, streamID_, nullptr, 0, [](Error) {});
+                }
+            }
+            if (auto cb = std::exchange(pendingRead_, {})) {
+                cb({}, true, terminal_.empty() ? Error("Sudoku mux stream closed") : terminal_);
+            }
+        }
+
+        void onRemoteData(const Buffer &payload) {
+            if (closed_ || payload.empty()) return;
+            buffered_.append(payload.data(), payload.size());
+            if (pendingRead_) {
+                auto cb = std::exchange(pendingRead_, {});
+                Buffer out = buffered_.consume(pendingMax_);
+                bool done = buffered_.empty() && remoteClosed_;
+                cb(std::move(out), done, {});
+            }
+        }
+
+        void onRemoteClose() {
+            remoteClosed_ = true;
+            if (pendingRead_ && buffered_.empty()) {
+                auto cb = std::exchange(pendingRead_, {});
+                cb({}, true, {});
+            }
+        }
+
+        void onRemoteReset(const Error &err) {
+            remoteClosed_ = true;
+            terminal_ = err.empty() ? Error("Sudoku mux stream reset by peer") : err;
+            if (pendingRead_) {
+                auto cb = std::exchange(pendingRead_, {});
+                cb({}, true, terminal_);
+            }
+        }
+
+    private:
+        std::weak_ptr<SudokuMuxSession> session_;
+        uint32_t streamID_ = 0;
+        CursorBuffer buffered_;
+        ReadCallback pendingRead_;
+        size_t pendingMax_ = 0;
+        Error terminal_;
+        bool remoteClosed_ = false;
+        bool closed_ = false;
+    };
+
+private:
+    void pumpRead() {
+        if (closed_) return;
+        auto self = shared_from_this();
+        reader_->exactly(7, [self](Buffer hdr, Error err) {
+            if (self->closed_) return;
+            if (!err.empty()) {
+                self->closeAll(err == "EOF" ? Error{} : err);
+                return;
+            }
+            uint8_t fType = hdr[0];
+            uint32_t sid = readBE32(hdr.data() + 1);
+            uint16_t payLen = readBE16(hdr.data() + 5);
+            if (payLen == 0) {
+                self->dispatchFrame(fType, sid, {});
+                self->pumpRead();
+                return;
+            }
+            self->reader_->exactly(payLen, [self, fType, sid](Buffer payload, Error perr) {
+                if (self->closed_) return;
+                if (!perr.empty()) {
+                    self->closeAll(perr);
+                    return;
+                }
+                self->dispatchFrame(fType, sid, payload);
+                self->pumpRead();
+            });
+        });
+    }
+
+    void dispatchFrame(uint8_t fType, uint32_t sid, const Buffer &payload) {
+        auto it = streams_.find(sid);
+        if (it == streams_.end()) return;
+        auto sub = it->second.lock();
+        if (!sub) {
+            streams_.erase(it);
+            return;
+        }
+        if (fType == kSudokuMuxFrameData) {
+            sub->onRemoteData(payload);
+        } else if (fType == kSudokuMuxFrameClose) {
+            streams_.erase(it);
+            sub->onRemoteClose();
+        } else if (fType == kSudokuMuxFrameReset) {
+            streams_.erase(it);
+            std::string msg(payload.begin(), payload.end());
+            sub->onRemoteReset(msg.empty() ? Error("Sudoku mux stream reset") : Error(msg));
+        }
+    }
+
+    std::shared_ptr<SudokuStream> carrier_;
+    std::shared_ptr<Reader> reader_;
+    std::shared_ptr<OrderedWriter> writer_;
+    std::unordered_map<uint32_t, std::weak_ptr<SubStream>> streams_;
+    uint32_t nextStreamID_ = 1;
+    Error terminal_;
+    bool closed_ = false;
+};
+
+void SudokuMuxSession::openSubStream(const Target &target, StreamCallback completion) {
+    if (closed_) {
+        completion(nullptr, terminal_.empty() ? Error("Sudoku mux session closed") : terminal_);
+        return;
+    }
+    Buffer addr;
+    try {
+        addr = socksAddress(target);
+    } catch (const std::exception &e) {
+        completion(nullptr, e.what());
+        return;
+    }
+    uint32_t sid = nextStreamID_++;
+    if (sid == 0) sid = nextStreamID_++;
+    auto sub = std::make_shared<SubStream>(shared_from_this(), sid);
+    streams_[sid] = sub;
+    writeMuxFrame(kSudokuMuxFrameOpen, sid, addr.data(), addr.size(), [self = shared_from_this(), sid, sub, completion = std::move(completion)](Error err) mutable {
+        if (!err.empty()) {
+            self->unregisterStream(sid);
+            completion(nullptr, err);
+            return;
+        }
+        completion(sub, {});
+    });
+}
+
+struct PooledSudokuMuxEntry {
+    std::shared_ptr<TransportFactory> factory;
+    std::shared_ptr<SudokuMuxSession> session;
+    std::vector<std::function<void(std::shared_ptr<SudokuMuxSession>, Error)>> waiters;
+    bool connecting = false;
+    void closeEntry() {
+        connecting = false;
+        if (session) {
+            session->closeAll("Sudoku mux client reset");
+            session.reset();
+        }
+        auto pending = std::move(waiters);
+        waiters.clear();
+        for (auto &w : pending) w(nullptr, "Sudoku mux client reset");
+    }
+};
+
+std::mutex &sudokuMuxPoolMutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::unordered_map<std::string, std::shared_ptr<PooledSudokuMuxEntry>> &sudokuMuxPool() {
+    static std::unordered_map<std::string, std::shared_ptr<PooledSudokuMuxEntry>> pool;
+    return pool;
+}
 
 // Sudoku UoT (UDP-over-TCP) Datagram: frame format [uint16 addrLen (BE)][uint16 payloadLen (BE)][socksAddress][payload]
 class SudokuUoTDatagram final : public Datagram, public std::enable_shared_from_this<SudokuUoTDatagram> {
@@ -1838,6 +2097,37 @@ private:
 
 } // namespace
 
+void resetSudokuClients() {
+    std::vector<std::shared_ptr<PooledSudokuMuxEntry>> entries;
+    {
+        std::lock_guard<std::mutex> lock(sudokuMuxPoolMutex());
+        for (auto &kv : sudokuMuxPool()) {
+            if (kv.second) entries.push_back(kv.second);
+        }
+        sudokuMuxPool().clear();
+    }
+    for (auto &e : entries) e->closeEntry();
+}
+
+void resetSudokuClient(const std::shared_ptr<TransportFactory> &factory) {
+    if (!factory) {
+        resetSudokuClients();
+        return;
+    }
+    std::vector<std::shared_ptr<PooledSudokuMuxEntry>> entries;
+    {
+        std::lock_guard<std::mutex> lock(sudokuMuxPoolMutex());
+        for (auto it = sudokuMuxPool().begin(); it != sudokuMuxPool().end();) {
+            if (!it->second || it->second->factory == factory) {
+                if (it->second) entries.push_back(it->second);
+                it = sudokuMuxPool().erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto &e : entries) e->closeEntry();
+}
 
 Error validateSudoku(const Node &node, bool) {
     SudokuConfig cfg;
@@ -1850,8 +2140,89 @@ void connectSudoku(const Node &node, const Target &target,
     auto err = parseSudokuConfig(node, cfg);
     if (!err.empty()) { completion(nullptr, err); return; }
 
-    auto tls = tlsOptions(node, !cfg.disableHttpMask && cfg.httpMaskTls);
     std::string endpointTag = formatHostHeaderAuthority(node.dialHost()) + ":" + std::to_string(node.port);
+    const bool useMux = !target.udp && (cfg.multiplex == "on" || cfg.multiplex == "true" || cfg.multiplex == "auto");
+    if (useMux) {
+        std::string poolKey = std::to_string(reinterpret_cast<uintptr_t>(factory.get())) + "|" +
+            endpointTag + "|" + node.interfaceName + "|" + cfg.key + "|" + cfg.tableType + "|" + cfg.customTable;
+        std::shared_ptr<PooledSudokuMuxEntry> entry;
+        {
+            std::lock_guard<std::mutex> lock(sudokuMuxPoolMutex());
+            if (sudokuMuxPool().size() > 64) sudokuMuxPool().clear();
+            auto &slot = sudokuMuxPool()[poolKey];
+            if (!slot) {
+                slot = std::make_shared<PooledSudokuMuxEntry>();
+                slot->factory = factory;
+            }
+            entry = slot;
+        }
+        if (entry->session && !entry->session->isClosed()) {
+            entry->session->openSubStream(target, std::move(completion));
+            return;
+        }
+        entry->session.reset();
+        entry->waiters.push_back([target, completion = std::move(completion)](std::shared_ptr<SudokuMuxSession> sess, Error muxErr) mutable {
+            if (!muxErr.empty() || !sess) {
+                completion(nullptr, muxErr.empty() ? Error("Sudoku mux session unavailable") : muxErr);
+                return;
+            }
+            sess->openSubStream(target, std::move(completion));
+        });
+        if (entry->connecting) return;
+        entry->connecting = true;
+
+        auto tls = tlsOptions(node, !cfg.disableHttpMask && cfg.httpMaskTls);
+        factory->tcp(node, tls, [factory, cfg = std::move(cfg), endpointTag = std::move(endpointTag), entry]
+                     (std::shared_ptr<Stream> raw, Error dialErr) mutable {
+            if (!dialErr.empty() || !raw) {
+                entry->connecting = false;
+                auto pending = std::move(entry->waiters);
+                entry->waiters.clear();
+                Error finalErr = dialErr.empty() ? Error("Sudoku TCP dial failed") : dialErr;
+                for (auto &w : pending) w(nullptr, finalErr);
+                return;
+            }
+            try {
+                std::string masterPubKey;
+                Buffer userHash8;
+                sudokuRecoverMasterPublicKey(cfg.key, masterPubKey, userHash8);
+                const bool upAscii = (cfg.tableType == "prefer_ascii" || cfg.tableType == "up_ascii_down_entropy");
+                const bool downAscii = (cfg.tableType == "prefer_ascii" || cfg.tableType == "up_entropy_down_ascii");
+                auto upTable = getSudokuTable(masterPubKey, upAscii, upAscii ? "" : cfg.customTable);
+                auto downTable = (upAscii == downAscii)
+                    ? upTable
+                    : getSudokuTable(masterPubKey, downAscii, downAscii ? "" : cfg.customTable);
+                auto sudokuStream = std::make_shared<SudokuStream>(
+                    raw, std::move(cfg), std::move(masterPubKey), std::move(userHash8),
+                    std::move(upTable), std::move(downTable), std::move(endpointTag));
+                sudokuStream->startMuxHandshake([entry](std::shared_ptr<Stream> readyCarrier, Error hsErr) {
+                    entry->connecting = false;
+                    if (!hsErr.empty() || !readyCarrier) {
+                        auto pending = std::move(entry->waiters);
+                        entry->waiters.clear();
+                        Error finalErr = hsErr.empty() ? Error("Sudoku mux handshake failed") : hsErr;
+                        for (auto &w : pending) w(nullptr, finalErr);
+                        return;
+                    }
+                    auto muxSess = std::make_shared<SudokuMuxSession>(std::static_pointer_cast<SudokuStream>(readyCarrier));
+                    muxSess->startReadLoop();
+                    entry->session = muxSess;
+                    auto pending = std::move(entry->waiters);
+                    entry->waiters.clear();
+                    for (auto &w : pending) w(muxSess, {});
+                }, factory);
+            } catch (const std::exception &e) {
+                raw->close();
+                entry->connecting = false;
+                auto pending = std::move(entry->waiters);
+                entry->waiters.clear();
+                for (auto &w : pending) w(nullptr, e.what());
+            }
+        });
+        return;
+    }
+
+    auto tls = tlsOptions(node, !cfg.disableHttpMask && cfg.httpMaskTls);
     factory->tcp(node, tls, [factory, cfg = std::move(cfg), endpointTag = std::move(endpointTag), target, completion = std::move(completion)]
                  (std::shared_ptr<Stream> raw, Error dialErr) mutable {
         if (!dialErr.empty() || !raw) {
@@ -1996,7 +2367,7 @@ bool sudokuProtocolSelfTest() {
 
             auto upTbl = getSudokuTable(userPub, true, "");
             auto downTbl = getSudokuTable(userPub, false, "xvxvppvv");
-            const uint8_t testPadMarker = downTbl->layout.paddingPool.back();
+            const uint8_t testPadMarker = downTbl->layout.paddingPool[0];
             auto packDownlink6Bit = [&](const Buffer &rec) -> Buffer {
                 Buffer wire;
                 uint32_t acc = 0;
@@ -2008,7 +2379,7 @@ bool sudokuProtocolSelfTest() {
                     while (bits >= 6) {
                         bits -= 6;
                         if ((++step % 5) == 0 && downTbl->layout.paddingPool.size() > 1) {
-                            wire.push_back(downTbl->layout.paddingPool[step % (downTbl->layout.paddingPool.size() - 1)]);
+                            wire.push_back(downTbl->layout.paddingPool[1 + (step % (downTbl->layout.paddingPool.size() - 1))]);
                         }
                         wire.push_back(downTbl->layout.encodeHint(((acc >> (bits + 4)) & 3), ((acc >> bits) & 0x0f)));
                     }
@@ -2018,7 +2389,7 @@ bool sudokuProtocolSelfTest() {
                     wire.push_back(testPadMarker);
                 }
                 if (downTbl->layout.paddingPool.size() > 1) {
-                    wire.push_back(downTbl->layout.paddingPool[0]);
+                    wire.push_back(downTbl->layout.paddingPool[1]);
                 }
                 return wire;
             };
@@ -2029,7 +2400,7 @@ bool sudokuProtocolSelfTest() {
             cfg.aeadMethod = "chacha20-poly1305";
             cfg.tableType = "up_ascii_down_entropy";
             cfg.customTable = "xvxvppvv";
-            cfg.enablePureDownlink = true;
+            cfg.enablePureDownlink = false;
             cfg.disableHttpMask = false;
 
             auto stream = std::make_shared<SudokuStream>(raw, cfg, userPub, userHash2, upTbl, downTbl, "127.0.0.1:8443");

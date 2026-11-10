@@ -1026,6 +1026,14 @@ final class EnhancedTunnelService {
             let flags = fcntl(descriptor, F_GETFL, 0)
             if flags >= 0 { _ = fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) }
             _ = fcntl(descriptor, F_SETFD, FD_CLOEXEC)
+            for candidate in [Int32(4 * 1024 * 1024), Int32(2 * 1024 * 1024), Int32(1 * 1024 * 1024)] {
+                var bufSize = candidate
+                if setsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size)) == 0 { break }
+            }
+            for candidate in [Int32(4 * 1024 * 1024), Int32(2 * 1024 * 1024), Int32(1 * 1024 * 1024)] {
+                var bufSize = candidate
+                if setsockopt(descriptor, SOL_SOCKET, SO_SNDBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size)) == 0 { break }
+            }
             return (descriptor, String(cString: name))
         } catch {
             Darwin.close(descriptor)

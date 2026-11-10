@@ -390,3 +390,28 @@
 2. **Shadowsocks ([Shadowsocks.cpp](file:///Users/weiwei/Downloads/hajimi-main/Sources/HajimiProtocolsCXX/Shadowsocks.cpp))**：内置 `simple-obfs` (`http` / `tls`) 与 `2022-blake3-chacha20-poly1305` 支持。
 3. **Mieru ([MieruProtocol.cpp](file:///Users/weiwei/Downloads/hajimi-main/Sources/HajimiProtocolsCXX/MieruProtocol.cpp))**：移除 UDP 载荷解密的 `beNonce`/`leNonce` 历史兜底分支，按 `multiplexing` 级别支持单底层连接多 Session 复用。
 
+---
+
+## 4. 全量去非标准协议栈重构与指标优化完成状态 (Build 69 Status)
+
+上述审计报告中列出的全部 P0 / P1 / P2 非标准协议实现、历史测试兼容变体与性能瓶颈均已 100% 完成标准化重构与指标优化：
+
+1. **Snell v4–v6 (`Snell.hpp`, `Snell.cpp`)**：✅ **已 100% 标准化**
+   - 已彻底移除 `Compat16Pool7`、`Compat16RFC`、`pool7Variant`、`tryFallbackCompat` 及 `"fixture.invalid"` / `"node.scope.invalid"` 硬编码判断；
+   - 统一采用标准 RFC 9106 Argon2id (`tagLen = 32` 取前 16B) 与标准 7 字节 `{4, 0, 0, pad_hi, pad_lo, len_hi, len_lo}` 帧头，并升级为 `frameSlice` + `CursorBuffer` 零拷贝实现。
+2. **TrustTunnel (`TrustTunnelProtocol.cpp`)**：✅ **已 100% 标准化**
+   - 已彻底移除私有 `_trusttunnel_udp_:443` 伪目标域名与自定义流式分帧；
+   - 已实现标准 **RFC 9298 (`connect-udp`)** 与 **RFC 9297 (HTTP Capsule Protocol)**（`Capsule Type = 0x00 DATAGRAM`, `Context ID = 0x00`），并新增 `PooledTrustTunnelQUIC` HTTP/3 连接池复用。
+3. **Mieru v3 (`MieruProtocol.cpp`)**：✅ **已 100% 标准化**
+   - 已移除 `openMetadataBlock` 与 `openPayloadSlice` 中的 `useLittleEndianRxNonce_` / `incrementNonceLE` 异常捕获回退分支，严格遵循 `enfein/mieru v3` 大端 Nonce 递增规范；
+   - 已补齐上行低熵模式编码器 `encodeMieruLowEntropyPayload` (`kMieruDataClientToServerLE = 10`) 与 TCP `HANDSHAKE_NO_WAIT` 0-RTT 首包合并发送。
+4. **Sudoku (`SudokuProtocol.cpp`)**：✅ **已 100% 标准化**
+   - 已彻底移除 `tryFlipDownlinkAndRedecode()`、`handshakeWire_` 及 `getLearnedSudokuPureDownlink` / `getLearnedSudokuPadMarker` 启发式翻转与猜测缓存，严格使用 `downTable_->layout.paddingPool[0]` 作为标准 `PackedConn` 填充标记；
+   - 已实现标准 `kKIPTypeStartMux (0x11)` 单连接多路复用 (`SudokuMuxSession` / `sudokuMuxPool`)。
+5. **WireGuard (`WireGuardProtocol.cpp`)**：✅ **已 100% 标准化**
+   - 已移除未配置 `self-ip-v6` 时默认填充私有 ULA `"fd00:6861:6a69:66::2"` 的非标逻辑与 `"fixture.invalid"` 硬编码判断；
+   - 已支持隧道内 IPv6 `dns-server` (`dnsIPv6`) 双栈 `AAAA` DNS 解析、Type-3 Cookie Reply (`mac2`)、RFC 6479 防重放滑动窗口及用户态 TCP Window Scale / SACK / RFC 6298 动态 RTO。
+6. **VMess AEAD (`VMess.cpp`, `Validation.cpp`)**：✅ **已 100% 标准化**
+   - 已完整支持 `chacha20-poly1305`、`aes-128-gcm`、`none`、`zero` 加密，以及基于 OpenSSL `EVP_shake128()` 的标准 `RequestOptionChunkMasking (0x04)` 与 `RequestOptionGlobalPadding (0x08)`。
+7. **QUIC / Hysteria2 / TUIC v5 / VLESS Vision / Shadowsocks (`QUICTransport.cpp`, `QUICProtocols.cpp`, `VlessTrojanProtocol.cpp`, `Shadowsocks.cpp`)**：✅ **已 100% 标准化并完成零拷贝优化**
+   - 已实现 Hysteria / Hysteria2 Brutal 恒定速率令牌桶步进器 (`brutalUpBps_`)、单 QUIC 连接多路复用池 (`SharedStream`)，并将全链路流式接收缓冲区统一升级为 $O(1)$ `proto_common::CursorBuffer`。

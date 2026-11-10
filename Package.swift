@@ -145,11 +145,33 @@ let package = Package(
         ]),
         .target(name: "HajimiNativeCore", dependencies: ["HajimiCore", "HajimiDataPlaneC", "HajimiFlowCXX"]),
         // Data plane runs in the App. The helper only needs IPC + root net config.
-        .executableTarget(name: "HajimiApp", dependencies: [
-            "HajimiCore", "HajimiIPC", "HajimiNativeCore", "HajimiMacOSObjC",
-            "HajimiRuntime", "HajimiRuntimeTestSupport", "HajimiUIComponents", "HajimiDiagnosticsUI",
-            "HajimiDiagnosticsUITestSupport"
-        ]),
+        // Set HAJIMI_MINIMAL_RELEASE=1 to strip embedded smoke-check fixtures and TestSupport modules.
+        .executableTarget(
+            name: "HajimiApp",
+            dependencies: ProcessInfo.processInfo.environment["HAJIMI_MINIMAL_RELEASE"] == "1" ? [
+                "HajimiCore", "HajimiIPC", "HajimiNativeCore", "HajimiMacOSObjC",
+                "HajimiRuntime", "HajimiUIComponents", "HajimiDiagnosticsUI"
+            ] : [
+                "HajimiCore", "HajimiIPC", "HajimiNativeCore", "HajimiMacOSObjC",
+                "HajimiRuntime", "HajimiRuntimeTestSupport", "HajimiUIComponents", "HajimiDiagnosticsUI",
+                "HajimiDiagnosticsUITestSupport"
+            ],
+            exclude: ProcessInfo.processInfo.environment["HAJIMI_MINIMAL_RELEASE"] == "1" ? [
+                "AppNetworkRuntimeSelfTest.swift",
+                "DNSAdaptiveLoopbackSmokeCheck.swift",
+                "DNSLocalIngressFixture.swift",
+                "DNSPerformanceLoopbackSmokeCheck.swift",
+                "DNSSecurityLoopbackSmokeCheck.swift",
+                "DNSSplitLoopbackSmokeCheck.swift",
+                "IngressSecuritySmokeCheck.swift",
+                "ProtocolAdapterSmokeCheck.swift",
+                "ProxyPerformanceSmokeCheck.swift",
+                "UDPPrivacySmokeCheck.swift",
+                "VideoStreamLoopbackSmokeCheck.swift"
+            ] : [],
+            swiftSettings: ProcessInfo.processInfo.environment["HAJIMI_MINIMAL_RELEASE"] == "1"
+                ? [.define("HAJIMI_MINIMAL_RELEASE")] : []
+        ),
         .executableTarget(name: "HajimiHelper", dependencies: ["HajimiIPC"])
     ],
     cxxLanguageStandard: .cxx17

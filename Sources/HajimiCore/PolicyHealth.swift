@@ -242,7 +242,7 @@ public enum PolicyProbe {
 
     static let routedConnector: Connector = { route, target, plainHTTP, lane, callback in
         TunnelConnector.connect(route: route, target: target, plainHTTP: plainHTTP,
-                                queue: lane, completion: callback)
+                                queue: lane, recordSetup: false, completion: callback)
     }
 
     /// Dials `route` and times a plain HTTP request through it.
@@ -588,8 +588,11 @@ public final class PolicyHealthMonitor {
             if !force {
                 if let retry = retryAfter[group.name] {
                     guard now >= retry else { continue }
+                    retryAfter.removeValue(forKey: group.name)
                 } else if let last = lastChecked[group.name],
                           now.timeIntervalSince(last) < options.interval { continue }
+            } else {
+                retryAfter.removeValue(forKey: group.name)
             }
             rounds[group.name] = ProbeRound(group: group, options: options, profile: profile,
                                            selections: selections, epoch: epoch, callbacks: callbacks)
@@ -666,7 +669,7 @@ public final class PolicyHealthMonitor {
         smartNodeStats[group.name] = groupStats
         #endif
         if result.deferred.isEmpty { retryAfter.removeValue(forKey: group.name) }
-        else { retryAfter[group.name] = Date().addingTimeInterval(max(5, min(30, options.interval))) }
+        else { retryAfter[group.name] = Date().addingTimeInterval(max(30, min(60, options.interval))) }
         let previous = selections[group.name]
         // Not obtaining a slot is not a negative health observation. Preserve
         // previous healthy data and do not switch based on a partial round.

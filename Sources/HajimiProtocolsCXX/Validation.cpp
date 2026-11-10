@@ -60,7 +60,8 @@ Error validateBasicProtocol(const Node &node,bool udp) {
                 if(node.flag("mux"))return "VLESS Vision TCP cannot use shared Mux.Cool";
             }
         }
-        if(node.flag("global-padding") || node.flag("authenticated-length"))return "Unsupported VMess/VLESS framing option";
+        if(node.type=="vless" && (node.flag("global-padding") || node.flag("authenticated-length") || node.flag("chunk-masking")))return "Unsupported VLESS framing option";
+        if(node.type=="vmess" && node.flag("authenticated-length"))return "Unsupported VMess authenticated-length option";
         return {};
     }
     if(node.type=="trojan") {

@@ -1,8 +1,10 @@
 #include "Runtime.hpp"
 #include "ProtocolStream.hpp"
+#include "ProtocolCommon.hpp"
 #include "Crypto.hpp"
 #include <openssl/crypto.h>
 #include <algorithm>
+#include <cstring>
 #include <array>
 #include <atomic>
 #include <cctype>
@@ -370,8 +372,8 @@ class SSRObfsStream final : public Stream, public std::enable_shared_from_this<S
     bool sentHandshake_ = false;
     bool strippedHttpHeader_ = false;
     bool tlsHandshakeComplete_ = false;
-    Buffer readBuf_;
-    Buffer decodedBuf_;
+    proto_common::CursorBuffer readBuf_;
+    proto_common::CursorBuffer decodedBuf_;
 
     std::string effectiveHost() const {
         if (!host_.empty()) {
@@ -518,9 +520,7 @@ public:
 
     void read(size_t maximum, ReadCallback completion) override {
         if (!decodedBuf_.empty()) {
-            size_t take = std::min(maximum, decodedBuf_.size());
-            Buffer out(decodedBuf_.begin(), decodedBuf_.begin() + take);
-            decodedBuf_.erase(decodedBuf_.begin(), decodedBuf_.begin() + take);
+            Buffer out = decodedBuf_.consume(maximum);
             completion(std::move(out), false, {});
             return;
         }
@@ -532,7 +532,7 @@ public:
             }
             if (self->mode_ == "http_simple" || self->mode_ == "http_post") {
                 if (!self->strippedHttpHeader_) {
-                    append(self->readBuf_, chunk);
+                    self->readBuf_.append(chunk.data(), chunk.size());
                     const std::string view(reinterpret_cast<const char *>(self->readBuf_.data()), self->readBuf_.size());
                     if (view.rfind("HTTP/", 0) == 0) {
                         auto pos = view.find("\r\n\r\n");
@@ -542,20 +542,22 @@ public:
                             return;
                         }
                         self->strippedHttpHeader_ = true;
-                        self->decodedBuf_.assign(self->readBuf_.begin() + pos + 4, self->readBuf_.end());
+                        self->decodedBuf_.clear();
+                        if (self->readBuf_.size() > pos + 4) {
+                            self->decodedBuf_.append(self->readBuf_.data() + pos + 4, self->readBuf_.size() - (pos + 4));
+                        }
                         self->readBuf_.clear();
                     } else {
                         self->strippedHttpHeader_ = true;
-                        self->decodedBuf_ = std::move(self->readBuf_);
+                        self->decodedBuf_.clear();
+                        self->decodedBuf_.append(self->readBuf_.data(), self->readBuf_.size());
                         self->readBuf_.clear();
                     }
                     if (self->decodedBuf_.empty() && !eof) {
                         self->read(maximum, std::move(completion));
                         return;
                     }
-                    size_t take = std::min(maximum, self->decodedBuf_.size());
-                    Buffer out(self->decodedBuf_.begin(), self->decodedBuf_.begin() + take);
-                    self->decodedBuf_.erase(self->decodedBuf_.begin(), self->decodedBuf_.begin() + take);
+                    Buffer out = self->decodedBuf_.consume(maximum);
                     completion(std::move(out), self->decodedBuf_.empty() ? eof : false, {});
                     return;
                 }
@@ -563,30 +565,27 @@ public:
                 return;
             }
             if (self->mode_ == "tls1.2_ticket_auth") {
-                append(self->readBuf_, chunk);
+                self->readBuf_.append(chunk.data(), chunk.size());
                 while (self->readBuf_.size() >= 5) {
-                    uint8_t rtype = self->readBuf_[0];
-                    size_t rlen = (size_t(self->readBuf_[3]) << 8) | self->readBuf_[4];
+                    const uint8_t *rp = self->readBuf_.data();
+                    uint8_t rtype = rp[0];
+                    size_t rlen = (size_t(rp[3]) << 8) | rp[4];
                     if (rlen > 16384 + 2048) {
                         completion({}, true, "SSR TLS obfs record length invalid");
                         return;
                     }
                     if (self->readBuf_.size() < 5 + rlen) break;
-                    if (rtype == 0x17) {
+                    if (rtype == 0x17 && rlen > 0) {
                         self->tlsHandshakeComplete_ = true;
-                        self->decodedBuf_.insert(self->decodedBuf_.end(),
-                                                 self->readBuf_.begin() + 5,
-                                                 self->readBuf_.begin() + 5 + rlen);
+                        self->decodedBuf_.append(rp + 5, rlen);
                     }
-                    self->readBuf_.erase(self->readBuf_.begin(), self->readBuf_.begin() + 5 + rlen);
+                    self->readBuf_.advance(5 + rlen);
                 }
                 if (self->decodedBuf_.empty() && !eof) {
                     self->read(maximum, std::move(completion));
                     return;
                 }
-                size_t take = std::min(maximum, self->decodedBuf_.size());
-                Buffer out(self->decodedBuf_.begin(), self->decodedBuf_.begin() + take);
-                self->decodedBuf_.erase(self->decodedBuf_.begin(), self->decodedBuf_.begin() + take);
+                Buffer out = self->decodedBuf_.consume(maximum);
                 completion(std::move(out), self->decodedBuf_.empty() ? eof : false, {});
                 return;
             }
@@ -614,7 +613,7 @@ class SSRProtocolCodec {
     Buffer lastServerHash_;
     std::unique_ptr<crypto::CipherStream> authChainClientRC4_;
     std::unique_ptr<crypto::CipherStream> authChainServerRC4_;
-    Buffer recvBuf_;
+    proto_common::CursorBuffer recvBuf_;
 
     struct XorShift128Plus {
         uint64_t v0 = 0, v1 = 0;
@@ -860,26 +859,27 @@ public:
         if (proto_ == "origin" || proto_ == "verify_sha1" || proto_ == "ota") {
             return incoming;
         }
-        append(recvBuf_, incoming);
+        recvBuf_.append(incoming.data(), incoming.size());
         Buffer out;
         if (proto_ == "auth_sha1_v4") {
             while (recvBuf_.size() >= 9) {
-                size_t totalLen = (size_t(recvBuf_[0]) << 8) | recvBuf_[1];
+                const uint8_t *rp = recvBuf_.data();
+                size_t totalLen = (size_t(rp[0]) << 8) | rp[1];
                 if (totalLen < 9 || totalLen > 65535) throw std::runtime_error("SSR auth_sha1_v4 frame length invalid");
-                uint16_t expectedCrc = static_cast<uint16_t>(crc32IEEE(recvBuf_.data(), 2) & 0xffffu);
-                if (get16LE(recvBuf_.data() + 2) != expectedCrc) throw std::runtime_error("SSR auth_sha1_v4 header CRC mismatch");
+                uint16_t expectedCrc = static_cast<uint16_t>(crc32IEEE(rp, 2) & 0xffffu);
+                if (get16LE(rp + 2) != expectedCrc) throw std::runtime_error("SSR auth_sha1_v4 header CRC mismatch");
                 if (recvBuf_.size() < totalLen) break;
-                uint32_t expectedAdler = adler32Checksum(recvBuf_.data(), totalLen - 4);
-                if (get32LE(recvBuf_.data() + totalLen - 4) != expectedAdler) throw std::runtime_error("SSR auth_sha1_v4 checksum mismatch");
+                uint32_t expectedAdler = adler32Checksum(rp, totalLen - 4);
+                if (get32LE(rp + totalLen - 4) != expectedAdler) throw std::runtime_error("SSR auth_sha1_v4 checksum mismatch");
                 size_t pos = 4;
-                size_t randLen = recvBuf_[pos];
+                size_t randLen = rp[pos];
                 if (randLen == 0xff) {
                     if (pos + 3 > totalLen - 4) throw std::runtime_error("SSR auth_sha1_v4 padding invalid");
-                    randLen = get16LE(recvBuf_.data() + pos + 1);
+                    randLen = get16LE(rp + pos + 1);
                 }
                 if (pos + randLen > totalLen - 4) throw std::runtime_error("SSR auth_sha1_v4 padding overflow");
-                out.insert(out.end(), recvBuf_.begin() + pos + randLen, recvBuf_.begin() + totalLen - 4);
-                recvBuf_.erase(recvBuf_.begin(), recvBuf_.begin() + totalLen);
+                out.insert(out.end(), rp + pos + randLen, rp + totalLen - 4);
+                recvBuf_.advance(totalLen);
             }
             return out;
         }
@@ -888,45 +888,47 @@ public:
             Buffer macKey = serverIv_;
             append(macKey, key_);
             while (recvBuf_.size() >= 9) {
-                size_t totalLen = get16LE(recvBuf_.data());
+                const uint8_t *rp = recvBuf_.data();
+                size_t totalLen = get16LE(rp);
                 if (totalLen < 9 || totalLen > 65535) throw std::runtime_error("SSR auth_aes128 frame length invalid");
-                Buffer lenMac = crypto::hmac(hashName, macKey, slice(recvBuf_, 0, 2));
-                if (recvBuf_[2] != lenMac[0] || recvBuf_[3] != lenMac[1]) throw std::runtime_error("SSR auth_aes128 header MAC mismatch");
+                Buffer lenMac = crypto::hmac(hashName, macKey, Buffer(rp, rp + 2));
+                if (rp[2] != lenMac[0] || rp[3] != lenMac[1]) throw std::runtime_error("SSR auth_aes128 header MAC mismatch");
                 if (recvBuf_.size() < totalLen) break;
-                Buffer pktMac = crypto::hmac(hashName, macKey, slice(recvBuf_, 0, totalLen - 4));
-                if (!crypto::constantTimeEqual(slice(recvBuf_, totalLen - 4, 4), slice(pktMac, 0, 4)))
+                Buffer pktMac = crypto::hmac(hashName, macKey, Buffer(rp, rp + totalLen - 4));
+                if (!crypto::constantTimeEqual(Buffer(rp + totalLen - 4, rp + totalLen), slice(pktMac, 0, 4)))
                     throw std::runtime_error("SSR auth_aes128 payload MAC mismatch");
                 size_t pos = 4;
-                size_t randLen = recvBuf_[pos];
+                size_t randLen = rp[pos];
                 if (randLen == 0xff) {
                     if (pos + 3 > totalLen - 4) throw std::runtime_error("SSR auth_aes128 padding invalid");
-                    randLen = get16LE(recvBuf_.data() + pos + 1);
+                    randLen = get16LE(rp + pos + 1);
                 }
                 if (pos + randLen > totalLen - 4) throw std::runtime_error("SSR auth_aes128 padding overflow");
-                out.insert(out.end(), recvBuf_.begin() + pos + randLen, recvBuf_.begin() + totalLen - 4);
-                recvBuf_.erase(recvBuf_.begin(), recvBuf_.begin() + totalLen);
+                out.insert(out.end(), rp + pos + randLen, rp + totalLen - 4);
+                recvBuf_.advance(totalLen);
             }
             return out;
         }
         if (proto_ == "auth_chain_a") {
             while (recvBuf_.size() >= 4) {
+                const uint8_t *rp = recvBuf_.data();
                 uint16_t mask = get16LE(lastServerHash_.data() + 14);
-                size_t dataLen = get16LE(recvBuf_.data()) ^ mask;
+                size_t dataLen = get16LE(rp) ^ mask;
                 size_t randLen = authChainRandLen(dataLen, lastServerHash_, rngServer_);
                 size_t totalLen = 2 + dataLen + randLen + 2;
                 if (totalLen > 65535) throw std::runtime_error("SSR auth_chain_a frame length invalid");
                 if (recvBuf_.size() < totalLen) break;
                 Buffer macKey = userKey_;
                 put32LE(macKey, recvId_);
-                Buffer nextHash = crypto::hmac("MD5", macKey, slice(recvBuf_, 0, totalLen - 2));
-                if (recvBuf_[totalLen - 2] != nextHash[0] || recvBuf_[totalLen - 1] != nextHash[1])
+                Buffer nextHash = crypto::hmac("MD5", macKey, Buffer(rp, rp + totalLen - 2));
+                if (rp[totalLen - 2] != nextHash[0] || rp[totalLen - 1] != nextHash[1])
                     throw std::runtime_error("SSR auth_chain_a MAC mismatch");
                 ++recvId_;
                 lastServerHash_ = std::move(nextHash);
-                Buffer dec = authChainServerRC4_->update(slice(recvBuf_, 2, dataLen + randLen));
+                Buffer dec = authChainServerRC4_->update(Buffer(rp + 2, rp + 2 + dataLen + randLen));
                 size_t pos = (dataLen > 0 && randLen > 0) ? static_cast<size_t>(rngServer_.next() % (randLen + 1)) : 0;
                 out.insert(out.end(), dec.begin() + pos, dec.begin() + pos + dataLen);
-                recvBuf_.erase(recvBuf_.begin(), recvBuf_.begin() + totalLen);
+                recvBuf_.advance(totalLen);
             }
             return out;
         }

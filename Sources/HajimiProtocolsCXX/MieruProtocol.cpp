@@ -276,6 +276,71 @@ uint64_t rotr64(uint64_t x, unsigned n) {
     return n == 0 ? x : ((x >> n) | (x << (64u - n)));
 }
 
+// Encodes standard AEAD ciphertext + 16B tag into Mieru v3 low-entropy payload (protoType 10: kMieruDataClientToServerLE)
+Buffer encodeMieruLowEntropyPayload(uint8_t lowEntropyMode, uint32_t lowEntropyMask, uint8_t lowEntropyMaskRot,
+                                    const Buffer &cipherPlusTag, Buffer &outMeta32) {
+    if (lowEntropyMode < 1 || lowEntropyMode > 4 || cipherPlusTag.size() < 16) {
+        throw std::runtime_error("Invalid Mieru low entropy encoding parameters");
+    }
+    const size_t C = size_t(lowEntropyMode) + 3; // 4..7 bytes per 8-byte chunk
+    const size_t N = cipherPlusTag.size() - 16;
+    const size_t numChunks = (N + C - 1) / C;
+    const size_t encodedLen = numChunks * 8;
+    if (encodedLen > 65535 || N > 65535) {
+        throw std::runtime_error("Mieru low entropy payload exceeds 16-bit bound");
+    }
+    uint64_t mask0 = (uint64_t(lowEntropyMask) << 32) | uint64_t(lowEntropyMask);
+    bool rotLeft = false;
+    unsigned rotStep = 0;
+    if ((lowEntropyMaskRot & 0x0f) != 0 && (lowEntropyMaskRot & 0xf0) == 0) {
+        rotLeft = false;
+        rotStep = lowEntropyMaskRot & 0x0f;
+    } else if ((lowEntropyMaskRot & 0xf0) != 0 && (lowEntropyMaskRot & 0x0f) == 0) {
+        rotLeft = true;
+        rotStep = (lowEntropyMaskRot >> 4) & 0x0f;
+    }
+
+    Buffer out;
+    out.reserve(encodedLen + 16);
+    size_t pos = 0;
+    for (size_t i = 0; i < numChunks; ++i) {
+        unsigned shift = unsigned((i * rotStep) & 63u);
+        uint64_t mask = rotLeft ? rotl64(mask0, shift) : rotr64(mask0, shift);
+        size_t take = std::min(C, N - pos);
+        uint64_t val = 0;
+        for (size_t b = 0; b < take; ++b) {
+            val = (val << 8) | uint64_t(cipherPlusTag[pos + b]);
+        }
+        pos += take;
+        uint64_t chunk = 0;
+        uint64_t subMask = mask;
+        const size_t totalMaskBits = size_t(__builtin_popcountll(subMask));
+        const size_t skipHighBits = totalMaskBits > take * 8 ? (totalMaskBits - take * 8) : 0;
+        for (size_t s = 0; s < skipHighBits; ++s) {
+            const int hiBit = 63 - __builtin_clzll(subMask);
+            subMask &= ~(1ULL << hiBit);
+        }
+        for (int bitIdx = int(take * 8) - 1; bitIdx >= 0; --bitIdx) {
+            if (subMask == 0) break;
+            const int hiBit = 63 - __builtin_clzll(subMask);
+            if ((val >> bitIdx) & 1ULL) {
+                chunk |= (1ULL << hiBit);
+            }
+            subMask &= ~(1ULL << hiBit);
+        }
+        appendBE64(out, chunk);
+    }
+    out.insert(out.end(), cipherPlusTag.end() - 16, cipherPlusTag.end());
+
+    outMeta32[0] = kMieruDataClientToServerLE;
+    outMeta32[1] = lowEntropyMode;
+    writeBE16At(outMeta32, 22, uint16_t(encodedLen));
+    writeBE32At(outMeta32, 25, lowEntropyMask);
+    writeBE16At(outMeta32, 29, uint16_t(N));
+    outMeta32[31] = lowEntropyMaskRot;
+    return out;
+}
+
 // Decodes Mieru low-entropy expanded ciphertext body (protoType 10 or 11) back into standard AEAD ciphertext + 16B tag
 Buffer decodeMieruLowEntropyPayload(const ParsedMieruMetadata &parsed, const Buffer &encodedPlusTag) {
     if (parsed.protoType != kMieruDataClientToServerLE && parsed.protoType != kMieruDataServerToClientLE) {
@@ -369,6 +434,18 @@ public:
           rxKey_(candidateKeys_.front()), txNonce_(std::move(txNonce)),
           sessionID_(sessionID), txSeq_(initialTxSeq) {}
 
+    void setDeferredInitialHandshake(Buffer wire) {
+        initialHandshakeWire_ = std::move(wire);
+    }
+
+    void flushDeferredHandshakeIfAny() {
+        if (!initialHandshakeWire_.empty() && !closed_) {
+            Buffer wire = std::move(initialHandshakeWire_);
+            initialHandshakeWire_.clear();
+            writer_->write(std::move(wire), [](Error) {});
+        }
+    }
+
     void writeInitialHandshake(Buffer wire, WriteCallback completion) {
         if (closed_) { completion("Stream closed"); return; }
         writer_->write(std::move(wire), std::move(completion));
@@ -376,10 +453,18 @@ public:
 
     void write(Buffer data, WriteCallback completion) override {
         if (closed_) { completion("Stream closed"); return; }
-        if (data.empty()) { completion({}); return; }
+        if (data.empty()) {
+            flushDeferredHandshakeIfAny();
+            completion({});
+            return;
+        }
         try {
             Buffer wire;
-            wire.reserve(data.size() + ((data.size() + 16383) / 16384) * 64);
+            wire.reserve(initialHandshakeWire_.size() + data.size() + ((data.size() + 16383) / 16384) * 64);
+            if (!initialHandshakeWire_.empty()) {
+                wire.insert(wire.end(), initialHandshakeWire_.begin(), initialHandshakeWire_.end());
+                initialHandshakeWire_.clear();
+            }
             size_t offset = 0;
             while (offset < data.size()) {
                 size_t chunkLen = std::min<size_t>(16384, data.size() - offset);
@@ -404,6 +489,7 @@ public:
 
     void read(size_t maximum, ReadCallback completion) override {
         if (closed_) { completion({}, true, "Stream closed"); return; }
+        flushDeferredHandshakeIfAny();
         if (socksReplyConsumed_ && !pending_.empty()) {
             completion(pending_.consume(maximum), false, {});
             return;
@@ -534,67 +620,32 @@ private:
         if (!rxKeyLocked_) {
             for (const auto &cand : candidateKeys_) {
                 try {
-                    Buffer plain = crypto::open(crypto::AEAD::XChaCha20Poly1305, cand, rxNonce_, encMeta);
+                    Buffer plain = crypto::openSlice(crypto::AEAD::XChaCha20Poly1305, cand, rxNonce_, encMeta.data(), encMeta.size());
                     rxKey_ = cand;
                     rxKeyLocked_ = true;
-                    lastRxNonceBeforeInc_ = rxNonce_;
                     incrementNonceBE(rxNonce_);
                     return plain;
                 } catch (...) {}
             }
             throw std::runtime_error("Mieru metadata authentication failed (check username/password or system clock)");
         }
-        try {
-            Buffer plain = crypto::open(crypto::AEAD::XChaCha20Poly1305, rxKey_, rxNonce_, encMeta);
-            lastRxNonceBeforeInc_ = rxNonce_;
-            if (useLittleEndianRxNonce_) incrementNonceLE(rxNonce_);
-            else incrementNonceBE(rxNonce_);
-            return plain;
-        } catch (...) {
-            if (!rxEndianLocked_) {
-                Buffer altNonce = lastRxNonceBeforeInc_;
-                incrementNonceLE(altNonce);
-                Buffer plain = crypto::open(crypto::AEAD::XChaCha20Poly1305, rxKey_, altNonce, encMeta);
-                useLittleEndianRxNonce_ = true;
-                rxEndianLocked_ = true;
-                lastRxNonceBeforeInc_ = altNonce;
-                rxNonce_ = altNonce;
-                incrementNonceLE(rxNonce_);
-                return plain;
-            }
-            throw;
-        }
+        Buffer plain = crypto::openSlice(crypto::AEAD::XChaCha20Poly1305, rxKey_, rxNonce_, encMeta.data(), encMeta.size());
+        incrementNonceBE(rxNonce_);
+        return plain;
     }
 
     Buffer openPayloadSlice(const uint8_t *cipherPtr, size_t cipherLen) {
-        try {
-            Buffer plain = crypto::openSlice(crypto::AEAD::XChaCha20Poly1305, rxKey_, rxNonce_, cipherPtr, cipherLen);
-            rxEndianLocked_ = true;
-            lastRxNonceBeforeInc_ = rxNonce_;
-            if (useLittleEndianRxNonce_) incrementNonceLE(rxNonce_);
-            else incrementNonceBE(rxNonce_);
-            return plain;
-        } catch (...) {
-            if (!rxEndianLocked_) {
-                Buffer altNonce = lastRxNonceBeforeInc_;
-                incrementNonceLE(altNonce);
-                Buffer plain = crypto::openSlice(crypto::AEAD::XChaCha20Poly1305, rxKey_, altNonce, cipherPtr, cipherLen);
-                useLittleEndianRxNonce_ = true;
-                rxEndianLocked_ = true;
-                lastRxNonceBeforeInc_ = altNonce;
-                rxNonce_ = altNonce;
-                incrementNonceLE(rxNonce_);
-                return plain;
-            }
-            throw;
-        }
+        Buffer plain = crypto::openSlice(crypto::AEAD::XChaCha20Poly1305, rxKey_, rxNonce_, cipherPtr, cipherLen);
+        incrementNonceBE(rxNonce_);
+        return plain;
     }
 
     std::shared_ptr<Stream> raw_;
     std::shared_ptr<Reader> reader_;
     std::shared_ptr<OrderedWriter> writer_;
     std::vector<Buffer> candidateKeys_;
-    Buffer txKey_, rxKey_, txNonce_, rxNonce_, lastRxNonceBeforeInc_;
+    Buffer txKey_, rxKey_, txNonce_, rxNonce_;
+    Buffer initialHandshakeWire_;
     Buffer handshakePending_;
     CursorBuffer pending_;
     uint32_t sessionID_ = 0;
@@ -602,8 +653,6 @@ private:
     uint32_t rxHighestSeq_ = 0;
     bool rxNonceInitialized_ = false;
     bool rxKeyLocked_ = false;
-    bool rxEndianLocked_ = false;
-    bool useLittleEndianRxNonce_ = false;
     bool socksReplyConsumed_ = false;
     bool closed_ = false;
 };
@@ -1748,6 +1797,11 @@ void connectMieru(const Node &node, const Target &target,
 
             auto mieruStream = std::make_shared<MieruTCPStream>(
                 raw, std::move(candKeys), std::move(nextNonce), sessionID, 1);
+            if (cfg.handshakeMode == "HANDSHAKE_NO_WAIT") {
+                mieruStream->setDeferredInitialHandshake(std::move(wire));
+                completion(mieruStream, {});
+                return;
+            }
             mieruStream->writeInitialHandshake(std::move(wire), [mieruStream, completion = std::move(completion)](Error writeErr) mutable {
                 if (!writeErr.empty()) {
                     mieruStream->close();
@@ -1788,6 +1842,16 @@ bool mieruProtocolSelfTest() {
         ParsedMieruMetadata parsed = parseMieruMetadata(pt);
         if (parsed.protoType != kMieruOpenSessionReq || parsed.sessionID != 0x12345678 || parsed.payloadLen != 10) {
             return false;
+        }
+        // Verify Mieru v3 Low-Entropy encode/decode round-trip
+        {
+            Buffer samplePlain{'H', 'a', 'j', 'i', 'm', 'i', '-', 'M', 'i', 'e', 'r', 'u', '-', 'L', 'E'};
+            Buffer sampleCipher = crypto::seal(crypto::AEAD::XChaCha20Poly1305, key1, nonce, samplePlain);
+            Buffer leMeta = buildMieruDataMetadata(kMieruDataClientToServer, 0x12345678, 1, 0, 4096, 0, 0, 0);
+            Buffer encodedLE = encodeMieruLowEntropyPayload(1, 0x55555555u, 0x03, sampleCipher, leMeta);
+            ParsedMieruMetadata parsedLE = parseMieruMetadata(leMeta);
+            Buffer decodedCipher = decodeMieruLowEntropyPayload(parsedLE, encodedLE);
+            if (decodedCipher != sampleCipher) return false;
         }
 
         Node mieruNode;

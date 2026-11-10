@@ -1,6 +1,8 @@
 #include "QUICTransport.hpp"
+#include "ProtocolCommon.hpp"
 #include "Crypto.hpp"
 #include <ngtcp2/ngtcp2.h>
+#include <cmath>
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <ngtcp2/ngtcp2_crypto_ossl.h>
 #include <openssl/ssl.h>
@@ -39,6 +41,29 @@ ngtcp2_tstamp now() {
 }
 // BLAKE2b with a 32-byte digest (not a truncation of BLAKE2b-512).
 Buffer blake2b256(const Buffer &input);
+uint64_t parseQuicBandwidthBytesPerSec(std::string value) {
+    value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char c) { return std::isspace(c); }), value.end());
+    if (value.empty()) return 0;
+    char *end = nullptr;
+    double number = std::strtod(value.c_str(), &end);
+    if (end == value.c_str() || !std::isfinite(number) || number <= 0) return 0;
+    std::string unit(end);
+    double multiplier = 125000.0; // Bare value: Mbps
+    if (!unit.empty()) {
+        multiplier = 1.0;
+        auto power = std::string("KMGT").find(static_cast<char>(std::toupper(unit[0])));
+        if (power != std::string::npos) {
+            multiplier = std::pow(1024.0, power + 1);
+            unit.erase(0, 1);
+        }
+        if (unit.empty() || (unit[0] != 'b' && unit[0] != 'B')) return 0;
+        if (unit[0] == 'b') multiplier /= 8.0;
+        unit.erase(0, 1);
+        if (!unit.empty() && unit != "ps" && unit != "/s") return 0;
+    }
+    double bytes = number * multiplier;
+    return (bytes < static_cast<double>(UINT64_MAX) && bytes >= 1.0) ? static_cast<uint64_t>(bytes) : 0;
+}
 bool isLoopbackAddress(const sockaddr *address, socklen_t size) {
     if (!address || size < sizeof(sockaddr)) return false;
     if (address->sa_family == AF_INET && size >= sizeof(sockaddr_in)) {
@@ -69,7 +94,7 @@ struct Connection::Impl {
         WriteCallback completion;
     };
     struct State {
-        std::deque<Write> writes; Buffer input; uint64_t end = 0;
+        std::deque<Write> writes; proto_common::CursorBuffer input; uint64_t end = 0;
         size_t readMaximum = 0; ReadCallback read;
         bool eof = false, fin = false, finSent = false, closed = false;
         bool finished = false, eofDelivered = false;
@@ -157,6 +182,9 @@ struct Connection::Impl {
     size_t maxTxPayload_ = 1350;
     size_t pmtudProbesSucceeded_ = 0;
     size_t consecutiveSendLosses_ = 0;
+    uint64_t brutalUpBps_ = 0;
+    uint64_t brutalTokens_ = 0;
+    ngtcp2_tstamp brutalLastRefill_ = 0;
     size_t obfsOverhead() const {
         if (node.type == "hysteria2" && node.option("obfs") == "salamander" && !node.option("obfs-password").empty()) return 8;
         if (node.type == "hysteria" && !node.option("obfs").empty()) return 16;
@@ -604,9 +632,16 @@ Error Connection::Impl::setupQUIC() {
     settings.initial_ts = now(); settings.handshake_timeout = 10 * NGTCP2_SECONDS;
     maxTxPayload_ = 1350 - obfsOverhead();
     settings.max_tx_udp_payload_size = maxTxPayload_; settings.no_pmtud = 1;
-    auto congestion = node.option("congestion-controller", node.option("congestion", "bbr"));
+    auto congestion = proto_common::lowerAscii(node.option("congestion-controller", node.option("congestion", "bbr")));
     settings.cc_algo = congestion == "cubic" ? NGTCP2_CC_ALGO_CUBIC :
                        congestion == "reno" ? NGTCP2_CC_ALGO_RENO : NGTCP2_CC_ALGO_BBR;
+    if (node.type == "hysteria2" || node.type == "hysteria") {
+        brutalUpBps_ = parseQuicBandwidthBytesPerSec(node.option("up", node.option("up-speed", node.option("upload-bandwidth"))));
+        if (brutalUpBps_ > 0) {
+            brutalTokens_ = std::max<uint64_t>(65536, brutalUpBps_ / 20);
+            brutalLastRefill_ = settings.initial_ts;
+        }
+    }
     ngtcp2_transport_params params; ngtcp2_transport_params_default(&params);
     params.initial_max_data = 16 * 1024 * 1024;
     params.initial_max_stream_data_bidi_local = 2 * 1024 * 1024;
@@ -685,7 +720,7 @@ int Connection::Impl::receive(ngtcp2_conn *conn, uint32_t flags, int64_t id,
     if (state.closed) return 0;
     if (count > 4 * 1024 * 1024 - state.input.size() ||
         self->readBytes + count > 16 * 1024 * 1024) return NGTCP2_ERR_CALLBACK_FAILURE;
-    state.input.insert(state.input.end(), data, data + count); self->readBytes += count;
+    state.input.append(data, count); self->readBytes += count;
     state.eof = state.eof || (flags & NGTCP2_STREAM_DATA_FLAG_FIN);
     self->satisfy(id);
     return 0;
@@ -739,14 +774,7 @@ void Connection::Impl::satisfy(int64_t id) {
     auto &state = found->second;
     if (!state.read || (state.input.empty() && !state.eof && state.error.empty())) return;
     size_t count = std::min(state.readMaximum, state.input.size());
-    Buffer output;
-    if (count == state.input.size()) {
-        output = std::move(state.input);
-        state.input.clear();
-    } else {
-        output.assign(state.input.begin(), state.input.begin() + count);
-        state.input.erase(state.input.begin(), state.input.begin() + count);
-    }
+    Buffer output = state.input.consume(count);
     readBytes -= count;
     if (count) {
         ngtcp2_conn_extend_max_stream_offset(conn, id, count);
@@ -978,7 +1006,17 @@ Error Connection::Impl::writePackets() {
     std::vector<int64_t> ids;
     for (auto &entry : streams) if (!entry.second.closed) ids.push_back(entry.first);
     size_t cursor = 0; ngtcp2_tstamp timestamp = now();
+    if (brutalUpBps_ > 0) {
+        if (timestamp > brutalLastRefill_) {
+            uint64_t elapsedNs = timestamp - brutalLastRefill_;
+            uint64_t addBytes = static_cast<uint64_t>((static_cast<double>(brutalUpBps_) * static_cast<double>(elapsedNs)) / 1e9);
+            uint64_t burstCap = std::max<uint64_t>(65536, brutalUpBps_ / 10);
+            brutalTokens_ = std::min<uint64_t>(burstCap, brutalTokens_ + addBytes);
+            brutalLastRefill_ = timestamp;
+        }
+    }
     for (size_t iteration = 0; iteration < 64; ++iteration) {
+        if (brutalUpBps_ > 0 && brutalTokens_ < maxTxPayload_ && iteration > 0) break;
         if (cancelled()) return "QUIC connection cancelled";
         ngtcp2_path_storage path; ngtcp2_path_storage_zero(&path);
         ngtcp2_pkt_info info{}; uint8_t output[1350]; ngtcp2_ssize written = 0;
@@ -1023,6 +1061,10 @@ Error Connection::Impl::writePackets() {
         }
         if (written < 0) return "QUIC packet write failed";
         if (!written) break;
+        if (brutalUpBps_ > 0) {
+            size_t ulen = static_cast<size_t>(written);
+            brutalTokens_ = (brutalTokens_ > ulen) ? (brutalTokens_ - ulen) : 0;
+        }
         pendingWire = obfuscate(output, static_cast<size_t>(written), true);
         sent = sendWire();
         if (sent < 0) return cancelled() ? "QUIC connection cancelled" : "QUIC UDP send failed";

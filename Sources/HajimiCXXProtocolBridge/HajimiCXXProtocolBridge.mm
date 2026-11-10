@@ -5,6 +5,8 @@
 #include "AnyTLS.hpp"
 #include "MieruProtocol.hpp"
 #include "SSH.hpp"
+#include "SudokuProtocol.hpp"
+#include "TrustTunnelProtocol.hpp"
 #include "WireGuardProtocol.hpp"
 #include "ServerProtocols.hpp"
 #include <algorithm>
@@ -612,7 +614,7 @@ struct Context:std::enable_shared_from_this<Context>{
     std::shared_ptr<std::atomic<bool>> flagForScope(const std::string &scopeKey) {
         if (scopeKey.empty()) return nullptr;
         std::lock_guard<std::mutex> lock(scopeMutex);
-        if (scopeFlags.size() > 256) {
+        if (scopeFlags.size() > 64) {
             for (auto it = scopeFlags.begin(); it != scopeFlags.end(); ) {
                 if (!it->second || (it->second.use_count() <= 1 && !it->second->load())) {
                     it = scopeFlags.erase(it);
@@ -620,7 +622,7 @@ struct Context:std::enable_shared_from_this<Context>{
                     ++it;
                 }
             }
-            if (scopeFlags.size() > 1024) {
+            if (scopeFlags.size() > 256) {
                 for (auto it = scopeFlags.begin(); it != scopeFlags.end(); ) {
                     if (it->second.use_count() <= 1) it = scopeFlags.erase(it);
                     else ++it;
@@ -690,6 +692,8 @@ struct Context:std::enable_shared_from_this<Context>{
         resetWireGuardClient(factory);
         resetSSHClient(factory);
         resetQUICClient(factory);
+        resetTrustTunnelClient(factory);
+        resetSudokuClient(factory);
         scopeSetupDatagrams.clear();
         scopeOperations.clear();
         {
@@ -705,6 +709,11 @@ struct Context:std::enable_shared_from_this<Context>{
         auto oldDatagrams=std::move(datagrams);datagrams.clear();for(auto &weak:oldDatagrams)if(auto value=weak.lock())value->close();dialer=nil;physicalDialer=nil;scopedPhysicalDialer=nil;scopedPreparedDialer=nil;
     }
     bool usesSharedFactory()const{
+        if (node.type=="trusttunnel" && node.flag("quic", false)) return true;
+        if (node.type=="sudoku") {
+            auto mux = node.option("multiplex", node.option("http-mask-multiplex", "off"));
+            if (mux == "on" || mux == "true" || mux == "auto") return true;
+        }
         return node.type=="anytls" || node.type=="ssh" || node.type=="wireguard" || node.type=="hysteria" || node.type=="hysteria2" || node.type=="tuic";
     }
     std::shared_ptr<TransportFactory> factoryForScope(NSUUID *scope);
@@ -1088,4 +1097,6 @@ void HJFlushCachedBridgeInterfaces(void) {
     hajimi::resetWireGuardClient(nullptr);
     hajimi::resetSSHClients();
     hajimi::resetQUICClients();
+    hajimi::resetTrustTunnelClients();
+    hajimi::resetSudokuClients();
 }

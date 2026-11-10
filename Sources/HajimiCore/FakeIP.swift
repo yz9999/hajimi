@@ -88,7 +88,8 @@ public final class FakeIPAllocator {
     }
 
     public func domain(for address: String) -> String? {
-        guard let value = Self.ipv4Value(address) else { return nil }
+        guard let value = Self.ipv4Value(address),
+              value >= Self.base && value < Self.base &+ Self.count else { return nil }
         lock.lock(); defer { lock.unlock() }
         return addressToDomain[value]
     }

@@ -9,6 +9,8 @@ void connectSudoku(const Node &node, const Target &target,
                    std::shared_ptr<TransportFactory> factory, StreamCallback completion);
 void makeSudokuDatagram(const Node &node, std::shared_ptr<TransportFactory> factory,
                         DatagramCallback completion);
+void resetSudokuClients();
+void resetSudokuClient(const std::shared_ptr<TransportFactory> &factory);
 bool sudokuProtocolSelfTest();
 
 } // namespace hajimi

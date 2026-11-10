@@ -142,9 +142,28 @@ public final class ProbeScheduler {
     private var cancelled: UInt64 = 0
     private var queueTimeouts: UInt64 = 0
     private var requestTimeouts: UInt64 = 0
+    private var collectingStatistics = true
     private var pendingConnections = Set<UUID>()
     private var rejectedConnections: UInt64 = 0
     private var latestQueueWaitMilliseconds: Double?
+
+    public func setCollectingStatistics(_ enabled: Bool) {
+        lock.lock()
+        collectingStatistics = enabled
+        lock.unlock()
+    }
+
+    public func resetStatistics() {
+        lock.lock()
+        completed = 0
+        rejected = 0
+        cancelled = 0
+        queueTimeouts = 0
+        requestTimeouts = 0
+        rejectedConnections = 0
+        latestQueueWaitMilliseconds = nil
+        lock.unlock()
+    }
 
     public init(maximumActive: Int = 8, maximumQueued: Int = 512) {
         self.maximumActive = min(64, max(1, maximumActive))
@@ -178,7 +197,7 @@ public final class ProbeScheduler {
                           callbackQueue: callbackQueue, start: start, failure: failure)
         var effects = advanceLocked(now: now)
         if active >= maximumActive && pending.count >= maximumQueued {
-            rejected &+= 1
+            if collectingStatistics { rejected &+= 1 }
             effects.failures.append((entry, .capacityExceeded))
         } else {
             entries[id] = entry
@@ -205,7 +224,7 @@ public final class ProbeScheduler {
     /// admit an unbounded chain of still-establishing native connections.
     public func reservePendingConnection() -> ConnectionReservation? {
         lock.lock(); defer { lock.unlock() }
-        guard pendingConnections.count < maximumActive else { rejectedConnections &+= 1; return nil }
+        guard pendingConnections.count < maximumActive else { if collectingStatistics { rejectedConnections &+= 1 }; return nil }
         let id = UUID()
         pendingConnections.insert(id)
         return ConnectionReservation(id: id, scheduler: self)
@@ -247,7 +266,7 @@ public final class ProbeScheduler {
         var effects = advanceLocked(now: now)
         let won: Bool
         if let entry = entries.removeValue(forKey: id), let lease = entry.lease {
-            active -= 1; completed &+= 1; won = true
+            active -= 1; if collectingStatistics { completed &+= 1 }; won = true
             if let cancellation = entry.cancellation { effects.cleanups.append((lease.queue, cancellation)) }
         } else { won = false }
         effects.append(advanceLocked(now: .now()))
@@ -264,7 +283,7 @@ public final class ProbeScheduler {
                 active -= 1
                 if let cancellation = entry.cancellation { effects.cleanups.append((lease.queue, cancellation)) }
             }
-            cancelled &+= 1
+            if collectingStatistics { cancelled &+= 1 }
             effects.failures.append((entry, .cancelled))
         }
         effects.append(advanceLocked(now: .now()))
@@ -286,11 +305,11 @@ public final class ProbeScheduler {
         for entry in Array(entries.values) where now.uptimeNanoseconds >= entry.expiration.uptimeNanoseconds {
             entries.removeValue(forKey: entry.id)
             if let lease = entry.lease {
-                active -= 1; requestTimeouts &+= 1
+                active -= 1; if collectingStatistics { requestTimeouts &+= 1 }
                 if let cancellation = entry.cancellation { effects.cleanups.append((lease.queue, cancellation)) }
                 effects.failures.append((entry, .requestExpired))
             } else {
-                queueTimeouts &+= 1
+                if collectingStatistics { queueTimeouts &+= 1 }
                 effects.failures.append((entry, .queueWaitExpired))
             }
         }
@@ -306,7 +325,7 @@ public final class ProbeScheduler {
             let waitNanoseconds = now.uptimeNanoseconds > entry.submitted.uptimeNanoseconds
                 ? (now.uptimeNanoseconds - entry.submitted.uptimeNanoseconds)
                 : 0
-            latestQueueWaitMilliseconds = Double(waitNanoseconds) / 1_000_000
+            if collectingStatistics { latestQueueWaitMilliseconds = Double(waitNanoseconds) / 1_000_000 }
             effects.starts.append(entry)
         }
         let deadline = entries.values.map(\.expiration).min { $0.uptimeNanoseconds < $1.uptimeNanoseconds }

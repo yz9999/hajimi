@@ -56,9 +56,7 @@ public:
             Buffer salt(16); for (size_t i = 0; i < salt.size(); ++i) salt[i] = uint8_t(0xa0 + i);
             sendKey_ = snell::deriveKey("testpsk", salt, version_); output_.insert(output_.end(), salt.begin(), salt.end());
         }
-        Buffer header;
-        if (version_ < 4) put16(header, plain.size());
-        else { header = {4, 0, 0, 0, 0}; put16(header, plain.size()); }
+        Buffer header{4, 0, 0, 0, 0}; put16(header, plain.size());
         auto sealed = crypto::seal(method(), sendKey_, sendNonce_, header); nonceNext(sendNonce_);
         output_.insert(output_.end(), sealed.begin(), sealed.end());
         if (!plain.empty()) {
@@ -74,7 +72,7 @@ private:
     Buffer input_, output_, key_, sendKey_, nonce_ = Buffer(12, 0), sendNonce_ = Buffer(12, 0);
     ReadCallback pending_;
     size_t maximum_ = 0;
-    crypto::AEAD method() { return version_ == 1 ? crypto::AEAD::ChaCha20Poly1305 : crypto::AEAD::AES128GCM; }
+    crypto::AEAD method() { return crypto::AEAD::AES128GCM; }
     void deliver() {
         if (!pending_ || (output_.empty() && !closed_)) return;
         size_t count = std::min({maximum_, output_.size(), size_t(7)});
@@ -88,15 +86,15 @@ private:
             key_ = snell::deriveKey("testpsk", Buffer(input_.begin(), input_.begin() + 16), version_);
             input_.erase(input_.begin(), input_.begin() + 16);
         }
-        size_t headerSize = version_ < 4 ? 18 : 23;
+        constexpr size_t headerSize = 23;
         while (input_.size() >= headerSize) {
             auto header = crypto::open(method(), key_, nonce_, Buffer(input_.begin(), input_.begin() + headerSize));
-            size_t padding = version_ < 4 ? 0 : word(header.data() + 3);
-            size_t length = word(header.data() + (version_ < 4 ? 0 : 5));
+            size_t padding = word(header.data() + 3);
+            size_t length = word(header.data() + 5);
             size_t bodySize = length ? length + 16 : 0;
             if (input_.size() < headerSize + padding + bodySize) return;
             assert(length <= snell::maximumFrame && padding <= snell::maximumFrame);
-            if (!records++ && version_ >= 4) { firstPadding = padding; assert(padding >= 256 && padding <= 511); }
+            if (!records++) { firstPadding = padding; assert(padding >= 256 && padding <= 511); }
             nonceNext(nonce_);
             Buffer body(input_.begin() + headerSize, input_.begin() + headerSize + padding + bodySize);
             for (size_t i = 0; i < std::min(padding, bodySize); i += 2) std::swap(body[i], body[padding + i]);
@@ -110,12 +108,12 @@ private:
     }
     void address(const Buffer &plain) {
         assert(plain.size() >= 3 && plain[0] == 1 && plain[2] == 0); addressed_ = true;
-        if (plain[1] == 6) { assert(version_ >= 3 && plain.size() == 3); udp = true; }
+        if (plain[1] == 6) { assert(plain.size() == 3); udp = true; }
         else {
-            assert(plain[1] == (version_ == 2 ? 5 : 1)); assert(plain.size() == size_t(plain[3]) + 6);
+            assert(plain[1] == 1); assert(plain.size() == size_t(plain[3]) + 6);
             destination = {std::string(plain.begin() + 4, plain.end() - 2), word(plain.data() + plain.size() - 2), false, false};
         }
-        if (!reject && ((udp && version_ == 3) || lazyTCPAck)) pendingAck_ = true;
+        if (!reject && lazyTCPAck) pendingAck_ = true;
         else emit(reject ? Buffer{2, 7, 14, 's','e','r','v','e','r','-','p','a','s','s','w','d','!'} : Buffer{0});
     }
     void packet(const Buffer &plain) {
@@ -137,11 +135,10 @@ private:
 int main() {
     Buffer salt(16); for (size_t i = 0; i < salt.size(); ++i) salt[i] = uint8_t(i);
     // Independently generated with argon2-cffi's reference Argon2id v0x13,
-    // time_cost=3, memory_cost=8 KiB, parallelism=1, hash_len=32.
+    // time_cost=3, memory_cost=8 KiB, parallelism=1, hash_len=32 (first 16B).
     assert(hex(snell::deriveKey("testpsk", salt, 4)) == "f85ab318206e5601081d4256eeae70a0");
     assert(hex(snell::deriveKey("testpsk", salt, 5)) == "f85ab318206e5601081d4256eeae70a0");
     assert(hex(snell::deriveKey("testpsk", salt, 6)) == "f85ab318206e5601081d4256eeae70a0");
-    assert(hex(snell::deriveKeyWithMode("testpsk", salt, 4, snell::CompatMode::Compat16Pool7)) == "7c774c75cd8acfe26fc8eb3b70c99048");
     for (unsigned legacyVer : {1u, 2u, 3u}) {
         Node legacyNode; legacyNode.type = "snell"; legacyNode.host = "fixture.invalid"; legacyNode.port = 443;
         legacyNode.parameters["psk"] = "testpsk"; legacyNode.parameters["version"] = std::to_string(legacyVer);
@@ -152,7 +149,7 @@ int main() {
         snell::Encoder encoder("testpsk", version, salt, 8); snell::Decoder decoder("testpsk", version, salt);
         Buffer plain = bytes("record-vector"); auto frame = encoder.frame(plain); size_t headerSize = decoder.headerSize();
         auto lengths = decoder.header(Buffer(frame.begin() + 16, frame.begin() + 16 + headerSize));
-        assert(lengths.payload == plain.size() && lengths.padding == (version >= 4 ? 8 : 0));
+        assert(lengths.payload == plain.size() && lengths.padding == 8);
         assert(decoder.body(Buffer(frame.begin() + 16 + headerSize, frame.end()), lengths) == plain);
         auto second = encoder.frame(bytes("next")); lengths = decoder.header(Buffer(second.begin(), second.begin() + headerSize));
         assert(decoder.body(Buffer(second.begin() + headerSize, second.end()), lengths) == bytes("next"));
@@ -188,15 +185,8 @@ int main() {
         more(); loop.drain(); assert(sent && received == payload);
         bool overflow = false;
         stream->write(Buffer(maximumQueuedBytes + 1, 0), [&](Error error) { overflow = !error.empty(); }); loop.drain(); assert(overflow);
-        if (version == 2) {
-            assert(stream->supportsHalfClose()); bool halfClosed = false, eof = false;
-            stream->shutdownWrite([&](Error error) { assert(error.empty()); halfClosed = true; });
-            stream->read(1, [&](Buffer data, bool end, Error error) { assert(data.empty() && error.empty()); eof = end; });
-            loop.drain(); assert(halfClosed && peers[0]->ended && eof);
-        } else {
-            assert(!stream->supportsHalfClose()); bool unsupportedHalfClose = false;
-            stream->shutdownWrite([&](Error error) { unsupportedHalfClose = !error.empty(); }); loop.drain(); assert(unsupportedHalfClose && !peers[0]->ended);
-        }
+        assert(!stream->supportsHalfClose()); bool unsupportedHalfClose = false;
+        stream->shutdownWrite([&](Error error) { unsupportedHalfClose = !error.empty(); }); loop.drain(); assert(unsupportedHalfClose && !peers[0]->ended);
         stream->close(); loop.drain();
 
         Node reject = node; reject.name = "reject"; bool denied = false; std::shared_ptr<Stream> rejectedStream;
@@ -216,22 +206,21 @@ int main() {
         connectSnell(wrong, target, factory, [&](std::shared_ptr<Stream> connected, Error error) { badKey = !connected && !error.empty(); });
         loop.drain(); assert(badKey);
 
-        if (version >= 3) {
-            std::shared_ptr<Datagram> datagram;
-            makeSnellDatagram(node, factory, [&](std::shared_ptr<Datagram> session, Error error) { assert(error.empty()); datagram = std::move(session); });
-            loop.drain(); assert(datagram && peers.back()->udp);
-            std::vector<Buffer> packets; std::vector<Target> sources;
-            datagram->start([&](Target source, Buffer packet) { sources.push_back(source); packets.push_back(std::move(packet)); }, [](Error error) { assert(error.empty()); });
-            Target v4{"127.0.0.1", 9000, true, false}, v6{"2001:db8::2", 53, true, false}, domain{"udp.test", 5353, true, false};
-            datagram->send(v4, bytes("one"), [](Error error) { assert(error.empty()); });
-            datagram->send(v6, bytes("two"), [](Error error) { assert(error.empty()); });
-            Buffer large(16000, 0xa7); datagram->send(domain, large, [](Error error) { assert(error.empty()); });
-            loop.drain(); assert(packets.size() == 3 && packets[0] == bytes("one") && packets[1] == bytes("two") && packets[2] == large);
-            assert(sources[0].host == v4.host && sources[1].host == v6.host && sources[2].host == "127.0.0.7");
-            assert(peers.back()->udpTargets[2].host == domain.host);
-            bool largeRejected = false; datagram->send(v4, Buffer(snell::maximumFrame, 0), [&](Error error) { largeRejected = !error.empty(); });
-            loop.drain(); assert(largeRejected); datagram->close(); loop.drain();
-        } else assert(!validateSnell(node, true).empty());
+        std::shared_ptr<Datagram> datagram;
+        makeSnellDatagram(node, factory, [&](std::shared_ptr<Datagram> session, Error error) { assert(error.empty()); datagram = std::move(session); });
+        loop.drain(); assert(datagram && peers.back()->udp);
+        std::vector<Buffer> packets; std::vector<Target> sources;
+        datagram->start([&](Target source, Buffer packet) { sources.push_back(source); packets.push_back(std::move(packet)); }, [](Error error) { assert(error.empty()); });
+        Target v4{"127.0.0.1", 9000, true, false}, v6{"2001:db8::2", 53, true, false}, domain{"udp.test", 5353, true, false};
+        datagram->send(v4, bytes("one"), [](Error error) { assert(error.empty()); });
+        datagram->send(v6, bytes("two"), [](Error error) { assert(error.empty()); });
+        Buffer large(16000, 0xa7); datagram->send(domain, large, [](Error error) { assert(error.empty()); });
+        loop.drain(); assert(packets.size() == 3 && packets[0] == bytes("one") && packets[1] == bytes("two") && packets[2] == large);
+        assert(sources[0].host == v4.host && sources[1].host == v6.host && sources[2].host == "127.0.0.7");
+        assert(peers.back()->udpTargets[2].host == domain.host);
+        bool largeRejected = false; datagram->send(v4, Buffer(snell::maximumFrame, 0), [&](Error error) { largeRejected = !error.empty(); });
+        loop.drain(); assert(largeRejected); datagram->close(); loop.drain();
+
         Node unsupported = node; unsupported.parameters["version"] = "7"; assert(!validateSnell(unsupported, false).empty());
         unsupported = node; unsupported.parameters["obfs"] = "tls"; assert(!validateSnell(unsupported, false).empty());
         stream.reset(); loop.drain();

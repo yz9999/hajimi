@@ -283,6 +283,8 @@ struct WGConfig {
     uint32_t dnsIPv4 = 0;  // Network byte order
     std::array<uint8_t, 16> selfIPv6{};
     bool hasSelfIPv6 = false;
+    std::array<uint8_t, 16> dnsIPv6{};
+    bool hasDnsIPv6 = false;
     std::array<uint8_t, 3> reserved{0, 0, 0};
     size_t mtu = 1420;
     uint32_t keepaliveSeconds = 0;
@@ -373,11 +375,23 @@ WGConfig parseWGConfig(const Node &node) {
     if (!ipv6Str.empty() && tryParseIPv6CIDR(ipv6Str, cfg.selfIPv6)) {
         cfg.hasSelfIPv6 = true;
     } else {
-        tryParseIPv6CIDR("fd00:6861:6a69:66::2", cfg.selfIPv6);
+        cfg.hasSelfIPv6 = false;
+        cfg.selfIPv6.fill(0);
     }
     auto dnsStr = node.option("dns", node.option("dns-server", "223.5.5.5"));
     try { cfg.dnsIPv4 = parseIPv4CIDR(dnsStr); }
-    catch (...) { cfg.dnsIPv4 = parseIPv4CIDR("223.5.5.5"); }
+    catch (...) {
+        cfg.dnsIPv4 = parseIPv4CIDR("223.5.5.5");
+        if (tryParseIPv6CIDR(dnsStr, cfg.dnsIPv6)) {
+            cfg.hasDnsIPv6 = true;
+        }
+    }
+    if (!cfg.hasDnsIPv6) {
+        auto comma = dnsStr.find_first_of(",;");
+        if (comma != std::string::npos && tryParseIPv6CIDR(dnsStr.substr(comma + 1), cfg.dnsIPv6)) {
+            cfg.hasDnsIPv6 = true;
+        }
+    }
     cfg.reserved = parseReserved(node.option("reserved"));
     auto mtuStr = node.option("mtu", "1420");
     if (!mtuStr.empty()) {
@@ -968,11 +982,17 @@ public:
                                                    const std::shared_ptr<TransportFactory> &factory);
     static void resetForFactory(const std::shared_ptr<TransportFactory> &factory);
 
+    static bool isLoopbackOrRFC6761TestHost(const std::string &h) {
+        if (h == "127.0.0.1" || h == "localhost" || h == "::1" || h == "[::1]") return true;
+        if (h.size() >= 8 && h.compare(h.size() - 8, 8, ".invalid") == 0) return true;
+        if (h.size() >= 5 && h.compare(h.size() - 5, 5, ".test") == 0) return true;
+        return false;
+    }
+
     bool matchesFactory(const std::shared_ptr<TransportFactory> &f) const {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
         if (closed_) return false;
-        if (node_.host == "127.0.0.1" || node_.host == "localhost" || node_.host == "::1" ||
-            node_.host == "[::1]" || node_.host == "fixture.invalid") {
+        if (isLoopbackOrRFC6761TestHost(node_.host)) {
             return factory_ == f;
         }
         return true;
@@ -982,8 +1002,7 @@ public:
         std::lock_guard<std::recursive_mutex> lock(mutex_);
         if (closed_) return true;
         if (!f) return true;
-        if (node_.host == "127.0.0.1" || node_.host == "localhost" || node_.host == "::1" ||
-            node_.host == "[::1]" || node_.host == "fixture.invalid") {
+        if (isLoopbackOrRFC6761TestHost(node_.host)) {
             return factory_ == f;
         }
         return factory_ == f && tcpHandlers_.empty() && udpHandlers_.empty();
@@ -1184,9 +1203,10 @@ public:
         auto resolved = std::make_shared<bool>(false);
         registerUDP(dnsPort, [self, dnsPort, txid, host, resolved, completion](const Buffer &ipPkt) mutable {
             std::lock_guard<std::recursive_mutex> lock(self->mutex_);
-            if (*resolved) return;
-            uint8_t ihl = (ipPkt[0] & 0x0F) * 4;
-            if (ipPkt.size() < size_t(ihl + 8)) return;
+            if (*resolved || ipPkt.size() < 20) return;
+            uint8_t ver = ipPkt[0] >> 4;
+            size_t ihl = (ver == 6) ? 40 : size_t(ipPkt[0] & 0x0F) * 4;
+            if (ipPkt.size() < ihl + 8) return;
             const uint8_t *udp = ipPkt.data() + ihl;
             uint16_t srcPort = readBE16(udp);
             uint16_t udpLen = readBE16(udp + 4);
@@ -1206,7 +1226,9 @@ public:
             }
         });
         auto q = buildDNSQuery(host, txid, 28 /* AAAA */);
-        auto ipPkt = buildIPv4UDPPacket(cfg_.selfIPv4, dnsPort, cfg_.dnsIPv4, 53, q);
+        Buffer ipPkt = (cfg_.hasSelfIPv6 && cfg_.hasDnsIPv6)
+            ? buildIPv6UDPPacket(cfg_.selfIPv6, dnsPort, cfg_.dnsIPv6, 53, q)
+            : buildIPv4UDPPacket(cfg_.selfIPv4, dnsPort, cfg_.dnsIPv4, 53, q);
         sendIPPacket(ipPkt, [](Error) {});
         std::weak_ptr<SharedWGTunnel> weak = self;
         factory_->after(4.0, [weak, dnsPort, resolved, completion]() mutable {
@@ -1459,8 +1481,7 @@ std::unordered_map<std::string, std::weak_ptr<SharedWGTunnel>> &tunnelMap() {
 std::shared_ptr<SharedWGTunnel> SharedWGTunnel::acquire(const Node &node, const WGConfig &cfg,
                                                         const std::shared_ptr<TransportFactory> &factory) {
     std::ostringstream oss;
-    if (node.host == "127.0.0.1" || node.host == "localhost" || node.host == "::1" ||
-        node.host == "[::1]" || node.host == "fixture.invalid") {
+    if (isLoopbackOrRFC6761TestHost(node.host)) {
         oss << reinterpret_cast<uintptr_t>(factory.get()) << "|";
     }
     oss << node.dialHost() << ":" << node.port << "|" << node.interfaceName << "|"
@@ -1543,6 +1564,10 @@ public:
             if (data.size() > 65000) { completion("WireGuard UDP payload too large"); return; }
             std::array<uint8_t, 16> dstIPv6{};
             if (tryParseIPv6CIDR(target.host, dstIPv6)) {
+                if (!self->cfg_.hasSelfIPv6) {
+                    completion("WireGuard IPv6 target requires ipv6/self-ip-v6 configuration");
+                    return;
+                }
                 auto ipPkt = buildIPv6UDPPacket(self->cfg_.selfIPv6, self->localPort_, dstIPv6, target.port, data);
                 self->tunnel_->sendIPPacket(ipPkt, std::move(completion));
                 return;
@@ -1861,6 +1886,10 @@ private:
     void beginTargetConnect() {
         if (closed_ || !tunnel_) return;
         if (tryParseIPv6CIDR(target_.host, dstIPv6_)) {
+            if (!cfg_.hasSelfIPv6) {
+                fail("WireGuard IPv6 target requires ipv6/self-ip-v6 configuration");
+                return;
+            }
             isIPv6Target_ = true;
             peerMSS_ = 1220;
             sendSyn();
@@ -2231,6 +2260,10 @@ bool wireGuardProtocolSelfTest() {
             return false;
 
         auto cfg = parseWGConfig(node);
+        if (cfg.hasSelfIPv6) return false;
+        node.parameters["ipv6"] = "2606:4700:110::2/128";
+        cfg = parseWGConfig(node);
+        if (!cfg.hasSelfIPv6) return false;
         WGHandshakeState hs;
         auto initPkt = buildHandshakeInitiation(cfg, hs);
         if (initPkt.size() != 148 || initPkt[0] != 1) return false;

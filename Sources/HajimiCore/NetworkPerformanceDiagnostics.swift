@@ -682,8 +682,20 @@ public final class NetworkPerformanceDiagnostics {
     }
 
     private let lock = NSLock()
+    private var collecting = true
     private let maximumSamples: Int
     private var counters = NetworkPerformanceSnapshot()
+
+    public var isCollecting: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return collecting
+    }
+
+    public func setCollecting(_ enabled: Bool) {
+        lock.lock()
+        collecting = enabled
+        lock.unlock()
+    }
     private var windows: [NetworkPerformanceStage: Window] = [:]
     private let maximumDNSAttempts: Int
     private var dnsAttempts: [DNSConnectionAttemptSnapshot] = []
@@ -759,6 +771,10 @@ public final class NetworkPerformanceDiagnostics {
             observedEventCount: 0, firstErrorSequence: nil, firstErrorBeforeCancellationSequence: nil,
             started: Self.now())
         lock.lock()
+        guard collecting else {
+            lock.unlock()
+            return DNSConnectionAttemptTrace(id: id, diagnostics: self, context: context)
+        }
         let slot: Int
         if dnsAttempts.count < maximumDNSAttempts {
             slot = dnsAttempts.count; dnsAttempts.append(value)
@@ -778,7 +794,7 @@ public final class NetworkPerformanceDiagnostics {
 
     fileprivate func updateDNSAttempt(_ id: UUID, update: (inout DNSConnectionAttemptSnapshot) -> Void) {
         lock.lock(); defer { lock.unlock() }
-        guard let slot = dnsAttemptSlots[id] else { return }
+        guard collecting, let slot = dnsAttemptSlots[id] else { return }
         update(&dnsAttempts[slot])
     }
 
@@ -845,7 +861,7 @@ public final class NetworkPerformanceDiagnostics {
             mergedCount: 0, finishedCount: 0, outcomeCounts: [:], failureCounts: [:], omittedWaiters: 0,
             scheduling: nil, started: started)
         lock.lock(); defer { lock.unlock() }
-        guard dnsLogicalQuerySlots[rootID] == nil else { return }
+        guard collecting, dnsLogicalQuerySlots[rootID] == nil else { return }
         let slot: Int
         if dnsLogicalQueries.count < maximumDNSAttempts {
             slot = dnsLogicalQueries.count; dnsLogicalQueries.append(value)
@@ -871,7 +887,7 @@ public final class NetworkPerformanceDiagnostics {
                                 queuedAt: UInt64, started: UInt64) {
         guard started >= queuedAt else { return }
         lock.lock(); defer { lock.unlock() }
-        guard let slot = dnsLogicalQuerySlots[rootID] else { return }
+        guard collecting, let slot = dnsLogicalQuerySlots[rootID] else { return }
         if let receipt = dnsUpstreamStartReceipts[rootID] {
             guard generationID != receipt.generationID, started > receipt.started else { return }
         }
@@ -896,7 +912,7 @@ public final class NetworkPerformanceDiagnostics {
                       absoluteDeadline: TimeInterval) {
         guard absoluteDeadline.isFinite else { return }
         lock.lock(); defer { lock.unlock() }
-        guard let slot = dnsLogicalQuerySlots[rootID] else { return }
+        guard collecting, let slot = dnsLogicalQuerySlots[rootID] else { return }
         guard !dnsLogicalQueries[slot].waiters.contains(where: { $0.waiterID == waiterID }) else { return }
         dnsLogicalQueries[slot].admittedCount = Self.add(dnsLogicalQueries[slot].admittedCount, 1)
         dnsLogicalQueries[slot].mergedCount = Self.add(dnsLogicalQueries[slot].mergedCount, 1)
@@ -915,7 +931,7 @@ public final class NetworkPerformanceDiagnostics {
         guard milliseconds.isFinite, milliseconds >= 0 else { return }
         let value: DNSAttemptOutcome = outcome == .success ? .success : (outcome == .failure ? .failure : .cancelled)
         lock.lock(); defer { lock.unlock() }
-        guard let slot = dnsLogicalQuerySlots[rootID] else { return }
+        guard collecting, let slot = dnsLogicalQuerySlots[rootID] else { return }
         if let index = dnsLogicalQueries[slot].waiters.firstIndex(where: { $0.waiterID == waiterID }) {
             guard dnsLogicalQueries[slot].waiters[index].outcome == nil else { return }
             dnsLogicalQueries[slot].waiters[index].outcome = value
@@ -950,6 +966,10 @@ public final class NetworkPerformanceDiagnostics {
             observedEventCount: 0, firstErrorSequence: nil, firstErrorBeforeCancellationSequence: nil,
             started: Self.now())
         lock.lock()
+        guard collecting else {
+            lock.unlock()
+            return DNSQueryExchangeTrace(id: id, diagnostics: self, context: context)
+        }
         let slot: Int
         if dnsExchanges.count < maximumDNSAttempts { slot = dnsExchanges.count; dnsExchanges.append(value) }
         else {
@@ -968,7 +988,7 @@ public final class NetworkPerformanceDiagnostics {
 
     fileprivate func updateDNSExchange(_ id: UUID, update: (inout DNSQueryExchangeSnapshot) -> Void) {
         lock.lock(); defer { lock.unlock() }
-        guard let slot = dnsExchangeSlots[id] else { return }
+        guard collecting, let slot = dnsExchangeSlots[id] else { return }
         update(&dnsExchanges[slot])
     }
 
@@ -1027,12 +1047,14 @@ public final class NetworkPerformanceDiagnostics {
         // A bad injected clock must not poison summaries or JSON serialization.
         guard milliseconds.isFinite, milliseconds >= 0 else { return }
         lock.lock(); defer { lock.unlock() }
+        guard collecting else { return }
         windows[stage, default: Window()].observe(milliseconds, outcome: outcome, limit: maximumSamples)
     }
 
     public func recordDNS(_ event: DNSPerformanceEvent, count: Int = 1) {
         guard count > 0 else { return }
         lock.lock(); defer { lock.unlock() }
+        guard collecting else { return }
         let amount = UInt64(count)
         switch event {
         case .query: counters.dnsQueries = Self.add(counters.dnsQueries, amount)
@@ -1058,6 +1080,7 @@ public final class NetworkPerformanceDiagnostics {
     public func recordDNSFailure(_ reason: DNSQueryFailureReason, count: Int = 1) {
         guard count > 0 else { return }
         lock.lock(); defer { lock.unlock() }
+        guard collecting else { return }
         addDNSFailure(reason, amount: UInt64(count))
     }
 

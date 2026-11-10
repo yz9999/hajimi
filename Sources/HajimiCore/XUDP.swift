@@ -107,6 +107,7 @@ final class XUDPDatagramSession: NativeOutboundDatagramSession {
     private let globalID: Data
     private var carrier: (any NativeOutboundByteStream)?
     private var pending = CarrierPendingQueue<(Data, RequestTarget)>()
+    private var pendingBytes = 0
     private var writing = false
     private var firstPacket = true
     private var receiveBuffer = Data()
@@ -133,7 +134,12 @@ final class XUDPDatagramSession: NativeOutboundDatagramSession {
                 self.fail(MuxCodecError.payloadTooLarge(payload.count))
                 return
             }
+            guard self.pending.count < 512,
+                  self.pendingBytes + payload.count <= 2 * 1_024 * 1_024 else {
+                return
+            }
             self.pending.append((payload, target))
+            self.pendingBytes += payload.count
             self.ensureCarrier()
             self.flush()
         }
@@ -144,6 +150,8 @@ final class XUDPDatagramSession: NativeOutboundDatagramSession {
             guard !self.cancelled else { return }
             self.cancelled = true
             self.pending.removeAll()
+            self.pendingBytes = 0
+            self.receiveBuffer.removeAll(keepingCapacity: false)
             self.carrier?.cancel()
             self.carrier = nil
         }
@@ -174,6 +182,7 @@ final class XUDPDatagramSession: NativeOutboundDatagramSession {
     private func flush() {
         guard !writing, let carrier, !pending.isEmpty, !cancelled, !failed else { return }
         guard let item = pending.popFirst() else { return }
+        pendingBytes = max(0, pendingBytes - item.0.count)
         let wire: Data
         do {
             wire = try XUDPCodec.encode(target: item.1, payload: item.0,
@@ -198,6 +207,10 @@ final class XUDPDatagramSession: NativeOutboundDatagramSession {
                 guard !self.cancelled, !self.failed else { return }
                 if let error { self.fail(error); return }
                 if let data, !data.isEmpty {
+                    if self.receiveBuffer.count + data.count > 512 * 1_024 {
+                        self.fail(MuxCodecError.malformed("XUDP 接收缓冲区超出安全上限"))
+                        return
+                    }
                     self.receiveBuffer.append(data)
                     do {
                         while true {
@@ -223,9 +236,15 @@ final class XUDPDatagramSession: NativeOutboundDatagramSession {
         guard !failed, !cancelled else { return }
         failed = true
         pending.removeAll()
+        pendingBytes = 0
+        receiveBuffer.removeAll(keepingCapacity: false)
         carrier?.cancel()
         carrier = nil
         failureHandler(error)
+    }
+
+    deinit {
+        carrier?.cancel()
     }
 }
 

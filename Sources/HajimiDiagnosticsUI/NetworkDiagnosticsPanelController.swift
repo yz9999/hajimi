@@ -6,6 +6,7 @@ import HajimiUIComponents
 public final class NetworkDiagnosticsPanelController: NSWindowController, NSWindowDelegate {
     public let feature: NetworkDiagnosticsFeature
     public var onClose: (() -> Void)?
+    public var onVisibilityChanged: ((Bool) -> Void)?
     private let scrollWrapper: WidthFittingScrollContentView
     private var refreshTimer: Timer?
     private var didClose = false
@@ -28,12 +29,23 @@ public final class NetworkDiagnosticsPanelController: NSWindowController, NSWind
         feature.view.onCloseDiagnostics = { [weak self] in
             self?.closeAndTeardown()
         }
+        NotificationCenter.default.addObserver(
+            forName: HajimiThemeCenter.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.window?.backgroundColor = HajimiAppearance.workspace
+            self.feature.view.viewDidChangeEffectiveAppearance()
+        }
     }
 
     public required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     deinit {
         refreshTimer?.invalidate()
         feature.close()
+        onVisibilityChanged?(false)
+        onClose?()
     }
 
     public override func showWindow(_ sender: Any?) {
@@ -56,6 +68,7 @@ public final class NetworkDiagnosticsPanelController: NSWindowController, NSWind
         suspend()
         window?.delegate = nil
         window?.contentView = nil
+        onVisibilityChanged = nil
         let callback = onClose
         onClose = nil
         callback?()
@@ -68,6 +81,7 @@ public final class NetworkDiagnosticsPanelController: NSWindowController, NSWind
 
     private func reconcileTimer() {
         guard isVisible else { suspend(); return }
+        onVisibilityChanged?(true)
         scrollWrapper.setSuspended(false)
         feature.setVisible(true)
         guard refreshTimer == nil else { return }
@@ -83,6 +97,7 @@ public final class NetworkDiagnosticsPanelController: NSWindowController, NSWind
 
     private func suspend() {
         refreshTimer?.invalidate(); refreshTimer = nil
+        onVisibilityChanged?(false)
         feature.setVisible(false)
         scrollWrapper.setSuspended(true)
     }

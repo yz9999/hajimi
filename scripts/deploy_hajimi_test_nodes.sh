@@ -36,7 +36,7 @@
 #   - 20003 (TCP)    : Snell-v4            (Snell v4 Argon2id + AES-128-GCM + UoT UDP)
 #   - 20012 (TCP)    : Sudoku-UoT          (Sudoku v0.5.2 ASCII Pure Downlink + KIP + UoT UDP)
 #   - 20029 (TCP)    : Sudoku-Entropy      (Sudoku v0.5.2 Custom xvxvppvv + 6-bit Packed Downlink + UoT)
-#   - 20018 (TCP)    : TrustTunnel         (TrustTunnel HTTPS CONNECT + _trusttunnel_udp_:443)
+#   - 20018 (TCP)    : TrustTunnel         (TrustTunnel HTTPS CONNECT + RFC 9298 connect-udp)
 #   - 20019 (TCP)    : SOCKS5-TLS          (SOCKS5 over TLS + UDP Associate)
 #   - 20020 (TCP+UDP): SSR-Origin          (ShadowsocksR aes-128-cfb origin/plain TCP + UDP)
 #
@@ -1008,7 +1008,7 @@ class DualStackUDPRelay:
 def derive_snell_v4_key_pure_python(psk: bytes, salt: bytes, tag_len: int = 32) -> bytes:
     """
     Pure-Python Argon2id (v=0x13, y=2, p=1, m=8 KiB, t=3, tagLen=tag_len)[:16]
-    matching Snell.cpp deriveKey / deriveKeyCompat16 byte-for-byte.
+    matching Snell.cpp RFC 9106 Argon2id (32->16B) deriveKey byte-for-byte.
     """
     def blake2b_long(data: bytes, out_len: int) -> bytes:
         le_len = struct.pack("<I", out_len)
@@ -1109,7 +1109,7 @@ def derive_snell_v4_key_pure_python(psk: bytes, salt: bytes, tag_len: int = 32) 
                 if p_pass == 0:
                     pool = s_slice * 2 + idx - 1
                 else:
-                    pool = 8 - 2 + idx - (1 if idx == 0 else 0)
+                    pool = 8 - 2 + idx - 1
                 x = (j1 * j1) >> 32
                 y = (pool * x) >> 32
                 rel = pool - 1 - y
@@ -1150,92 +1150,29 @@ class SnellStream:
         self.rx_nonce = bytearray(12)
         self.tx_key = None
         self.tx_nonce = bytearray(12)
-        self.compat16 = None  # Auto-detected on first record: False = standard v4 (tag32+23B hdr), True = compat16 (tag16+18B hdr)
         self.plain_buf = bytearray()
 
     async def read_packet(self) -> bytes:
         if self.rx_key is None:
             salt = await self.reader.readexactly(16)
-            first18 = await self.reader.readexactly(18)
-            key32 = derive_snell_v4_key(self.psk, salt, 32)
-            key16_pool7 = derive_snell_v4_key_pure_python(self.psk, salt, 16)
-            key16_rfc = derive_snell_v4_key(self.psk, salt, 16)
-            matched_k16 = None
-            matched_pool7 = False
-            plain_len_bytes = None
-            for cand_key, is_pool7 in ((key16_pool7, True), (key16_rfc, False)):
-                try:
-                    plain_len_bytes = AESGCM(cand_key).decrypt(bytes(self.rx_nonce), first18, None)
-                    matched_k16 = cand_key
-                    matched_pool7 = is_pool7
-                    break
-                except Exception:
-                    pass
-            if matched_k16 is not None:
-                self.rx_key = matched_k16
-                self.compat16 = True
-                self.use_pool7 = matched_pool7
-                snell_advance_nonce(self.rx_nonce)
-                chunk_len = struct.unpack(">H", plain_len_bytes)[0]
-                if chunk_len == 0:
-                    return b""
-                enc_payload = await self.reader.readexactly(chunk_len + 16)
-                payload = AESGCM(self.rx_key).decrypt(bytes(self.rx_nonce), enc_payload, None)
-                snell_advance_nonce(self.rx_nonce)
-                return payload
-            else:
-                rem5 = await self.reader.readexactly(5)
-                enc_hdr23 = first18 + rem5
-                hdr = AESGCM(key32).decrypt(bytes(self.rx_nonce), enc_hdr23, None)
-                if len(hdr) != 7 or hdr[0] not in (4, 5, 6):
-                    raise ValueError("Invalid Snell v4-v6 extended header")
-                self.rx_key = key32
-                self.compat16 = False
-                self.use_pool7 = False
-                snell_advance_nonce(self.rx_nonce)
-                pad_len, chunk_len = struct.unpack(">HH", hdr[3:7])
-                if pad_len > 0:
-                    enc_pad = await self.reader.readexactly(pad_len + 16)
-                    dec_pad = AESGCM(self.rx_key).decrypt(bytes(self.rx_nonce), enc_pad, None)
-                    snell_advance_nonce(self.rx_nonce)
-                    _ = snell_swap_padding(dec_pad)
-                if chunk_len == 0:
-                    return b""
-                enc_payload = await self.reader.readexactly(chunk_len + 16)
-                payload = AESGCM(self.rx_key).decrypt(bytes(self.rx_nonce), enc_payload, None)
-                snell_advance_nonce(self.rx_nonce)
-                return payload
-
+            self.rx_key = derive_snell_v4_key(self.psk, salt, 32)
         aesgcm = AESGCM(self.rx_key)
-        if self.compat16:
-            enc_len = await self.reader.readexactly(18)
-            plain_len_bytes = aesgcm.decrypt(bytes(self.rx_nonce), enc_len, None)
-            snell_advance_nonce(self.rx_nonce)
-            chunk_len = struct.unpack(">H", plain_len_bytes)[0]
-            if chunk_len == 0:
-                return b""
-            enc_payload = await self.reader.readexactly(chunk_len + 16)
-            payload = aesgcm.decrypt(bytes(self.rx_nonce), enc_payload, None)
-            snell_advance_nonce(self.rx_nonce)
-            return payload
-        else:
-            enc_hdr = await self.reader.readexactly(23)
-            hdr = aesgcm.decrypt(bytes(self.rx_nonce), enc_hdr, None)
-            if len(hdr) != 7 or hdr[0] != 4:
-                raise ValueError("Invalid Snell v4 extended header")
-            snell_advance_nonce(self.rx_nonce)
-            pad_len, chunk_len = struct.unpack(">HH", hdr[3:7])
-            if pad_len > 0:
-                enc_pad = await self.reader.readexactly(pad_len + 16)
-                dec_pad = aesgcm.decrypt(bytes(self.rx_nonce), enc_pad, None)
-                snell_advance_nonce(self.rx_nonce)
-                _ = snell_swap_padding(dec_pad)
-            if chunk_len == 0:
-                return b""
-            enc_payload = await self.reader.readexactly(chunk_len + 16)
-            payload = aesgcm.decrypt(bytes(self.rx_nonce), enc_payload, None)
-            snell_advance_nonce(self.rx_nonce)
-            return payload
+        enc_hdr = await self.reader.readexactly(23)
+        hdr = aesgcm.decrypt(bytes(self.rx_nonce), enc_hdr, None)
+        if len(hdr) != 7 or hdr[0] not in (4, 5, 6):
+            raise ValueError("Invalid Snell v4-v6 extended header")
+        snell_advance_nonce(self.rx_nonce)
+        pad_len, chunk_len = struct.unpack(">HH", hdr[3:7])
+        body_cipher_len = (chunk_len + 16) if chunk_len > 0 else 0
+        raw_body = bytearray(await self.reader.readexactly(pad_len + body_cipher_len))
+        for i in range(0, min(pad_len, body_cipher_len), 2):
+            raw_body[i], raw_body[pad_len + i] = raw_body[pad_len + i], raw_body[i]
+        if chunk_len == 0:
+            return b""
+        enc_payload = bytes(raw_body[pad_len:])
+        payload = aesgcm.decrypt(bytes(self.rx_nonce), enc_payload, None)
+        snell_advance_nonce(self.rx_nonce)
+        return payload
 
     async def read_exact_plain(self, n: int) -> bytes:
         while len(self.plain_buf) < n:
@@ -1249,44 +1186,27 @@ class SnellStream:
 
     async def write_packet(self, data: bytes):
         out = bytearray()
-        use_compat16 = bool(self.compat16)
         if self.tx_key is None:
             salt = os.urandom(16)
-            if use_compat16 and getattr(self, "use_pool7", False):
-                self.tx_key = derive_snell_v4_key_pure_python(self.psk, salt, 16)
-            else:
-                self.tx_key = derive_snell_v4_key(self.psk, salt, 16 if use_compat16 else 32)
+            self.tx_key = derive_snell_v4_key(self.psk, salt, 32)
             out.extend(salt)
         aesgcm = AESGCM(self.tx_key)
         offset = 0
         if not data:
-            if use_compat16:
-                enc_len = aesgcm.encrypt(bytes(self.tx_nonce), b"\x00\x00", None)
-                snell_advance_nonce(self.tx_nonce)
-                out.extend(enc_len)
-            else:
-                hdr_plain = b"\x04\x00\x00\x00\x00\x00\x00"
-                enc_hdr = aesgcm.encrypt(bytes(self.tx_nonce), hdr_plain, None)
-                snell_advance_nonce(self.tx_nonce)
-                out.extend(enc_hdr)
+            hdr_plain = b"\x04\x00\x00\x00\x00\x00\x00"
+            enc_hdr = aesgcm.encrypt(bytes(self.tx_nonce), hdr_plain, None)
+            snell_advance_nonce(self.tx_nonce)
+            out.extend(enc_hdr)
         while offset < len(data):
             chunk = data[offset:offset + 16384]
             offset += len(chunk)
-            if use_compat16:
-                enc_len = aesgcm.encrypt(bytes(self.tx_nonce), struct.pack(">H", len(chunk)), None)
-                snell_advance_nonce(self.tx_nonce)
-                enc_body = aesgcm.encrypt(bytes(self.tx_nonce), chunk, None)
-                snell_advance_nonce(self.tx_nonce)
-                out.extend(enc_len)
-                out.extend(enc_body)
-            else:
-                hdr_plain = b"\x04\x00\x00\x00\x00" + struct.pack(">H", len(chunk))
-                enc_hdr = aesgcm.encrypt(bytes(self.tx_nonce), hdr_plain, None)
-                snell_advance_nonce(self.tx_nonce)
-                enc_body = aesgcm.encrypt(bytes(self.tx_nonce), chunk, None)
-                snell_advance_nonce(self.tx_nonce)
-                out.extend(enc_hdr)
-                out.extend(enc_body)
+            hdr_plain = b"\x04\x00\x00\x00\x00" + struct.pack(">H", len(chunk))
+            enc_hdr = aesgcm.encrypt(bytes(self.tx_nonce), hdr_plain, None)
+            snell_advance_nonce(self.tx_nonce)
+            enc_body = aesgcm.encrypt(bytes(self.tx_nonce), chunk, None)
+            snell_advance_nonce(self.tx_nonce)
+            out.extend(enc_hdr)
+            out.extend(enc_body)
         self.writer.write(bytes(out))
         await self.writer.drain()
 
@@ -2190,53 +2110,89 @@ async def handle_sudoku(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 # 3. TrustTunnel HTTPS CONNECT & UDP-over-Stream Server
 # ============================================================================
 
+def _encode_quic_varint(val: int) -> bytes:
+    if val < 64:
+        return bytes([val])
+    elif val < 16384:
+        return struct.pack(">H", 0x4000 | val)
+    elif val < 1073741824:
+        return struct.pack(">I", 0x80000000 | val)
+    else:
+        return struct.pack(">Q", 0xC000000000000000 | val)
+
+async def _read_quic_varint(reader: asyncio.StreamReader) -> int:
+    b0 = (await reader.readexactly(1))[0]
+    prefix = b0 >> 6
+    length = 1 << prefix
+    val = b0 & 0x3F
+    if length > 1:
+        rest = await reader.readexactly(length - 1)
+        for b in rest:
+            val = (val << 8) | b
+    return val
+
 async def handle_trusttunnel(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                              expected_user: str, expected_pass: str):
     try:
         raw_hdr = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10.0)
         lines = raw_hdr.decode("latin1").split("\r\n")
-        if not lines or not lines[0].upper().startswith("CONNECT "):
+        if not lines:
+            return
+        req_line = lines[0]
+        parts = req_line.split(" ")
+        if len(parts) < 2:
             writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
             await writer.drain()
             return
-        authority = lines[0].split(" ")[1]
+        method = parts[0].upper()
+        target_uri = parts[1]
         expected_b64 = base64.b64encode(f"{expected_user}:{expected_pass}".encode()).decode()
         authed = False
+        upgrade_proto = ""
         for line in lines[1:]:
-            if line.lower().startswith("proxy-authorization:"):
+            low = line.lower()
+            if low.startswith("proxy-authorization:"):
                 val = line.split(":", 1)[1].strip()
                 if val == f"Basic {expected_b64}":
                     authed = True
-                    break
+            elif low.startswith("upgrade:"):
+                upgrade_proto = line.split(":", 1)[1].strip().lower()
         if not authed:
             writer.write(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
             await writer.drain()
             return
 
-        if authority.startswith("_trusttunnel_udp_"):
-            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        # RFC 9298 MASQUE connect-udp Upgrade (/.well-known/masque/udp/{host}/{port}/)
+        if upgrade_proto == "connect-udp" and target_uri.startswith("/.well-known/masque/udp/"):
+            segs = [seg for seg in target_uri[len("/.well-known/masque/udp/"):].split("/") if seg]
+            if len(segs) < 2:
+                writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                await writer.drain()
+                return
+            dst_host = segs[0].replace("%3A", ":").replace("%3a", ":")
+            dst_port = int(segs[1])
+            writer.write(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\nCapsule-Protocol: ?1\r\n\r\n")
             await writer.drain()
             loop = asyncio.get_running_loop()
             relay = DualStackUDPRelay(loop)
 
             async def on_tt_udp(data: bytes, src_ip: str, src_port: int):
-                saddr = encode_socks_addr(src_ip, src_port)
-                pkt = struct.pack(">HH", len(saddr), len(data)) + saddr + data
-                writer.write(pkt)
+                capsule = _encode_quic_varint(0x00) + _encode_quic_varint(1 + len(data)) + b"\x00" + data
+                writer.write(capsule)
                 await writer.drain()
 
             rx_tasks = relay.start_rx_tasks(on_tt_udp)
             try:
                 while True:
-                    hdr = await reader.readexactly(4)
-                    addr_len, pay_len = struct.unpack(">HH", hdr)
-                    body = await reader.readexactly(addr_len + pay_len)
-                    dst_host, dst_port, _ = parse_socks_addr(body[:addr_len], 0)
-                    payload = body[addr_len:]
-                    await relay.sendto(dst_host, dst_port, payload)
+                    cap_type = await _read_quic_varint(reader)
+                    cap_len = await _read_quic_varint(reader)
+                    cap_val = await reader.readexactly(cap_len)
+                    if cap_type == 0x00 and len(cap_val) >= 1 and cap_val[0] == 0x00:
+                        await relay.sendto(dst_host, dst_port, cap_val[1:])
             finally:
                 relay.close(rx_tasks)
-        else:
+        elif method == "CONNECT":
+            authority = target_uri
             if authority.startswith("["):
                 idx = authority.rfind("]:")
                 host = authority[1:idx]
