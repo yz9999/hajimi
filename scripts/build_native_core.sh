@@ -16,13 +16,33 @@ ensure_cmake() {
     fi
     CMAKE_DIR="$ROOT/.build/Vendor/CMake"
     CMAKE_VER="3.31.6"
-    CMAKE_TAR="$CMAKE_DIR/cmake-$CMAKE_VER-macos-universal.tar.gz"
+    CMAKE_TAR_NAME="cmake-$CMAKE_VER-macos-universal.tar.gz"
+    CMAKE_TAR="$CMAKE_DIR/$CMAKE_TAR_NAME"
+    CMAKE_SHA_FILE="$CMAKE_DIR/cmake-$CMAKE_VER-SHA-256.txt"
     mkdir -p "$CMAKE_DIR"
     if [ ! -x "$CMAKE_DIR/CMake.app/Contents/bin/cmake" ]; then
-        echo "Downloading portable CMake $CMAKE_VER..."
-        curl --fail --location --retry 2 --max-time 180 \
-            "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VER/cmake-$CMAKE_VER-macos-universal.tar.gz" \
+        echo "Downloading portable CMake $CMAKE_VER and official SHA-256 manifest..."
+        curl --proto '=https' --tlsv1.2 --fail --location --retry 2 --max-time 180 \
+            "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VER/cmake-$CMAKE_VER-SHA-256.txt" \
+            -o "$CMAKE_SHA_FILE"
+        EXPECTED_CMAKE_SHA=$(/usr/bin/awk -v f="$CMAKE_TAR_NAME" '$2 == f || $2 == ("*" f) { print $1; exit }' "$CMAKE_SHA_FILE")
+        case "$EXPECTED_CMAKE_SHA" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+            *) echo "Failed to parse valid SHA-256 for $CMAKE_TAR_NAME" >&2; exit 1 ;;
+        esac
+        if [ "${#EXPECTED_CMAKE_SHA}" -ne 64 ]; then
+            echo "Invalid SHA-256 digest length for $CMAKE_TAR_NAME" >&2
+            exit 1
+        fi
+        curl --proto '=https' --tlsv1.2 --fail --location --retry 2 --max-time 180 \
+            "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VER/$CMAKE_TAR_NAME" \
             -o "$CMAKE_TAR"
+        ACTUAL_CMAKE_SHA=$(/usr/bin/shasum -a 256 "$CMAKE_TAR" | /usr/bin/awk '{print $1}')
+        if [ "$ACTUAL_CMAKE_SHA" != "$EXPECTED_CMAKE_SHA" ]; then
+            echo "CMake SHA-256 mismatch (expected $EXPECTED_CMAKE_SHA, got $ACTUAL_CMAKE_SHA); refusing extraction." >&2
+            rm -f "$CMAKE_TAR"
+            exit 1
+        fi
         tar -xzf "$CMAKE_TAR" -C "$CMAKE_DIR" --strip-components=1
     fi
     export PATH="$CMAKE_DIR/CMake.app/Contents/bin:$PATH"
@@ -56,14 +76,21 @@ build_vendor_openssl() {
         export HAJIMI_OPENSSL_ROOT
         return 0
     fi
-    OPENSSL_VER="3.5.0"
+    # OpenSSL 3.5 LTS latest security patch release (EOL 2030-04-08, native ML-KEM / QUIC TLS API)
+    OPENSSL_VER="3.5.9"
+    OPENSSL_SHA256="603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
     mkdir -p "$VENDOR_SSL/downloads" "$VENDOR_SSL/src" "$VENDOR_SSL/include" "$VENDOR_SSL/lib"
     ARCHIVE="$VENDOR_SSL/downloads/openssl-$OPENSSL_VER.tar.gz"
     if [ ! -f "$ARCHIVE" ]; then
-        echo "Downloading OpenSSL $OPENSSL_VER source for local static build (macOS 13.0+)..."
-        curl --fail --location --retry 2 --max-time 180 \
+        echo "Downloading OpenSSL $OPENSSL_VER LTS source for local static build (macOS 13.0+)..."
+        curl --proto '=https' --tlsv1.2 --fail --location --retry 2 --max-time 180 \
             "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VER/openssl-$OPENSSL_VER.tar.gz" \
             -o "$ARCHIVE"
+    fi
+    ACTUAL_SSL_SHA=$(/usr/bin/shasum -a 256 "$ARCHIVE" | /usr/bin/awk '{print $1}')
+    if [ "$ACTUAL_SSL_SHA" != "$OPENSSL_SHA256" ]; then
+        echo "OpenSSL $OPENSSL_VER SHA-256 mismatch (expected $OPENSSL_SHA256, got $ACTUAL_SSL_SHA); remove $ARCHIVE and retry." >&2
+        exit 1
     fi
     JOBS=${HAJIMI_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}
     for ARCH in $HAJIMI_ARCHS; do
@@ -106,61 +133,50 @@ build_vendor_openssl() {
 
 ensure_cmake
 
-if ! check_openssl_valid "${HAJIMI_OPENSSL_ROOT:-}"; then
-    HAJIMI_OPENSSL_ROOT=""
-    for CANDIDATE in "/usr/local/opt/openssl@3" "/opt/homebrew/opt/openssl@3" "$ROOT/.build/Vendor/OpenSSL"; do
-        if check_openssl_valid "$CANDIDATE"; then
-            HAJIMI_OPENSSL_ROOT="$CANDIDATE"
-            break
-        fi
-    done
-fi
+REQUESTED_OPENSSL_ROOT="${HAJIMI_OPENSSL_ROOT:-}"
+if [ "$REQUESTED_OPENSSL_ROOT" = "$ROOT/.build/Vendor/OpenSSL" ]; then
+    build_vendor_openssl
+else
+    if ! check_openssl_valid "${HAJIMI_OPENSSL_ROOT:-}"; then
+        HAJIMI_OPENSSL_ROOT=""
+        for CANDIDATE in "/usr/local/opt/openssl@3" "/opt/homebrew/opt/openssl@3" "$ROOT/.build/Vendor/OpenSSL"; do
+            if check_openssl_valid "$CANDIDATE"; then
+                HAJIMI_OPENSSL_ROOT="$CANDIDATE"
+                break
+            fi
+        done
+    fi
 
-if ! check_openssl_valid "${HAJIMI_OPENSSL_ROOT:-}"; then
-    if command -v brew >/dev/null 2>&1; then
-        echo "Checking Homebrew openssl@3 (requires OpenSSL 3.5+)..."
-        brew install openssl@3 || true
-        BREW_SSL=$(brew --prefix openssl@3 2>/dev/null || true)
-        if check_openssl_valid "$BREW_SSL"; then
-            HAJIMI_OPENSSL_ROOT="$BREW_SSL"
+    if ! check_openssl_valid "${HAJIMI_OPENSSL_ROOT:-}"; then
+        if command -v brew >/dev/null 2>&1; then
+            echo "Checking/installing openssl@3 via Homebrew..."
+            brew install openssl@3 >/dev/null 2>&1 || true
+            BREW_SSL=$(brew --prefix openssl@3 2>/dev/null || true)
+            if check_openssl_valid "$BREW_SSL"; then
+                HAJIMI_OPENSSL_ROOT="$BREW_SSL"
+            fi
         fi
+    fi
+
+    if ! check_openssl_valid "${HAJIMI_OPENSSL_ROOT:-}"; then
+        build_vendor_openssl
     fi
 fi
 
-if ! check_openssl_valid "${HAJIMI_OPENSSL_ROOT:-}"; then
-    build_vendor_openssl
-fi
-
 export HAJIMI_OPENSSL_ROOT
+echo "Using OpenSSL 3.5+ from: $HAJIMI_OPENSSL_ROOT"
+
 sh "$ROOT/scripts/build_cpp_quic.sh"
 sh "$ROOT/scripts/build_cpp_ssh.sh"
 
-# Stage all headers and OpenSSL static libraries into local workspace paths so
-# SwiftPM finds them reliably even when the project directory contains spaces.
-VENDOR_SSL="$ROOT/.build/Vendor/OpenSSL"
-mkdir -p "$VENDOR_SSL/include" "$VENDOR_SSL/lib"
-if [ "$HAJIMI_OPENSSL_ROOT" != "$VENDOR_SSL" ]; then
-    rm -rf "$VENDOR_SSL/include/openssl"
-    cp -pR "$HAJIMI_OPENSSL_ROOT/include/openssl" "$VENDOR_SSL/include/"
-    for LIB in libssl.a libcrypto.a; do
-        if [ -f "$HAJIMI_OPENSSL_ROOT/lib/$LIB" ]; then
-            cp -f "$HAJIMI_OPENSSL_ROOT/lib/$LIB" "$VENDOR_SSL/lib/$LIB"
-        else
-            set --
-            for ARCH in $HAJIMI_ARCHS; do
-                set -- "$@" "$HAJIMI_OPENSSL_ROOT/$ARCH/lib/$LIB"
-            done
-            lipo -create "$@" -output "$VENDOR_SSL/lib/$LIB"
-        fi
-    done
-fi
+BUILD_FLAGS="-c release"
+for ARCH in $HAJIMI_ARCHS; do
+    BUILD_FLAGS="$BUILD_FLAGS --arch $ARCH"
+done
 
-VENDOR_INC="$ROOT/Sources/HajimiProtocolsCXX/VendorInclude"
-mkdir -p "$VENDOR_INC"
-rm -rf "$VENDOR_INC/openssl" "$VENDOR_INC/ngtcp2" "$VENDOR_INC/nghttp3"
-cp -pR "$VENDOR_SSL/include/openssl" "$VENDOR_INC/"
-cp -pR "$ROOT/.build/Vendor/HajimiQUIC/include/ngtcp2" "$VENDOR_INC/"
-cp -pR "$ROOT/.build/Vendor/HajimiQUIC/include/nghttp3" "$VENDOR_INC/"
-cp -pR "$ROOT/.build/Vendor/HajimiSSH/include/"* "$VENDOR_INC/"
-
-echo "Built native C++ protocol dependencies ($HAJIMI_ARCHS) using OpenSSL at $HAJIMI_OPENSSL_ROOT"
+echo "Building Hajimi & HajimiHelper ($HAJIMI_ARCHS)..."
+# shellcheck disable=SC2086
+swift build $BUILD_FLAGS --product Hajimi
+# shellcheck disable=SC2086
+swift build $BUILD_FLAGS --product HajimiHelper
+echo "Native core build completed successfully."

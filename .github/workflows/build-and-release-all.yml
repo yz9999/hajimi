@@ -109,10 +109,8 @@ jobs:
           export HAJIMI_ARCHS="${{ matrix.archs }}"
           export HAJIMI_BUILD_JOBS="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 
-          # Universal 双架构编译时，强制使用源码编译含双架构切片的静态 OpenSSL 3.5+
-          if [ "${{ matrix.flavor }}" = "universal" ]; then
-            export HAJIMI_OPENSSL_ROOT="$PWD/.build/Vendor/OpenSSL"
-          fi
+          # CI 统一构建并缓存仓库内的静态 OpenSSL 3.5+，避免单架构任务误用 Homebrew 动态库导致产物校验失败
+          export HAJIMI_OPENSSL_ROOT="$PWD/.build/Vendor/OpenSSL"
 
           ./scripts/build_native_core.sh
 

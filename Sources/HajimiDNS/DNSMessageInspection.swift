@@ -32,7 +32,7 @@ public enum DNSPTRQueryKind: String, Codable, CaseIterable {
 
 /// RFC 8914 Extended DNS Error (EDE) semantic categories for privacy-preserving
 /// diagnostics and adaptive upstream health classification.
-public enum DNSExtendedErrorCategory: String, Codable, CaseIterable {
+public enum DNSExtendedErrorCategory: String, Codable, CaseIterable, Sendable {
     case dnssecValidationFailure
     case policyBlockedOrCensored
     case staleOrCachedError
@@ -76,6 +76,8 @@ public struct DNSServiceBindingRecord: Equatable {
     public let ipv4Hints: [String]
     public let ipv6Hints: [String]
     public let hasECHConfig: Bool
+    /// Validated RFC 9849 `ECHConfigList` wire bytes extracted from `SvcParamKey = 5` (`ech`).
+    public let echConfigList: Data?
     public let dohPathTemplate: String?
 }
 
@@ -648,6 +650,7 @@ public enum DNSMessageInspection {
                 var ipv4Hints: [String] = []
                 var ipv6Hints: [String] = []
                 var hasECH = false
+                var echConfigList: Data?
                 var dohPath: String?
                 if priority == 0 {
                     guard target.end == end else { return [] }
@@ -688,9 +691,19 @@ public enum DNSMessageInspection {
                                     ipv4Hints.append(String(cString: text))
                                 }
                             }
-                        case 5: // ech
-                            guard valLen >= 7, Int(read16(bytes, paramPos)) == valLen - 2 else { return [] }
+                        case 5: // ech (RFC 9460 §7.3 & RFC 9849 §4 ECHConfigList)
+                            guard valLen >= 8, Int(read16(bytes, paramPos)) == valLen - 2 else { return [] }
+                            var echPos = paramPos + 2
+                            while echPos < valEnd {
+                                guard valEnd - echPos >= 4 else { return [] }
+                                let cfgLen = Int(read16(bytes, echPos + 2))
+                                echPos += 4
+                                guard cfgLen >= 4, cfgLen <= valEnd - echPos else { return [] }
+                                echPos += cfgLen
+                            }
+                            guard echPos == valEnd else { return [] }
                             hasECH = true
+                            echConfigList = Data(bytes[paramPos..<valEnd])
                         case 6: // ipv6hint
                             guard valLen > 0, valLen % 16 == 0 else { return [] }
                             for ipOff in stride(from: paramPos, to: valEnd, by: 16) {
@@ -715,11 +728,69 @@ public enum DNSMessageInspection {
                     owner: owner.name, type: rtype, ttl: ttl, priority: priority,
                     targetName: target.name, alpnProtocols: alpn, noDefaultALPN: noDefaultALPN,
                     port: port, ipv4Hints: ipv4Hints, ipv6Hints: ipv6Hints,
-                    hasECHConfig: hasECH, dohPathTemplate: dohPath))
+                    hasECHConfig: hasECH, echConfigList: echConfigList, dohPathTemplate: dohPath))
             }
             offset = end
         }
         return results
+    }
+
+    /// RFC 9462 §4.1 & §4.2: Validates a Discovery of Designated Resolvers (DDR)
+    /// `_dns.resolver.arpa` SVCB response against a known `resolverAddress` IP literal,
+    /// rejecting AliasMode (`priority == 0`), unencrypted ALPNs, DoH entries missing
+    /// `dohpath` (RFC 9461 §4.2), and mismatched IP hints, sorted by ascending priority.
+    public static func verifiedDDRBindings(in response: Data,
+                                           resolverAddress: String) -> [DNSServiceBindingRecord] {
+        guard let q = question(in: response, response: true),
+              q.name == "_dns.resolver.arpa", q.type == 64, q.`class` == 1,
+              let canonicalIP = canonicalIPLiteral(resolverAddress) else { return [] }
+        let encryptedALPNs: Set<String> = ["h2", "h3", "dot", "doq"]
+        return serviceBindingAnswers(in: response)
+            .filter { record in
+                guard record.owner == "_dns.resolver.arpa",
+                      record.type == 64,
+                      record.priority > 0,
+                      record.targetName != ".",
+                      !record.alpnProtocols.isEmpty,
+                      record.alpnProtocols.allSatisfy({ encryptedALPNs.contains($0) }) else {
+                    return false
+                }
+                let isDoH = record.alpnProtocols.contains("h2") || record.alpnProtocols.contains("h3")
+                if isDoH && (record.dohPathTemplate == nil || record.dohPathTemplate?.isEmpty == true) {
+                    return false
+                }
+                if canonicalIP.isIPv6 {
+                    if !record.ipv6Hints.isEmpty && !record.ipv6Hints.contains(canonicalIP.text) {
+                        return false
+                    }
+                } else {
+                    if !record.ipv4Hints.isEmpty && !record.ipv4Hints.contains(canonicalIP.text) {
+                        return false
+                    }
+                }
+                return true
+            }
+            .sorted { $0.priority < $1.priority }
+    }
+
+    private static func canonicalIPLiteral(_ raw: String) -> (text: String, isIPv6: Bool)? {
+        var host = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if host.count >= 2, host.hasPrefix("["), host.hasSuffix("]") {
+            host = String(host.dropFirst().dropLast())
+        }
+        var addr4 = in_addr()
+        if inet_pton(AF_INET, host, &addr4) == 1 {
+            var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            guard inet_ntop(AF_INET, &addr4, &buf, socklen_t(buf.count)) != nil else { return nil }
+            return (String(cString: buf), false)
+        }
+        var addr6 = in6_addr()
+        if inet_pton(AF_INET6, host, &addr6) == 1 {
+            var buf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+            guard inet_ntop(AF_INET6, &addr6, &buf, socklen_t(buf.count)) != nil else { return nil }
+            return (String(cString: buf), true)
+        }
+        return nil
     }
 
     /// Validate wire-name framing without allocating owner strings. Compression

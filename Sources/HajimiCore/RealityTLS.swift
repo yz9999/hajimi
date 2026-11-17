@@ -8,19 +8,12 @@ import Foundation
 /// harder for ordinary Network.framework TLS to accidentally inherit
 /// REALITY's intentionally non-X.509 certificate verification rules.
 final class RealityTLSByteTransport: VisionDirectByteTransport {
-    /// Geneva-style (ACM CCS '19 / CCS '26) client-side DPI desynchronization modes.
-    enum DesyncMode: String, Equatable {
-        case none = "none"
-        case recordSplitSNI = "record-split-sni"
-        case tcpMultiSegmentSNI = "multi-segment-sni"
-    }
-
     struct Configuration {
         let serverName: String
         let publicKey: Data
         let shortID: Data
         let alpn: [String]
-        let desyncMode: DesyncMode
+        let enablePostQuantum: Bool
 
         init(policy: ProxyPolicy, fallbackServerName: String) throws {
             serverName = policy.parameters["sni"]
@@ -44,9 +37,9 @@ final class RealityTLSByteTransport: VisionDirectByteTransport {
                 .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
                 .filter { !$0.isEmpty }
             alpn = configured.isEmpty ? ["h2", "http/1.1"] : configured
-            let rawDesync = (policy.parameters["client-desync"] ?? policy.parameters["desync-mode"] ?? "none")
+            let pqRaw = (policy.parameters["pqc"] ?? policy.parameters["pq"] ?? "auto")
                 .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            desyncMode = DesyncMode(rawValue: rawDesync) ?? .none
+            enablePostQuantum = !(pqRaw == "false" || pqRaw == "0" || pqRaw == "off")
         }
 
         private static func decodeBase64URL(_ value: String) -> Data? {
@@ -152,12 +145,24 @@ final class RealityTLSByteTransport: VisionDirectByteTransport {
                 self.authKey = try TLS13.HKDF.expand(.sha256,
                                                      pseudoRandomKey: extracted,
                                                      info: Data("REALITY".utf8), count: 32)
+                var mlkemPrivate: Data?
+                var hybridShare: Data?
+                if self.configuration.enablePostQuantum,
+                   let pqPair = TLS13.generateMLKEM768KeyPair() {
+                    mlkemPrivate = pqPair.privateKey
+                    // RFC 10024 §3: client key_exchange = mlkem768_public_key (1184B) || x25519_public_key (32B)
+                    var combinedShare = Data(capacity: 1184 + 32)
+                    combinedShare.append(pqPair.publicKey)
+                    combinedShare.append(ephemeral.publicKey.rawRepresentation)
+                    hybridShare = combinedShare
+                }
                 let inputs = TLS13Fingerprint.ChromeClientHelloInputs(
                     serverName: self.configuration.serverName,
                     sessionID: Data(repeating: 0, count: 32),
                     x25519PublicKey: ephemeral.publicKey.rawRepresentation,
                     alpnProtocols: self.configuration.alpn,
-                    random: random)
+                    random: random,
+                    hybridKeyShare: hybridShare)
                 var hello = try TLS13Fingerprint.chromeClientHello(inputs)
                 let nonce = try AES.GCM.Nonce(data: random.suffix(12))
                 let sealed = try AES.GCM.seal(clearSession, using: SymmetricKey(data: self.authKey),
@@ -169,29 +174,23 @@ final class RealityTLSByteTransport: VisionDirectByteTransport {
                 hello.replaceSubrange(TLS13Fingerprint.sessionIDOffset..<(TLS13Fingerprint.sessionIDOffset + 32),
                                       with: self.sessionID)
                 self.material = TLS13.ClientHelloMaterial(message: hello,
-                                                          ephemeralPrivateKey: ephemeral)
-                let segments = try GenevaDesyncEngine.buildClientHelloFlight(
-                    hello: hello,
-                    mode: self.configuration.desyncMode
+                                                          ephemeralPrivateKey: ephemeral,
+                                                          mlkem768PrivateKey: mlkemPrivate)
+                let record = try TLS13.plaintextRecord(
+                    contentType: .handshake,
+                    legacyVersion: TLS13.legacyRecordVersionInitial,
+                    fragment: hello
                 )
-                self.sendInitialSegments(segments, index: 0)
+                self.raw.send(record) { error in self.queue.async {
+                    if let error { self.fail(error) }
+                    else { self.readRaw() }
+                }}
                 self.queue.asyncAfter(deadline: .now() + 12) { [weak self] in
                     guard let self, self.phase == .handshaking else { return }
                     self.fail(NativeOutboundError.connection("REALITY TLS 握手超时"))
                 }
             } catch { self.fail(error) }
         }
-    }
-
-    private func sendInitialSegments(_ segments: [Data], index: Int) {
-        guard index < segments.count else {
-            self.readRaw()
-            return
-        }
-        self.raw.send(segments[index]) { error in self.queue.async {
-            if let error { self.fail(error) }
-            else { self.sendInitialSegments(segments, index: index + 1) }
-        }}
     }
 
     func send(_ data: Data, completion: @escaping (Error?) -> Void) {
@@ -310,15 +309,35 @@ final class RealityTLSByteTransport: VisionDirectByteTransport {
             guard hello.legacySessionIDEcho == sessionID else {
                 throw NativeOutboundError.protocolError("REALITY TLS ServerHello session_id echo 不匹配")
             }
-            guard hello.keyShareGroup == 0x001d else {
-                throw NativeOutboundError.protocolError("REALITY TLS 服务端未选择 X25519")
+            let sharedSecret: Data
+            if hello.keyShareGroup == TLS13.NamedGroup.x25519 {
+                sharedSecret = try TLS13.x25519(
+                    privateKey: material.ephemeralPrivateKey,
+                    peerPublicKey: hello.keyShareData
+                )
+            } else if hello.keyShareGroup == TLS13.NamedGroup.x25519MLKEM768 {
+                guard let mlkemPriv = material.mlkem768PrivateKey else {
+                    throw NativeOutboundError.protocolError("REALITY TLS 服务端返回未请求的 X25519MLKEM768 key_share")
+                }
+                guard hello.keyShareData.count == 1088 + 32 else {
+                    throw NativeOutboundError.protocolError("REALITY TLS X25519MLKEM768 key_share 长度必须为 1120 字节")
+                }
+                let ct = Data(hello.keyShareData.prefix(1088))
+                let mlkemSS = try TLS13.mlkem768Decapsulate(privateKey: mlkemPriv, ciphertext: ct)
+                sharedSecret = try TLS13.hybridX25519MLKEM768SharedSecret(
+                    mlkemSharedSecret: mlkemSS,
+                    x25519PrivateKey: material.ephemeralPrivateKey,
+                    serverKeyShareData: hello.keyShareData
+                ).combinedSharedSecret
+            } else {
+                throw NativeOutboundError.protocolError(
+                    String(format: "REALITY TLS 服务端选择了不受支持的密钥交换组 0x%04X", hello.keyShareGroup))
             }
             var transcript = TLS13.Transcript(hello.cipherSuite.hashFunction)
             transcript.update(material.message); transcript.update(message.raw)
             helloTranscriptHash = transcript.value
             var schedule = TLS13.KeySchedule(suite: hello.cipherSuite)
-            try schedule.advance(sharedSecret: TLS13.x25519(
-                privateKey: material.ephemeralPrivateKey, peerPublicKey: hello.keyShareData))
+            try schedule.advance(sharedSecret: sharedSecret)
             let serverSecret = try schedule.trafficSecret(.serverHandshake,
                                                           transcriptHash: transcript.value)
             serverHandshakeProtector = try TLS13.RecordProtector(suite: hello.cipherSuite,
@@ -350,20 +369,24 @@ final class RealityTLSByteTransport: VisionDirectByteTransport {
             _ = try TLS13.EncryptedExtensions(message.body)
             transcript.update(message.raw)
         case .certificate:
-            let certificates = try TLS13.CertificateMessage(message.body)
-            guard let der = certificates.leaf else {
-                throw NativeOutboundError.protocolError("REALITY TLS 缺少叶子证书")
+            guard self.leaf == nil else {
+                throw NativeOutboundError.protocolError("REALITY TLS 收到重复的证书握手消息")
             }
-            let leaf = try TLS13.LeafCertificate(der: der)
-            guard leaf.isEd25519, leaf.signatureAlgorithm == TLS13.LeafCertificate.ed25519OID else {
-                throw NativeOutboundError.crypto("REALITY 未返回 Ed25519 伪造证书，可能已回落到真实站点")
+            try authenticateRealityCertificate(try TLS13.CertificateMessage(message.body))
+            transcript.update(message.raw)
+        case .compressedCertificate:
+            // RFC 8879 §4: ClientHello advertises compress_certificate = { brotli (0x0002) }.
+            // Transcript MUST hash the CompressedCertificate wire message (`message.raw`),
+            // while leaf validation runs over the decompressed Certificate body.
+            guard self.leaf == nil else {
+                throw NativeOutboundError.protocolError("REALITY TLS 收到重复的压缩证书握手消息")
             }
-            let signature = Data(HMAC<SHA512>.authenticationCode(
-                for: leaf.publicKey, using: SymmetricKey(data: authKey)))
-            guard TLS13.constantTimeEquals(signature, leaf.signature) else {
-                throw NativeOutboundError.crypto("REALITY 证书 HMAC 校验失败，可能是公钥/short-id 错误或遭到中间人")
+            let compressed = try TLS13.CompressedCertificate(message.body)
+            guard compressed.algorithm == TLS13.CompressedCertificate.Algorithm.brotli.rawValue else {
+                throw NativeOutboundError.protocolError("REALITY TLS 服务端使用了未在 ClientHello 声明的证书压缩算法")
             }
-            self.leaf = leaf; transcript.update(message.raw)
+            try authenticateRealityCertificate(try TLS13.CertificateMessage(compressed.decompressedCertificateBody))
+            transcript.update(message.raw)
         case .certificateVerify:
             guard let leaf else { throw NativeOutboundError.protocolError("CertificateVerify 早于 Certificate") }
             let verify = try TLS13.CertificateVerify(message.body)
@@ -388,6 +411,22 @@ final class RealityTLSByteTransport: VisionDirectByteTransport {
             throw NativeOutboundError.protocolError("REALITY TLS 收到意外的握手消息 \(message.type)")
         }
         self.transcript = transcript
+    }
+
+    private func authenticateRealityCertificate(_ certificates: TLS13.CertificateMessage) throws {
+        guard let der = certificates.leaf else {
+            throw NativeOutboundError.protocolError("REALITY TLS 缺少叶子证书")
+        }
+        let leaf = try TLS13.LeafCertificate(der: der)
+        guard leaf.isEd25519, leaf.signatureAlgorithm == TLS13.LeafCertificate.ed25519OID else {
+            throw NativeOutboundError.crypto("REALITY 未返回 Ed25519 伪造证书，可能已回落到真实站点")
+        }
+        let signature = Data(HMAC<SHA512>.authenticationCode(
+            for: leaf.publicKey, using: SymmetricKey(data: authKey)))
+        guard TLS13.constantTimeEquals(signature, leaf.signature) else {
+            throw NativeOutboundError.crypto("REALITY 证书 HMAC 校验失败，可能是公钥/short-id 错误或遭到中间人")
+        }
+        self.leaf = leaf
     }
 
     private func finishClientHandshake() throws {
@@ -556,8 +595,33 @@ public enum RealityTLSSelfTest {
               node.parameters["reality-short-id"] == "0123456789abcdef" else {
             throw NativeOutboundError.protocolError("REALITY 分享链接导入自测失败")
         }
-        try GenevaDesyncEngine.selfTest()
+        try standardClientHelloRecordSelfTest()
         try siblingStrandTargetQueueSelfTest()
+    }
+
+    private static func standardClientHelloRecordSelfTest() throws {
+        let ephemeral = Curve25519.KeyAgreement.PrivateKey()
+        let hello = try TLS13Fingerprint.chromeClientHello(
+            TLS13Fingerprint.ChromeClientHelloInputs(
+                serverName: "example.org",
+                sessionID: Data(repeating: 0x33, count: 32),
+                x25519PublicKey: ephemeral.publicKey.rawRepresentation
+            )
+        )
+        let record = try TLS13.plaintextRecord(
+            contentType: .handshake,
+            legacyVersion: TLS13.legacyRecordVersionInitial,
+            fragment: hello
+        )
+        var recordReader = TLS13.RecordReader()
+        var handshakeReader = TLS13.HandshakeReader()
+        recordReader.append(record)
+        while let rec = try recordReader.next() {
+            handshakeReader.append(rec.fragment)
+        }
+        guard let parsed = try handshakeReader.next(), parsed.raw == hello else {
+            throw NativeOutboundError.protocolError("标准 RFC 8446 ClientHello 记录封装往返自测失败")
+        }
     }
 
     /// Regression test: invoking `enableVisionDirectWrite()` and
@@ -591,76 +655,4 @@ public enum RealityTLSSelfTest {
     }
 }
 
-/// Geneva-style (ACM CCS '19 / CCS '26) Client-Side DPI Desynchronization Engine:
-/// Splits a TLS 1.3 ClientHello handshake message across multiple RFC 8446 §5.1
-/// TLSPlaintext records and/or multi-segment TCP writes right at the midpoint of
-/// the SNI hostname so single-record / stateless middlebox DPIs cannot match the
-/// full SNI string, while preserving byte-exact HandshakeReader & Transcript hashes.
-enum GenevaDesyncEngine {
-    static func buildClientHelloFlight(
-        hello: Data,
-        mode: RealityTLSByteTransport.DesyncMode
-    ) throws -> [Data] {
-        switch mode {
-        case .none:
-            return [try TLS13.plaintextRecord(contentType: .handshake,
-                                              legacyVersion: TLS13.legacyRecordVersionInitial,
-                                              fragment: hello)]
-        case .recordSplitSNI, .tcpMultiSegmentSNI:
-            let splitIndex: Int
-            if let sniRange = TLS13Fingerprint.sniHostnameByteRange(in: hello), sniRange.count >= 2 {
-                splitIndex = sniRange.lowerBound + (sniRange.count / 2)
-            } else {
-                splitIndex = max(1, hello.count / 2)
-            }
-            let prefix = Data(hello.prefix(splitIndex))
-            let suffix = Data(hello.dropFirst(splitIndex))
-            let firstRecord = try TLS13.plaintextRecord(
-                contentType: .handshake,
-                legacyVersion: TLS13.legacyRecordVersionInitial,
-                fragment: prefix
-            )
-            let secondRecord = try TLS13.plaintextRecord(
-                contentType: .handshake,
-                legacyVersion: TLS13.legacyRecordVersion,
-                fragment: suffix
-            )
-            if mode == .recordSplitSNI {
-                return [firstRecord + secondRecord]
-            } else {
-                return [firstRecord, secondRecord]
-            }
-        }
-    }
 
-    static func selfTest() throws {
-        let ephemeral = Curve25519.KeyAgreement.PrivateKey()
-        let hello = try TLS13Fingerprint.chromeClientHello(
-            TLS13Fingerprint.ChromeClientHelloInputs(
-                serverName: "research.censorship-evasion.example.org",
-                sessionID: Data(repeating: 0x33, count: 32),
-                x25519PublicKey: ephemeral.publicKey.rawRepresentation
-            )
-        )
-        let segments = try buildClientHelloFlight(hello: hello, mode: .tcpMultiSegmentSNI)
-        guard segments.count == 2 else {
-            throw NativeOutboundError.protocolError("GenevaDesyncEngine 应生成 2 个分段 TLS 记录")
-        }
-        let fullSNI = Data("research.censorship-evasion.example.org".utf8)
-        guard segments[0].range(of: fullSNI) == nil && segments[1].range(of: fullSNI) == nil else {
-            throw NativeOutboundError.protocolError("GenevaDesyncEngine 分片后单个 TLS 记录仍暴露完整 SNI")
-        }
-        var recordReader = TLS13.RecordReader()
-        var handshakeReader = TLS13.HandshakeReader()
-        for seg in segments {
-            recordReader.append(seg)
-            while let rec = try recordReader.next() {
-                handshakeReader.append(rec.fragment)
-            }
-        }
-        guard let reassembled = try handshakeReader.next(),
-              reassembled.raw == hello else {
-            throw NativeOutboundError.protocolError("GenevaDesyncEngine 跨记录重组后与原始 ClientHello 不一致")
-        }
-    }
-}

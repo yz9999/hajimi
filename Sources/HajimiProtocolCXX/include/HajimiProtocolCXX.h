@@ -440,6 +440,53 @@ hajimi_codec_result hajimi_masque_decode_capsule(
     size_t *payload_offset_out,
     size_t *payload_length_out);
 
+
+/* ============================================================================
+ * Zero-Allocation Single-Pass DNS Wire Security, Entropy, NCACHE & DE-R Analyzer
+ * - RFC 1035 §4.1.4 compression-pointer loop-safe name walker
+ * - QNAME label telemetry & 256-bin exact Shannon entropy (entropy_bits_x1000)
+ * - RFC 2308 §3/§5 Authority SOA negative caching TTL (min(rr_ttl, soa_minimum))
+ * - RFC 6891 EDNS(0) + RFC 8914 Option 15 EDE + RFC 9567 Option 18 REPORT-CHANNEL
+ * - RFC 9460 / RFC 9461 SVCB/HTTPS ECH (key=5) & dohpath (key=7) detection
+ * ============================================================================ */
+typedef struct hajimi_dns_wire_metrics {
+    uint16_t id;
+    uint16_t flags;
+    uint8_t rcode;
+    uint8_t is_response;
+    uint8_t has_edns;
+    uint8_t edns_do_bit;
+    uint16_t qdcount;
+    uint16_t ancount;
+    uint16_t nscount;
+    uint16_t arcount;
+    uint16_t qtype;
+    uint16_t qclass;
+    uint16_t qname_char_len;
+    uint16_t label_count;
+    uint8_t max_label_len;
+    uint8_t cname_hops;
+    uint16_t digit_or_hex_chars;
+    uint32_t entropy_bits_x1000;
+    uint32_t min_positive_ttl;
+    uint8_t has_authority_soa;
+    uint8_t has_svcb_or_https;
+    uint8_t has_ech_config;
+    uint8_t has_dohpath;
+    uint32_t soa_minimum_ttl;
+    uint32_t effective_negative_ttl;
+    uint16_t edns_udp_payload;
+    uint8_t has_ede;
+    uint8_t has_report_channel;
+    uint16_t ede_info_code;
+    uint16_t report_agent_length;
+    size_t report_agent_offset;
+} hajimi_dns_wire_metrics;
+
+hajimi_codec_result hajimi_dns_inspect_wire_metrics(
+    const uint8_t *dns_message, size_t message_length,
+    hajimi_dns_wire_metrics *metrics_out);
+
 #ifdef __cplusplus
 }
 #endif

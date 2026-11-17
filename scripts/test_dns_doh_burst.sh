@@ -65,7 +65,7 @@ fi
 MODULE="$BUILD/HajimiCore.swiftmodule"
 if [[ ! -f "$MODULE" ]]; then MODULE="$BUILD/Modules/HajimiCore.swiftmodule"; fi
 [[ -f "$MODULE" ]] || fail "missing $CONFIGURATION Core module; complete the external build first"
-for source in Profile.swift CompiledRoutingRules.swift NativeOutbound.swift EncryptedDNS.swift ProxyEngine.swift NetworkProcessResources.swift DNSQueryModuleAdapter.swift NetworkPerformanceDiagnostics.swift; do
+for source in Profile.swift CompiledRoutingRules.swift NativeOutbound.swift EncryptedDNS.swift ProxyEngine.swift ProxyEngineDNSTransports.swift NetworkProcessResources.swift DNSQueryModuleAdapter.swift NetworkPerformanceDiagnostics.swift; do
     [[ ! "$ROOT/Sources/HajimiCore/$source" -nt "$MODULE" ]] \
         || fail "the $CONFIGURATION Core module is older than $source; complete the external build first"
 done

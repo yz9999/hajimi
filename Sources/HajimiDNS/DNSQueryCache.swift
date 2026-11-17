@@ -5,12 +5,21 @@ import Foundation
 public final class DNSQueryCache {
     private struct Key: Hashable { let scope: String; let question: Data }
     private struct TTLField { let offset: Int; let value: UInt32 }
+    public struct Statistics: Equatable, Sendable {
+        public let positiveHits: UInt64
+        public let negativeHits: UInt64
+        public let staleHits: UInt64
+        public let misses: UInt64
+        public let insertions: UInt64
+        public let evictions: UInt64
+    }
     private struct Entry {
         let response: Data
         let fields: [TTLField]
         let inserted: Date
         let expires: Date
         let cost: Int
+        let isNegative: Bool
         var access: UInt64
     }
     fileprivate struct Question {
@@ -39,20 +48,36 @@ public final class DNSQueryCache {
     private let lock = NSLock()
     private let maximumEntries: Int, maximumBytes: Int
     private let maximumTTL: UInt32
+    private let maximumNegativeTTL: UInt32
     private let clock: () -> Date
     private var entries: [Key: Entry] = [:]
     private var staleArchive: [Key: Entry] = [:]
     private var bytes = 0
     private var access: UInt64 = 0
     private var lastClock: Date?
+    private var positiveHits: UInt64 = 0
+    private var negativeHits: UInt64 = 0
+    private var staleHits: UInt64 = 0
+    private var misses: UInt64 = 0
+    private var insertions: UInt64 = 0
+    private var evictions: UInt64 = 0
 
     public init(maximumEntries: Int = 512, maximumBytes: Int = 2 * 1024 * 1024,
                 maximumTTL: UInt32 = 3600,
+                maximumNegativeTTL: UInt32 = 300,
                 clock: @escaping () -> Date = {
                     Date(timeIntervalSince1970: ProcessInfo.processInfo.systemUptime)
                 }) {
         self.maximumEntries = max(0, maximumEntries); self.maximumBytes = max(0, maximumBytes)
-        self.maximumTTL = maximumTTL; self.clock = clock
+        self.maximumTTL = maximumTTL; self.maximumNegativeTTL = maximumNegativeTTL
+        self.clock = clock
+    }
+
+    public var statistics: Statistics {
+        lock.lock(); defer { lock.unlock() }
+        return Statistics(positiveHits: positiveHits, negativeHits: negativeHits,
+                          staleHits: staleHits, misses: misses,
+                          insertions: insertions, evictions: evictions)
     }
 
     /// Only the ID is removed. Case, RD, EDNS payload and padding remain exact
@@ -100,24 +125,14 @@ public final class DNSQueryCache {
         let key = Key(scope: scopeKey, question: identity)
         lock.lock(); defer { lock.unlock() }
         let now = clock()
-        guard checkClock(now), var entry = entries[key] else { return nil }
-        guard now < entry.expires else { archiveAndRemove(key, now: now); return nil }
+        guard checkClock(now), var entry = entries[key] else { misses &+= 1; return nil }
+        guard now < entry.expires else { archiveAndRemove(key, now: now); misses &+= 1; return nil }
         access &+= 1; entry.access = access; entries[key] = entry
+        if entry.isNegative { negativeHits &+= 1 } else { positiveHits &+= 1 }
         let age = UInt32(min(Double(UInt32.max), max(0, ceil(now.timeIntervalSince(entry.inserted)))))
         let remaining = UInt32(min(Double(UInt32.max), max(0, floor(entry.expires.timeIntervalSince(now)))))
-        var response = [UInt8](entry.response)
-        for field in entry.fields {
-            let value = min(field.value > age ? field.value - age : 0, remaining)
-            Self.write32(value, at: field.offset, in: &response)
-        }
-        // Only strict store() can create an entry, and both wire snapshots are
-        // owned. The exact ID-zero query key binds this prepared query to that
-        // validated answer; aging only touches recorded RR TTL fields after
-        // the question. Re-parsing the same question cannot add validation.
-        // The public arbitrary-response rewriter deliberately remains strict.
-        response[0] = prepared.query[prepared.query.startIndex]
-        response[1] = prepared.query[prepared.query.startIndex + 1]
-        return Data(response)
+        return Self.rewriteCachedWire(entry.response, fields: entry.fields,
+                                      age: age, remaining: remaining, query: prepared.query)
     }
 
     /// Optimistic DNS Prefetching lookup: returns the validated cached response
@@ -141,23 +156,19 @@ public final class DNSQueryCache {
         let key = Key(scope: scopeKey, question: identity)
         lock.lock(); defer { lock.unlock() }
         let now = clock()
-        guard checkClock(now), var entry = entries[key] else { return nil }
-        guard now < entry.expires else { archiveAndRemove(key, now: now); return nil }
+        guard checkClock(now), var entry = entries[key] else { misses &+= 1; return nil }
+        guard now < entry.expires else { archiveAndRemove(key, now: now); misses &+= 1; return nil }
         access &+= 1; entry.access = access; entries[key] = entry
+        if entry.isNegative { negativeHits &+= 1 } else { positiveHits &+= 1 }
         let age = UInt32(min(Double(UInt32.max), max(0, ceil(now.timeIntervalSince(entry.inserted)))))
         let remaining = UInt32(min(Double(UInt32.max), max(0, floor(entry.expires.timeIntervalSince(now)))))
         let totalLifetime = max(1.0, entry.expires.timeIntervalSince(entry.inserted))
         let safeFraction = prefetchFraction.isFinite ? min(0.5, max(0.01, prefetchFraction)) : 0.15
-        let shouldPrefetch = remaining <= minimumPrefetchRemainingTTL
-            || Double(remaining) <= totalLifetime * safeFraction
-        var response = [UInt8](entry.response)
-        for field in entry.fields {
-            let value = min(field.value > age ? field.value - age : 0, remaining)
-            Self.write32(value, at: field.offset, in: &response)
-        }
-        response[0] = prepared.query[prepared.query.startIndex]
-        response[1] = prepared.query[prepared.query.startIndex + 1]
-        return (Data(response), remaining, shouldPrefetch)
+        let shouldPrefetch = !entry.isNegative && (remaining <= minimumPrefetchRemainingTTL
+            || Double(remaining) <= totalLifetime * safeFraction)
+        let rewritten = Self.rewriteCachedWire(entry.response, fields: entry.fields,
+                                               age: age, remaining: remaining, query: prepared.query)
+        return (rewritten, remaining, shouldPrefetch)
     }
 
     /// RFC 8767 Serve-Stale emergency lookup: called only after upstream resolution
@@ -195,13 +206,10 @@ public final class DNSQueryCache {
             return nil
         }
         let emergencyTTL = min(staleServeTTL, maximumTTL)
-        var response = [UInt8](stale.response)
-        for field in stale.fields {
-            Self.write32(emergencyTTL, at: field.offset, in: &response)
-        }
-        response[0] = prepared.query[prepared.query.startIndex]
-        response[1] = prepared.query[prepared.query.startIndex + 1]
-        return Data(response)
+        staleHits &+= 1
+        return Self.rewriteCachedWire(stale.response, fields: stale.fields,
+                                      age: 0, remaining: emergencyTTL,
+                                      fixedTTL: emergencyTTL, query: prepared.query)
     }
 
     @discardableResult
@@ -220,13 +228,17 @@ public final class DNSQueryCache {
               answer.count >= 12, answer[0] == prepared.query[0], answer[1] == prepared.query[1],
               // The strict response inspection below checks the question,
               // class, opcode and flags against the prepared metadata too.
-              let fields = Self.inspectResponse(answer, question: question), !fields.isEmpty,
+              let inspected = Self.inspectResponse(answer, question: question),
+              !inspected.fields.isEmpty,
               maximumEntries > 0, maximumTTL > 0 else { return false }
+        let fields = inspected.fields
+        let isNegative = inspected.isNegative
         let cost = answer.count + identity.count + scopeKey.utf8.count
             + fields.count * MemoryLayout<TTLField>.stride
             + MemoryLayout<Entry>.stride + MemoryLayout<Key>.stride
         guard cost <= maximumBytes else { return false }
-        let lifetime = min(fields.map(\.value).min()!, maximumTTL)
+        let ttlCeiling = isNegative ? min(maximumTTL, maximumNegativeTTL) : maximumTTL
+        let lifetime = min(fields.map(\.value).min()!, ttlCeiling)
         guard lifetime > 0 else { return false }
         let key = Key(scope: scopeKey, question: identity)
         lock.lock(); defer { lock.unlock() }
@@ -239,11 +251,13 @@ public final class DNSQueryCache {
         while !entries.isEmpty && (entries.count >= maximumEntries || cost > maximumBytes - bytes) {
             guard let oldest = entries.min(by: { $0.value.access < $1.value.access })?.key else { return false }
             remove(oldest)
+            evictions &+= 1
         }
         guard entries.count < maximumEntries, cost <= maximumBytes - bytes else { return false }
         access &+= 1
+        insertions &+= 1
         entries[key] = Entry(response: Data(answer), fields: fields, inserted: now,
-                             expires: expires, cost: cost, access: access)
+                             expires: expires, cost: cost, isNegative: isNegative, access: access)
         bytes += cost
         return true
     }
@@ -275,12 +289,40 @@ public final class DNSQueryCache {
     private func archiveAndRemove(_ key: Key, now: Date) {
         guard let value = entries.removeValue(forKey: key) else { return }
         bytes -= value.cost
+        // RFC 8767 §4: Only positive cached answers are retained for emergency Serve-Stale.
+        guard !value.isNegative else { return }
         let staleLimit = min(max(1, maximumEntries), 64)
         if staleArchive.count >= staleLimit,
            let oldest = staleArchive.min(by: { $0.value.access < $1.value.access })?.key {
             staleArchive.removeValue(forKey: oldest)
         }
         staleArchive[key] = value
+    }
+
+    private static func rewriteCachedWire(
+        _ source: Data,
+        fields: [TTLField],
+        age: UInt32,
+        remaining: UInt32,
+        fixedTTL: UInt32? = nil,
+        query: Data
+    ) -> Data {
+        var output = source
+        let q0 = query[query.startIndex]
+        let q1 = query[query.startIndex + 1]
+        output.withUnsafeMutableBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+            for field in fields {
+                let value = fixedTTL ?? min(field.value > age ? field.value - age : 0, remaining)
+                base[field.offset]     = UInt8(truncatingIfNeeded: value >> 24)
+                base[field.offset + 1] = UInt8(truncatingIfNeeded: value >> 16)
+                base[field.offset + 2] = UInt8(truncatingIfNeeded: value >> 8)
+                base[field.offset + 3] = UInt8(truncatingIfNeeded: value)
+            }
+            base[0] = q0
+            base[1] = q1
+        }
+        return output
     }
     private func expire(_ now: Date) {
         for (key, value) in entries where value.expires <= now { archiveAndRemove(key, now: now) }
@@ -315,19 +357,24 @@ public final class DNSQueryCache {
                         payloadLimit: payload, recursionDesired: bytes[2] & 1)
     }
 
-    private static func inspectResponse(_ bytes: [UInt8], question: Question) -> [TTLField]? {
+    private static func inspectResponse(_ bytes: [UInt8], question: Question)
+        -> (fields: [TTLField], isNegative: Bool)? {
+        let rcode = bytes.count >= 4 ? (bytes[3] & 0x0f) : 0xff
         guard (12...65_535).contains(bytes.count), bytes.count <= question.payloadLimit,
-              bytes[2] & 0x80 != 0, bytes[2] & 0x7a == 0, bytes[3] & 0x5f == 0,
+              bytes[2] & 0x80 != 0, bytes[2] & 0x7a == 0, bytes[3] & 0x50 == 0,
+              (rcode == 0 || rcode == 3),
               bytes[2] & 1 == question.recursionDesired,
               read16(bytes, 4) == 1 else { return nil }
         let counts = [Int(read16(bytes, 6)), Int(read16(bytes, 8)), Int(read16(bytes, 10))]
-        guard counts[0] > 0, counts.reduce(0, +) <= 256 else { return nil }
+        let isNegativeCandidate = (counts[0] == 0 && counts[1] >= 1)
+        guard (rcode == 0 && counts[0] > 0) || isNegativeCandidate,
+              counts.reduce(0, +) <= 256 else { return nil }
         var names = Set<Int>()
         guard let named = readName(bytes, at: 12, known: &names), named.value == question.name,
               named.end <= bytes.count - 4, read16(bytes, named.end) == question.type,
               read16(bytes, named.end + 2) == 1 else { return nil }
         var offset = named.end + 4, fields: [TTLField] = [], aliases: [String: String] = [:]
-        var answerOwners: [String] = [], optCount = 0
+        var answerOwners: [String] = [], optCount = 0, authoritySOACount = 0
         for section in counts.indices {
             for _ in 0..<counts[section] {
                 let ownerOffset = offset
@@ -341,52 +388,70 @@ public final class DNSQueryCache {
                 let end = offset + length
                 if type == 41 {
                     optCount += 1
-                    // A DoH server may add neutral response padding even if
-                    // the client did not send OPT. This grants no capability:
-                    // the original query's payload bound above still applies
-                    // (512 without OPT), and every OPT flag must remain zero.
                     guard section == 2, optCount == 1, owner.value == ".",
                           bytes[ownerOffset] == 0, cls >= 512, ttl == 0,
                           paddingOnly(bytes, from: offset, to: end) else { return nil }
-                    // OPT's TTL-position is a flags/version field, not TTL.
                 } else {
                     guard cls == 1, ttl > 0 else { return nil }
-                    fields.append(TTLField(offset: ttlOffset, value: ttl))
                     switch type {
                     case 1, 28:
-                        guard length == (type == 1 ? 4 : 16), section != 1 else { return nil }
+                        guard !isNegativeCandidate, length == (type == 1 ? 4 : 16), section != 1 else { return nil }
+                        fields.append(TTLField(offset: ttlOffset, value: ttl))
                         if section == 0 {
                             guard type == question.type else { return nil }
                             answerOwners.append(owner.value)
                         }
                     case 5:
-                        guard section == 0, let alias = readName(bytes, at: offset, known: &names),
+                        guard !isNegativeCandidate, section == 0,
+                              let alias = readName(bytes, at: offset, known: &names),
                               alias.end == end else { return nil }
+                        fields.append(TTLField(offset: ttlOffset, value: ttl))
                         if let old = aliases[owner.value], old != alias.value { return nil }
                         aliases[owner.value] = alias.value
                     case 2:
-                        guard section != 0, let ns = readName(bytes, at: offset, known: &names), ns.end == end else { return nil }
+                        guard section == 1 || (!isNegativeCandidate && section == 2),
+                              let ns = readName(bytes, at: offset, known: &names), ns.end == end else { return nil }
+                        fields.append(TTLField(offset: ttlOffset, value: ttl))
                     case 6:
                         guard section == 1, let ns = readName(bytes, at: offset, known: &names),
-                              let mailbox = readName(bytes, at: ns.end, known: &names), mailbox.end == end - 20 else { return nil }
+                              ns.end <= end,
+                              let mailbox = readName(bytes, at: ns.end, known: &names),
+                              mailbox.end == end - 20 else { return nil }
+                        // RFC 2308 §3 & §5: Clamp SOA negative lifetime by SOA.MINIMUM timer
+                        let soaMinimum = read32(bytes, mailbox.end + 16)
+                        if isNegativeCandidate {
+                            guard soaMinimum > 0,
+                                  owner.value == "." || question.name == owner.value
+                                      || question.name.hasSuffix("." + owner.value) else { return nil }
+                            authoritySOACount += 1
+                            fields.append(TTLField(offset: ttlOffset, value: min(ttl, soaMinimum)))
+                        } else {
+                            fields.append(TTLField(offset: ttlOffset, value: ttl))
+                        }
                     case 64, 65:
-                        guard section == 0, type == question.type,
+                        guard !isNegativeCandidate, section == 0, type == question.type,
                               serviceBinding(bytes, from: offset, to: end, known: &names) else { return nil }
+                        fields.append(TTLField(offset: ttlOffset, value: ttl))
                         answerOwners.append(owner.value)
-                    default: return nil // Signatures, TSIG and complex RRs stay uncached.
+                    default: return nil
                     }
                 }
                 offset = end
             }
         }
-        guard offset == bytes.count, !answerOwners.isEmpty else { return nil }
+        guard offset == bytes.count else { return nil }
+        if isNegativeCandidate {
+            guard authoritySOACount >= 1, aliases.isEmpty, answerOwners.isEmpty else { return nil }
+            return (fields, true)
+        }
+        guard !answerOwners.isEmpty else { return nil }
         var chain = Set<String>(), terminal = question.name
         for _ in 0..<64 {
             guard chain.insert(terminal).inserted else { return nil }
             if let next = aliases[terminal] { terminal = next; continue }
             guard aliases.keys.allSatisfy({ chain.contains($0) }),
                   answerOwners.allSatisfy({ $0 == terminal }) else { return nil }
-            return fields
+            return (fields, false)
         }
         return nil
     }
@@ -407,7 +472,7 @@ public final class DNSQueryCache {
             guard end - offset >= 4 else { return false }
             let key = read16(bytes, offset), length = Int(read16(bytes, offset + 2))
             offset += 4
-            guard Int(key) > previous, key <= 6, length <= end - offset else { return false }
+            guard Int(key) > previous, key <= 7, length <= end - offset else { return false }
             let valueEnd = offset + length
             previous = Int(key); keys.insert(key)
             switch key {
@@ -416,7 +481,7 @@ public final class DNSQueryCache {
                 var last: UInt16 = 0
                 for index in stride(from: offset, to: valueEnd, by: 2) {
                     let required = read16(bytes, index)
-                    guard required > last, required <= 6 else { return false }
+                    guard required > last, required <= 7 else { return false }
                     mandatory.insert(required); last = required
                 }
             case 1:
@@ -446,6 +511,10 @@ public final class DNSQueryCache {
                 }
             case 6:
                 guard length > 0, length % 16 == 0 else { return false }
+            case 7:
+                // RFC 9461 SvcParamKey=7 (dohpath): non-empty relative URI template starting with '/'
+                guard length > 0, bytes[offset] == 0x2f,
+                      bytes[offset..<valueEnd].allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else { return false }
             default: return false
             }
             offset = valueEnd
@@ -572,6 +641,58 @@ public enum DNSQueryCacheSelfTest {
         try serveStaleAndOptimisticPrefetch()
         try malformedAndResourceBounds()
         try concurrentIDs()
+        try negativeCachingAndDohPath()
+    }
+
+    private static func negativeCachingAndDohPath() throws {
+        let clock = Clock()
+        let cache = DNSQueryCache(maximumNegativeTTL: 180, clock: clock.now)
+        let nxQuery1 = query(0x3101, name: "missing.example.test", type: 1)
+        let nxQuery2 = query(0x3102, name: "missing.example.test", type: 1)
+        // Build authoritative NXDOMAIN (rcode=3) with example.test SOA (RR TTL = 600, SOA.MINIMUM = 120)
+        var nxResp = nxQuery1
+        nxResp[2] = 0x81; nxResp[3] = 0x83 // QR=1, RD=1, RA=1, NXDOMAIN(3)
+        nxResp[8] = 0x00; nxResp[9] = 0x01 // NSCOUNT = 1
+        var soaBody = name("ns1.example.test") + name("hostmaster.example.test")
+        for timer: UInt32 in [2026111701, 3600, 600, 86400, 120] {
+            soaBody.append(contentsOf: [
+                UInt8(truncatingIfNeeded: timer >> 24),
+                UInt8(truncatingIfNeeded: timer >> 16),
+                UInt8(truncatingIfNeeded: timer >> 8),
+                UInt8(truncatingIfNeeded: timer)
+            ])
+        }
+        appendRecord(name("example.test"), type: 6, ttl: 600, body: soaBody, to: &nxResp)
+        try require(cache.store(scopeKey: "neg-scope", query: nxQuery1, response: nxResp),
+                    "RFC 2308 含权威 SOA 的 NXDOMAIN 未被负缓存")
+        clock.set(110) // 10s elapsed -> SOA TTL clamped from min(600,120)=120 down to 110
+        guard let nxHit = cache.lookup(scopeKey: "neg-scope", query: nxQuery2) else {
+            throw Failure(text: "RFC 2308 NXDOMAIN 负缓存未命中")
+        }
+        try require(nxHit[0] == 0x31 && nxHit[1] == 0x02 && (nxHit[3] & 0x0f) == 3,
+                    "RFC 2308 负缓存未重写客户端 ID 或 RCODE 失真")
+        try require(cache.statistics.negativeHits == 1, "负缓存命中计数未递增")
+        clock.set(221) // > 120s SOA minimum -> expired, and MUST NOT enter RFC 8767 staleArchive!
+        try require(cache.lookup(scopeKey: "neg-scope", query: nxQuery2) == nil
+                    && cache.lookupStale(scopeKey: "neg-scope", query: nxQuery2) == nil,
+                    "RFC 2308 负缓存超出 SOA MINIMUM 未过期，或被错误归档至 Serve-Stale")
+
+        // Unrelated zone SOA (attacker.other.test for missing.example.test) MUST be rejected!
+        var unrelatedSOA = nxQuery1
+        unrelatedSOA[2] = 0x81; unrelatedSOA[3] = 0x83; unrelatedSOA[9] = 1
+        appendRecord(name("other.test"), type: 6, ttl: 120, body: soaBody, to: &unrelatedSOA)
+        try require(!cache.store(scopeKey: "neg-scope", query: nxQuery1, response: unrelatedSOA),
+                    "跨域非祖先 SOA 负响应被误缓存（缓存投毒风险）")
+
+        // RFC 9461 SvcParamKey=7 (dohpath) positive HTTPS binding admission
+        let httpsQ = query(0x4101, type: 65)
+        let dohFixture = serviceAnswer(httpsQ, records: [(
+            serviceBody(target: "dns.example.test",
+                        parameters: [(1, [2, 104, 50]), (7, Array("/dns-query{?dns}".utf8))]), 90
+        )])
+        try require(cache.store(scopeKey: "doh-svc", query: httpsQ, response: dohFixture.wire)
+                    && cache.lookup(scopeKey: "doh-svc", query: query(0x4102, type: 65)) != nil,
+                    "RFC 9461 SvcParamKey=7 (dohpath) 服务绑定未被缓存")
     }
 
     private static func serveStaleAndOptimisticPrefetch() throws {

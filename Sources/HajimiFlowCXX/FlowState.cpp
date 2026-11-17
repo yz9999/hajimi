@@ -401,15 +401,65 @@ extern "C" size_t hajimi_tcp_reassembly_ingest(hajimi_tcp_reassembly *s, uint32_
         s->finishIfReady();
         return released;
     }
-    if (n > s->byteLimit - s->buffered || s->segments.size() >= s->segmentLimit) return 0;
+    // Normalize & coalesce out-of-order overlaps (RFC 793 wrap-safe sequence arithmetic):
+    // 1. Trim prefix/suffix already covered by buffered segments so overlapping OOO floods
+    //    cannot inflate s->buffered or waste BufferBudgetLimit.
+    // 2. Replace completely covered shorter buffered segments (e.g. coalesced retransmissions
+    //    starting at the same sequence with a larger payload).
+    for (const auto &seg : s->segments) {
+        const uint32_t segStart = seg.sequence;
+        const uint32_t segEnd = seg.sequence + uint32_t(seg.length);
+        const uint32_t inEnd = sequence + uint32_t(n);
+        if (int32_t(segStart - sequence) <= 0 && int32_t(segEnd - inEnd) >= 0) {
+            return 0; // Incoming segment is completely covered by an existing segment.
+        }
+        if (int32_t(segStart - sequence) < 0 && int32_t(segEnd - sequence) > 0) {
+            const size_t trim = size_t(uint32_t(segEnd - sequence));
+            if (trim >= n) return 0;
+            sequence += uint32_t(trim);
+            bytes += trim;
+            n -= trim;
+        }
+        const uint32_t updatedEnd = sequence + uint32_t(n);
+        if (int32_t(segStart - sequence) > 0 && int32_t(updatedEnd - segStart) > 0 &&
+            int32_t(segEnd - updatedEnd) >= 0) {
+            const size_t keep = size_t(uint32_t(segStart - sequence));
+            if (keep == 0) return 0;
+            n = keep;
+        }
+    }
+    size_t reclaimableBytes = 0;
+    size_t reclaimableCount = 0;
+    const uint32_t finalEnd = sequence + uint32_t(n);
+    for (const auto &seg : s->segments) {
+        const uint32_t segEnd = seg.sequence + uint32_t(seg.length);
+        if (int32_t(sequence - seg.sequence) <= 0 && int32_t(finalEnd - segEnd) >= 0) {
+            reclaimableBytes += seg.length;
+            ++reclaimableCount;
+        }
+    }
+    if (n > (s->byteLimit - (s->buffered - reclaimableBytes)) ||
+        (s->segments.size() - reclaimableCount) >= s->segmentLimit) {
+        return 0;
+    }
+    auto copy = allocateBuffer(n);
+    if (!copy) return 0;
+    std::memcpy(copy.get(), bytes, n);
+    if (reclaimableCount > 0) {
+        for (auto it = s->segments.begin(); it != s->segments.end();) {
+            const uint32_t segEnd = it->sequence + uint32_t(it->length);
+            if (int32_t(sequence - it->sequence) <= 0 && int32_t(finalEnd - segEnd) >= 0) {
+                s->buffered -= it->length;
+                it = s->segments.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     auto pos = std::lower_bound(s->segments.begin(), s->segments.end(), sequence,
         [](const PendingSegment &seg, uint32_t seq) {
             return int32_t(seg.sequence - seq) > 0;
         });
-    if (pos != s->segments.end() && pos->sequence == sequence) return 0;
-    auto copy = allocateBuffer(n);
-    if (!copy) return 0;
-    std::memcpy(copy.get(), bytes, n);
     s->segments.insert(pos, {sequence, n, std::move(copy)});
     s->buffered += n;
     return 0;
@@ -463,6 +513,19 @@ static int flowSelfTestBody(void) {
     hajimi_tcp_reassembly_ingest(overlap, 102, reinterpret_cast<const uint8_t *>("cdef"), 4, q, consumeQueue);
     if (hajimi_tcp_reassembly_ingest(overlap, 100, reinterpret_cast<const uint8_t *>("abcd"), 4, q, consumeQueue) != 6) return 14;
     if (hajimi_byte_queue_copy(q, output, 6) != 6 || std::memcmp(output, "abcdef", 6)) return 15;
+    {
+        auto *retrans = hajimi_tcp_reassembly_create(200, 16, 4);
+        if (!retrans) return 15;
+        std::unique_ptr<hajimi_tcp_reassembly, decltype(&hajimi_tcp_reassembly_destroy)> rtOwner(retrans, hajimi_tcp_reassembly_destroy);
+        hajimi_byte_queue_clear(q);
+        // Out-of-order short segment [202..204), followed by larger coalesced retransmission [202..206)
+        hajimi_tcp_reassembly_ingest(retrans, 202, reinterpret_cast<const uint8_t *>("cd"), 2, q, consumeQueue);
+        hajimi_tcp_reassembly_ingest(retrans, 202, reinterpret_cast<const uint8_t *>("cdef"), 4, q, consumeQueue);
+        if (hajimi_tcp_reassembly_buffered(retrans) != 4) return 15;
+        if (hajimi_tcp_reassembly_ingest(retrans, 200, reinterpret_cast<const uint8_t *>("ab"), 2, q, consumeQueue) != 6) return 15;
+        if (hajimi_byte_queue_copy(q, output, 6) != 6 || std::memcmp(output, "abcdef", 6)) return 15;
+        hajimi_byte_queue_clear(q);
+    }
     hajimi_tcp_reassembly_fin(overlap, 108);
     if (hajimi_tcp_reassembly_ingest(overlap, 106, reinterpret_cast<const uint8_t *>("ghij"), 4, q, consumeQueue) != 2 ||
         !hajimi_tcp_reassembly_finished(overlap) || hajimi_tcp_reassembly_expected(overlap) != 109) return 16;

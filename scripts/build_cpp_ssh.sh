@@ -16,7 +16,7 @@ ARCHS=${HAJIMI_ARCHS:-$(uname -m)}
 JOBS=${HAJIMI_BUILD_JOBS:-${HJ_BUILD_JOBS:-4}}
 mkdir -p "$BASE/downloads" "$BASE/src" "$BASE/include" "$BASE/lib"
 if [ ! -f "$ARCHIVE" ]; then
-    curl --fail --location --connect-timeout 10 --max-time 120 \
+    curl --proto '=https' --tlsv1.2 --fail --location --connect-timeout 10 --max-time 120 \
         "https://codeload.github.com/libssh2/libssh2/tar.gz/$COMMIT" -o "$ARCHIVE"
 fi
 ACTUAL=$(/usr/bin/shasum -a 256 "$ARCHIVE" | /usr/bin/awk '{print $1}')

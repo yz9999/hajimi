@@ -177,7 +177,10 @@ struct HTTP3Auth : std::enable_shared_from_this<HTTP3Auth> {
             if (!error.empty()) { self->finish(false, error); return; }
             readVarint(self->reader, [self, type](uint64_t length, Error error) {
                 if (self->abort()) return;
-                if (!error.empty() || length > 65536 || type == 0) {
+                const bool forbiddenFrame =
+                    type == 0 || type == 2 || type == 3 || type == 4 ||
+                    type == 6 || type == 7 || type == 8 || type == 9 || type == 0x0d;
+                if (!error.empty() || length > 65536 || forbiddenFrame) {
                     self->finish(false, error.empty() ? "Invalid HTTP/3 authentication response" : error); return;
                 }
                 self->reader->exactly(static_cast<size_t>(length), [self, type](Buffer block, Error error) {

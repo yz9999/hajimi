@@ -140,6 +140,7 @@ final class HTTP1ResponseParser {
     }
 
     private var buffer = Data()
+    private var readOffset = 0
     private var body: BodyState = .untilClose
 
     /// The head of a response has no business being large; a peer that never
@@ -147,9 +148,15 @@ final class HTTP1ResponseParser {
     private static let maximumHeadBytes = 64 * 1024
 
     func ingest(_ data: Data) throws -> (payload: Data, complete: Bool) {
-        buffer.append(data)
+        if !data.isEmpty {
+            if readOffset == buffer.count && readOffset > 0 {
+                buffer.removeAll(keepingCapacity: true)
+                readOffset = 0
+            }
+            buffer.append(data)
+        }
         var payload = Data()
-        var cursor = 0
+        var cursor = readOffset
 
         loop: while true {
             if !headComplete {
@@ -230,7 +237,15 @@ final class HTTP1ResponseParser {
             }
         }
 
-        if cursor > 0 { buffer.removeSubrange(0..<cursor) }
+        if cursor == buffer.count {
+            buffer.removeAll(keepingCapacity: true)
+            readOffset = 0
+        } else if cursor >= 16384 && cursor * 2 >= buffer.count {
+            buffer.removeSubrange(0..<cursor)
+            readOffset = 0
+        } else {
+            readOffset = cursor
+        }
         return (payload, complete)
     }
 

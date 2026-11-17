@@ -8,9 +8,11 @@
 #include <vector>
 
 namespace hajimi {
-/// Serial, bounded writes for framed streams with high/low-water flow control.
+/// Serial, bounded writes for framed streams with high/low-water flow control
+/// and automatic 32 KiB write coalescing across queued non-FIN chunks.
 /// All methods and underlying completions run on the factory strand.
 class OrderedWriter : public std::enable_shared_from_this<OrderedWriter> {
+    static constexpr size_t kMaxCoalescedWriteBytes = 32768;
     struct Entry { Buffer data; size_t bytes; WriteCallback completion; bool fin; };
     std::shared_ptr<Stream> source_;
     std::deque<Entry> entries_;
@@ -18,6 +20,7 @@ class OrderedWriter : public std::enable_shared_from_this<OrderedWriter> {
     size_t bytes_ = 0;
     size_t maxBytes_ = maximumQueuedBytes;
     size_t maxEntries_ = 128;
+    size_t coalesceMaxBytes_ = 0;
     bool active_ = false, closed_ = false, finishing_ = false;
     uint64_t generation_ = 0;
     void notifyDrainIfReady() {
@@ -30,32 +33,74 @@ class OrderedWriter : public std::enable_shared_from_this<OrderedWriter> {
         if (closed_ || active_ || entries_.empty()) return;
         active_ = true;
         auto self = shared_from_this(); auto generation = generation_;
-        auto complete = [self, generation](Error error) {
+        if (entries_.front().fin) {
+            source_->shutdownWrite([self, generation](Error error) {
+                if (generation != self->generation_ || self->closed_) return;
+                self->active_ = false;
+                auto entry = std::move(self->entries_.front()); self->entries_.pop_front();
+                self->bytes_ = self->bytes_ >= entry.bytes ? self->bytes_ - entry.bytes : 0;
+                if (!error.empty()) {
+                    self->closed_ = true; self->source_->close();
+                    auto remaining = std::move(self->entries_); self->entries_.clear(); self->bytes_ = 0;
+                    self->drainWaiters_.clear();
+                    entry.completion(error);
+                    for (auto &pending : remaining) pending.completion(error);
+                } else {
+                    entry.completion({});
+                    self->notifyDrainIfReady();
+                    self->flush();
+                }
+            });
+            return;
+        }
+        size_t batchCount = 1;
+        size_t batchBytes = entries_.front().bytes;
+        while (coalesceMaxBytes_ > 0 &&
+               batchCount < entries_.size() &&
+               !entries_[batchCount].fin &&
+               batchBytes + entries_[batchCount].bytes <= coalesceMaxBytes_) {
+            batchBytes += entries_[batchCount].bytes;
+            ++batchCount;
+        }
+        Buffer payload;
+        if (batchCount == 1) {
+            payload = std::move(entries_.front().data);
+        } else {
+            payload.reserve(batchBytes);
+            for (size_t i = 0; i < batchCount; ++i) {
+                payload.insert(payload.end(), entries_[i].data.begin(), entries_[i].data.end());
+                Buffer().swap(entries_[i].data);
+            }
+        }
+        source_->write(std::move(payload), [self, generation, batchCount, batchBytes](Error error) {
             if (generation != self->generation_ || self->closed_) return;
             self->active_ = false;
-            auto entry = std::move(self->entries_.front()); self->entries_.pop_front();
-            self->bytes_ = self->bytes_ >= entry.bytes ? self->bytes_ - entry.bytes : 0;
+            std::vector<WriteCallback> done;
+            done.reserve(batchCount);
+            const size_t popCount = std::min(batchCount, self->entries_.size());
+            for (size_t i = 0; i < popCount; ++i) {
+                done.push_back(std::move(self->entries_.front().completion));
+                self->entries_.pop_front();
+            }
+            self->bytes_ = self->bytes_ >= batchBytes ? self->bytes_ - batchBytes : 0;
             if (!error.empty()) {
                 self->closed_ = true; self->source_->close();
                 auto remaining = std::move(self->entries_); self->entries_.clear(); self->bytes_ = 0;
                 self->drainWaiters_.clear();
-                entry.completion(error);
-                for (auto &pending : remaining) pending.completion(error);
+                for (auto &cb : done) if (cb) cb(error);
+                for (auto &pending : remaining) if (pending.completion) pending.completion(error);
             } else {
-                entry.completion({});
+                for (auto &cb : done) if (cb) cb({});
                 self->notifyDrainIfReady();
                 self->flush();
             }
-        };
-        if (entries_.front().fin) {
-            source_->shutdownWrite(std::move(complete));
-        } else {
-            source_->write(std::move(entries_.front().data), std::move(complete));
-        }
+        });
     }
 public:
-    explicit OrderedWriter(std::shared_ptr<Stream> source, size_t maxBytes = maximumQueuedBytes, size_t maxEntries = 128)
-        : source_(std::move(source)), maxBytes_(maxBytes), maxEntries_(maxEntries) {}
+    explicit OrderedWriter(std::shared_ptr<Stream> source, size_t maxBytes = maximumQueuedBytes,
+                           size_t maxEntries = 128, size_t coalesceMaxBytes = 0)
+        : source_(std::move(source)), maxBytes_(maxBytes), maxEntries_(maxEntries),
+          coalesceMaxBytes_(coalesceMaxBytes) {}
     void write(Buffer data, WriteCallback completion) {
         if (closed_ || finishing_) { completion("Stream write side closed"); return; }
         const size_t sz = data.size();
@@ -91,7 +136,7 @@ class BufferedStream final : public Stream {
     std::shared_ptr<OrderedWriter> writer_;
 public:
     BufferedStream(std::shared_ptr<Stream> source, std::shared_ptr<Reader> reader)
-        : source_(std::move(source)), reader_(std::move(reader)), writer_(std::make_shared<OrderedWriter>(source_)) {}
+        : source_(std::move(source)), reader_(std::move(reader)), writer_(std::make_shared<OrderedWriter>(source_, maximumQueuedBytes, 128, 32768)) {}
     void write(Buffer data, WriteCallback completion) override { writer_->write(std::move(data), std::move(completion)); }
     void read(size_t maximum, ReadCallback completion) override { reader_->some(maximum, std::move(completion)); }
     void close() override { writer_->close(); reader_->close(); }

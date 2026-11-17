@@ -64,8 +64,17 @@ void storeLE64(uint8_t *dst, uint64_t v) {
 uint64_t rotr64(uint64_t x, unsigned n) {
     return (x >> n) | (x << (64 - n));
 }
-// RFC 7693 BLAKE2b with arbitrary digest length (1..64) for Argon2id fallback on OpenSSL < 3.2
+// OpenSSL 3.2+ uses native EVP_KDF("ARGON2ID") directly in snell::deriveKey().
+// For OpenSSL 3.0/3.1 fallback, delegate 64-byte BLAKE2b to EVP_blake2b512() and cleanse RFC 7693 state for 32-byte H'.
 void blake2bHash(uint8_t *out, size_t outlen, const uint8_t *in, size_t inlen) {
+    if (outlen == 0 || outlen > 64) throw std::runtime_error("Invalid BLAKE2b output length");
+    static const uint8_t emptyByte = 0;
+    if (outlen == 64) {
+        unsigned written = 0;
+        if (EVP_Digest(inlen ? in : &emptyByte, inlen, out, &written, EVP_blake2b512(), nullptr) != 1 || written != 64)
+            throw std::runtime_error("OpenSSL EVP_blake2b512 failed");
+        return;
+    }
     static const uint64_t iv[8] = {
         0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
         0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
@@ -73,18 +82,12 @@ void blake2bHash(uint8_t *out, size_t outlen, const uint8_t *in, size_t inlen) {
         0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL
     };
     static const uint8_t sigma[12][16] = {
-        {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},
-        {14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3},
-        {11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4},
-        {7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8},
-        {9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13},
-        {2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9},
-        {12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11},
-        {13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10},
-        {6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5},
-        {10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0},
-        {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},
-        {14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3}
+        {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}, {14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3},
+        {11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4}, {7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8},
+        {9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13}, {2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9},
+        {12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11}, {13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10},
+        {6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5}, {10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0},
+        {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}, {14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3}
     };
     uint64_t h[8];
     for (int i = 0; i < 8; ++i) h[i] = iv[i];
@@ -104,16 +107,14 @@ void blake2bHash(uint8_t *out, size_t outlen, const uint8_t *in, size_t inlen) {
         };
         for (int r = 0; r < 12; ++r) {
             const uint8_t *s = sigma[r];
-            G(0, 4,  8, 12, m[s[0]],  m[s[1]]);
-            G(1, 5,  9, 13, m[s[2]],  m[s[3]]);
-            G(2, 6, 10, 14, m[s[4]],  m[s[5]]);
-            G(3, 7, 11, 15, m[s[6]],  m[s[7]]);
-            G(0, 5, 10, 15, m[s[8]],  m[s[9]]);
-            G(1, 6, 11, 12, m[s[10]], m[s[11]]);
-            G(2, 7,  8, 13, m[s[12]], m[s[13]]);
-            G(3, 4,  9, 14, m[s[14]], m[s[15]]);
+            G(0,4,8,12,m[s[0]],m[s[1]]); G(1,5,9,13,m[s[2]],m[s[3]]);
+            G(2,6,10,14,m[s[4]],m[s[5]]); G(3,7,11,15,m[s[6]],m[s[7]]);
+            G(0,5,10,15,m[s[8]],m[s[9]]); G(1,6,11,12,m[s[10]],m[s[11]]);
+            G(2,7,8,13,m[s[12]],m[s[13]]); G(3,4,9,14,m[s[14]],m[s[15]]);
         }
         for (int i = 0; i < 8; ++i) h[i] ^= v[i] ^ v[i + 8];
+        OPENSSL_cleanse(v, sizeof(v));
+        OPENSSL_cleanse(m, sizeof(m));
     };
     size_t offset = 0;
     while (inlen - offset > 128) {
@@ -129,6 +130,9 @@ void blake2bHash(uint8_t *out, size_t outlen, const uint8_t *in, size_t inlen) {
     uint8_t digest[64];
     for (int i = 0; i < 8; ++i) storeLE64(digest + i * 8, h[i]);
     std::memcpy(out, digest, outlen);
+    OPENSSL_cleanse(h, sizeof(h));
+    OPENSSL_cleanse(lastBlock, sizeof(lastBlock));
+    OPENSSL_cleanse(digest, sizeof(digest));
 }
 void argon2HPrime(uint8_t *out, uint32_t outlen, const uint8_t *in, size_t inlen) {
     Buffer buf(4 + inlen);
@@ -210,6 +214,7 @@ Buffer deriveSnellArgon2idRFC9106(const std::string &psk, const Buffer &salt) {
     push32(0); // ad len = 0
     uint8_t h0[72]{};
     blake2bHash(h0, 64, h0Input.data(), h0Input.size());
+    OPENSSL_cleanse(h0Input.data(), h0Input.size());
 
     std::array<ArgonBlock, 8> memory{};
     for (uint32_t j = 0; j < 2; ++j) {
@@ -218,6 +223,7 @@ Buffer deriveSnellArgon2idRFC9106(const std::string &psk, const Buffer &salt) {
         uint8_t raw[1024];
         argon2HPrime(raw, 1024, h0, 72);
         for (size_t k = 0; k < 128; ++k) memory[j][k] = loadLE64(raw + k * 8);
+        OPENSSL_cleanse(raw, sizeof(raw));
     }
 
     constexpr uint32_t q = 8, sl = 2;

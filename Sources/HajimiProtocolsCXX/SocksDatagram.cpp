@@ -2,6 +2,7 @@
 #include "ProtocolStream.hpp"
 #include <arpa/inet.h>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <stdexcept>
 
@@ -41,12 +42,28 @@ class SocksDatagrams final:public Datagram,public std::enable_shared_from_this<S
             entry.completion({});self->flush();
         });
     }
+    static bool sameNumericAddress(const std::string &a, const std::string &b) {
+        in_addr a4{}, b4{};
+        if (::inet_pton(AF_INET, a.c_str(), &a4) == 1 && ::inet_pton(AF_INET, b.c_str(), &b4) == 1) {
+            return a4.s_addr == b4.s_addr;
+        }
+        const std::string ca = unbracketAndStripZone(a);
+        const std::string cb = unbracketAndStripZone(b);
+        in6_addr a6{}, b6{};
+        if (::inet_pton(AF_INET6, ca.c_str(), &a6) == 1 && ::inet_pton(AF_INET6, cb.c_str(), &b6) == 1) {
+            return std::memcmp(&a6, &b6, 16) == 0;
+        }
+        return true; // Non-literal hostname relay (validated by connected socket)
+    }
     void beginReceive(){
         if(closed_ || !started_ || !raw_ || receiving_)return;
         receiving_=true;std::weak_ptr<SocksDatagrams> weak=shared_from_this();
-        raw_->start([weak](Target,Buffer wire){
+        raw_->start([weak](Target sender,Buffer wire){
             if(auto self=weak.lock()){
-                if(self->closed_ || wire.size()<4 || wire[0] || wire[1] || wire[2])return; // RFC1928 FRAG unsupported: drop, never concatenate.
+                // RFC 1928 §7: Drop UDP datagrams from any source other than the expected UDP relay server.
+                if(self->closed_ || wire.size()<4 || wire[0] || wire[1] || wire[2])return;
+                if(sender.port != 0 && self->relay_.port != 0 && sender.port != self->relay_.port)return;
+                if(!sender.host.empty() && !self->relay_.host.empty() && !sameNumericAddress(sender.host, self->relay_.host))return;
                 try{Buffer body(wire.begin()+3,wire.end());size_t consumed=0;auto target=parseSocksAddress(body,consumed);
                     Buffer payload(body.begin()+consumed,body.end());if(self->receive_)self->receive_(std::move(target),std::move(payload));}
                 catch(const std::exception &){} // Malformed unauthenticated UDP is discarded.
@@ -70,23 +87,41 @@ class SocksDatagrams final:public Datagram,public std::enable_shared_from_this<S
                 in6_addr v6{};
                 return ::inet_pton(AF_INET6, clean.c_str(), &v6) == 1;
             };
-            auto isPrivateOrLoopbackV4 = [](const std::string &h) -> bool {
-                unsigned a = 0, b = 0, c = 0, d = 0;
-                char tail = 0;
-                if (std::sscanf(h.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4) return false;
-                if (a > 255 || b > 255 || c > 255 || d > 255) return false;
-                return a == 0 || a == 10 || a == 127 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168);
+            auto isNonPublicIPv4Bytes = [](const uint8_t ip[4]) -> bool {
+                const uint8_t a = ip[0], b = ip[1];
+                return a == 0 ||                               // 0.0.0.0/8 (RFC 1122)
+                       a == 10 ||                              // 10.0.0.0/8 (RFC 1918)
+                       a == 127 ||                             // 127.0.0.0/8 Loopback
+                       (a == 100 && (b & 0xc0) == 64) ||       // 100.64.0.0/10 CGNAT (RFC 6598)
+                       (a == 169 && b == 254) ||               // 169.254.0.0/16 Link-Local (RFC 3927)
+                       (a == 172 && b >= 16 && b <= 31) ||     // 172.16.0.0/12 (RFC 1918)
+                       (a == 192 && b == 168) ||               // 192.168.0.0/16 (RFC 1918)
+                       a >= 224;                               // 224.0.0.0/4+ Multicast & Reserved
             };
-            auto isPrivateOrLoopbackV6 = [](const std::string &h) -> bool {
+            auto isPrivateOrLoopbackV4 = [&](const std::string &h) -> bool {
+                in_addr v4{};
+                if (::inet_pton(AF_INET, h.c_str(), &v4) != 1) return false;
+                return isNonPublicIPv4Bytes(reinterpret_cast<const uint8_t *>(&v4));
+            };
+            auto isPrivateOrLoopbackV6 = [&](const std::string &h) -> bool {
                 std::string clean = unbracketAndStripZone(h);
                 in6_addr v6{};
                 if (::inet_pton(AF_INET6, clean.c_str(), &v6) != 1) return false;
                 const uint8_t *b = reinterpret_cast<const uint8_t *>(&v6);
-                bool allZeroPrefix = true;
-                for (int i = 0; i < 15; ++i) if (b[i] != 0) allZeroPrefix = false;
-                if (allZeroPrefix && (b[15] == 0 || b[15] == 1)) return true; // :: or ::1
+                bool zero10 = true;
+                for (int i = 0; i < 10; ++i) if (b[i] != 0) zero10 = false;
+                if (zero10 && b[10] == 0xff && b[11] == 0xff) {
+                    // IPv4-mapped IPv6 ::ffff:a.b.c.d
+                    return isNonPublicIPv4Bytes(b + 12);
+                }
+                if (zero10 && b[10] == 0 && b[11] == 0) {
+                    // ::, ::1, or deprecated IPv4-compatible ::a.b.c.d
+                    if (b[12] == 0 && b[13] == 0 && b[14] == 0 && (b[15] == 0 || b[15] == 1)) return true;
+                    return isNonPublicIPv4Bytes(b + 12);
+                }
                 if ((b[0] & 0xfe) == 0xfc) return true; // fc00::/7 ULA
                 if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) return true; // fe80::/10 link-local
+                if (b[0] == 0xff) return true; // ff00::/8 multicast
                 return false;
             };
             const std::string dialHost = self->node_.dialHost();

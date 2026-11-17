@@ -1,66 +1,38 @@
-# C QUIC dependencies
+# C QUIC & Post-Quantum TLS dependencies
 
-`scripts/build_cpp_quic.sh` fetches checksum-pinned ngtcp2 1.18.0 and nghttp3
-1.12.0 release sources and builds static libraries inside
-`.build/Vendor/HajimiQUIC`. ngtcp2 uses OpenSSL's external QUIC TLS interface;
-it does not use OpenSSL's client QUIC stack (which lacks application DATAGRAMs).
-Both dependency projects use the MIT license; their release sources contain
-the corresponding license files. OpenSSL uses the Apache License 2.0.
+`scripts/build_cpp_quic.sh` fetches SHA-256-pinned `ngtcp2 1.18.0` and `nghttp3 1.12.0`
+release sources over HTTPS (TLS 1.2+) and builds static libraries inside
+`.build/Vendor/HajimiQUIC`. `ngtcp2` uses OpenSSL 3.5+'s external QUIC TLS
+interface (`SSL_set_quic_tls_cbs`) rather than OpenSSL's internal QUIC engine so
+RFC 9221 unreliable `DATAGRAM` frames remain natively supported. Both `ngtcp2`
+and `nghttp3` use the MIT license; OpenSSL uses the Apache License 2.0.
 
-OpenSSL 3.5+ static headers/libraries must be supplied with
-`HAJIMI_OPENSSL_ROOT` (default `/usr/local/opt/openssl@3`). For universal builds,
-the OpenSSL archive must be universal, or the root must contain `x86_64` and
-`arm64` static installations. `HAJIMI_ARCHS` defaults to the current host.
-Nothing is installed into system directories.
+OpenSSL 3.5+ static headers/libraries are supplied via `HAJIMI_OPENSSL_ROOT`
+(default `/usr/local/opt/openssl@3` or `/opt/homebrew/opt/openssl@3`; when
+absent, `scripts/build_native_core.sh` builds SHA-256-verified `OpenSSL 3.5.9 LTS`
+inside `.build/Vendor/OpenSSL`). Nothing is installed into host system directories.
 
-The application protocol implementation lives in
-`Sources/HajimiProtocolsCXX/QUICProtocols.cpp` and `QUICTransport.cpp`.
-Hysteria v1 uses its binary authentication/control stream; Hysteria v2 uses
-HTTP/3 authentication with nghttp3's static-table QPACK encoder/decoder;
-TUIC v5 uses RFC 8446 TLS-exporter authentication. TCP uses independent QUIC
-bidirectional streams. UDP uses RFC 9221 DATAGRAMs and bounded fragmentation;
-TUIC also supports its unidirectional-stream (`quic`) relay mode. XPlus
-(SHA-256) and Salamander (BLAKE2b-256) obfuscation are implemented in C++.
+ Frontier standards enabled in `Sources/HajimiProtocolsCXX/QUICTransport.cpp`,
+`QUICProtocols.cpp`, and `TrustTunnelProtocol.cpp`:
+- **Post-Quantum Hybrid TLS 1.3 (RFC 10024 / NIST FIPS 203)**: Prioritizes
+  `X25519MLKEM768` (`0x11EC`) via OpenSSL 3.5+ (`pqc = auto | true | false`) with
+  automatic fallback to `X25519:P-256:P-384`.
+- **QUIC Version 2 & Compatible Version Negotiation (RFC 9369 & RFC 9368)**:
+  Advertises `{QUIC v2 (0x6b3343cf), QUIC v1 (0x00000001)}` in `preferred_versions`
+  by default (`quic-version = auto | 1 | 2`) and enables **RFC 9287**
+  `grease_quic_bit = 1`.
+- **Kernel Unfragmented UDP & DPLPMTUD (RFC 9000 §14 & RFC 8899)**: Sets
+  `IP_DONTFRAG` / `IPV6_DONTFRAG` (`IP_PMTUDISC_DO` on Linux) so oversized UDP
+  packets surface `EMSGSIZE` directly to the C++ DPLPMTUD state machine instead
+  of silently IP-fragmenting.
+- **HTTP/3 & MASQUE (`nghttp3`)**: Hysteria v2 and TrustTunnel QUIC enforce
+  RFC 9114 §7.2 control-frame restrictions, skip unknown/GREASE frames per
+  §7.2.8, and transport UDP over RFC 9221 `DATAGRAM` or RFC 9298 `connect-udp`
+  RFC 9297 capsules.
 
-macOS system trust is evaluated with the Security/CoreFoundation C APIs, so
-the distributed application does not depend on Homebrew's CA certificate
-bundle. A node's explicit `ca` file instead uses OpenSSL's supplied CA store.
-Certificate verification is skipped only for explicit `skip-cert-verify`.
-Socket interface binding, cancellation, handshake/idle timeouts and separate
-stream/datagram budgets are enforced by a C++ reactor. Connections currently
-belong to individual TCP/UDP sessions; cross-request pooling is not implemented.
+macOS system trust is evaluated with the `Security.framework` / `CoreFoundation`
+C APIs unless an explicit node `ca` bundle is configured, and certificate
+verification is skipped only when `skip-cert-verify` is explicitly set.
 
-Port hopping, chain/dialer proxies, 0-RTT/fast-open, custom TLS fingerprints,
-certificate pinning, ECH and BBR profiles are rejected explicitly. The backend
-supports ngtcp2 BBR v2, Cubic and Reno; it does not reproduce Hysteria's custom
-Brutal sender or apernet's BBR profiles. Selecting a language alone does not
-establish throughput, latency or memory guarantees.
-
-Run `HAJIMI_SANITIZE=1 sh scripts/test_cpp_quic.sh` for independent, loopback-only
-aioquic interoperability checks (the Python peer is a test fixture, not shipped
-in the app). They verify TLS/hostname/system-trust rejection, explicit bypass,
-real Hysteria authentication and independently calculated TUIC exporter tokens,
-TCP half-close/prefetched bytes, empty/max-size UDP, out-of-order/duplicate UDP
-fragments, both obfuscators and 96 consecutive TUIC stream-relay packets.
-Cancellation tests cover pending TCP/UDP handshakes against a real UDP blackhole,
-pre-start cancellation and TLS-ready callback races for all three protocols;
-they require exactly-once failure and reactor/socket cleanup within 500 ms.
-Tests never install a Helper, activate a VPN, or change routing/DNS/proxies.
-
-The independent peer has a version-limited workaround for aioquic 1.3.0's
-FIN-only packet-budget defect. When the remaining payload budget is negative,
-its sender dequeues EOF before the packet builder rejects the frame, without
-registering a retransmission callback. The observed failure received all
-20,013 application bytes but never EOF; server diagnostics showed final offset
-20,020, no pending EOF, no acknowledged FIN and no transmitted FIN frame.
-The fixture leaves FIN queued for negative budgets only on version 1.3.0; it
-does not edit the installed package or change the C++ implementation. Four
-deterministic peer regression tests run before interoperability, including
-reproduction with the original method and successful FIN/ACK after budget
-recovery. The payload, half-close and EOF assertions remain unchanged; no
-retries or timeout extensions hide this failure. ASan's altered scheduling
-made the unsafe window less likely, so both sanitized and ordinary runs matter.
-
-Set `HAJIMI_QUIC_TEST_TRACE=1` for credential-free phase, stream/FIN and fragment
-length diagnostics. The C++ trace hooks are compiled only in the standalone
-test build, not the application. Timeouts always identify the waiting phase.
+Run `HAJIMI_SANITIZE=1 sh scripts/test_cpp_quic.sh` for loopback-only `aioquic`
+interoperability checks.

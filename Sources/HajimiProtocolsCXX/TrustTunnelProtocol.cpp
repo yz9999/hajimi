@@ -4,7 +4,9 @@
 #include "QUICTransport.hpp"
 #include "../HajimiProtocolCXX/include/HajimiProtocolCXX.h"
 #include <nghttp3/nghttp3.h>
+#include <cctype>
 #include <mutex>
+#include <openssl/crypto.h>
 #include <unordered_map>
 
 namespace hajimi {
@@ -212,10 +214,18 @@ private:
             }
             readQuicVarint(self->reader_, [self, frameType](uint64_t frameLen, Error lenErr) {
                 if (self->closed_) return;
-                if (!lenErr.empty() || frameLen > 16 * 1024 * 1024) {
+                // RFC 9114 §7.2: Reject control/HTTP2-reserved frames on request streams.
+                const bool forbiddenOnRequestStream =
+                    frameType == 0x02 || frameType == 0x03 || frameType == 0x04 ||
+                    frameType == 0x06 || frameType == 0x07 || frameType == 0x08 ||
+                    frameType == 0x09 || frameType == 0x0d;
+                const uint64_t maxAllowed = (frameType == 0x00) ? (16ULL * 1024 * 1024) : 65536ULL;
+                if (!lenErr.empty() || forbiddenOnRequestStream || frameLen > maxAllowed) {
                     auto cb = std::exchange(self->pendingRead_, {});
                     self->close();
-                    if (cb) cb({}, true, lenErr.empty() ? "Oversized HTTP/3 frame" : lenErr);
+                    if (cb) cb({}, true, !lenErr.empty() ? lenErr :
+                               (forbiddenOnRequestStream ? "Unexpected HTTP/3 control frame on request stream"
+                                                         : "Oversized HTTP/3 frame"));
                     return;
                 }
                 self->reader_->exactly(static_cast<size_t>(frameLen), [self, frameType](Buffer payload, Error payErr) {
@@ -229,6 +239,7 @@ private:
                     if (frameType == 0x00 && !payload.empty()) {
                         self->buffered_.append(payload.data(), payload.size());
                     }
+                    // RFC 9114 §7.2.8: Unknown/GREASE frames and trailing HEADERS are cleanly ignored.
                     self->pumpRead();
                 });
             });
@@ -248,20 +259,24 @@ private:
 // Pooled HTTP/3 QUIC connection manager for TrustTunnel so concurrent TCP/UDP
 // streams multiplex over a single established HTTP/3 connection.
 struct PooledTrustTunnelQUIC : std::enable_shared_from_this<PooledTrustTunnelQUIC> {
+    std::mutex mtx;
     std::shared_ptr<TransportFactory> factory;
     std::shared_ptr<quic::Connection> connection;
     std::vector<std::function<void(std::shared_ptr<quic::Connection>, Error)>> waiters;
     bool connecting = false;
     bool settingsSent = false;
     void closeEntry() {
-        connecting = false;
-        settingsSent = false;
-        if (connection) {
-            connection->close();
-            connection.reset();
+        std::shared_ptr<quic::Connection> oldConn;
+        std::vector<std::function<void(std::shared_ptr<quic::Connection>, Error)>> pending;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            connecting = false;
+            settingsSent = false;
+            oldConn = std::move(connection);
+            pending = std::move(waiters);
+            waiters.clear();
         }
-        auto pending = std::move(waiters);
-        waiters.clear();
+        if (oldConn) oldConn->close();
         for (auto &w : pending) w(nullptr, "TrustTunnel QUIC client reset");
     }
 };
@@ -276,20 +291,106 @@ std::unordered_map<std::string, std::shared_ptr<PooledTrustTunnelQUIC>> &trustTu
     return pool;
 }
 
-std::string trustTunnelPoolKey(const Node &node, const std::string &username, const std::shared_ptr<TransportFactory> &factory) {
+std::string trustTunnelPoolKey(const Node &node, const std::string &username, const std::string &password,
+                               const std::shared_ptr<TransportFactory> &factory) {
+    std::string credMaterial = username + ":" + password;
+    Buffer credDigest = crypto::digestSlice("SHA256", reinterpret_cast<const uint8_t *>(credMaterial.data()), credMaterial.size());
+    OPENSSL_cleanse(credMaterial.data(), credMaterial.size());
     return std::to_string(reinterpret_cast<uintptr_t>(factory.get())) + "|" +
            node.dialHost() + ":" + std::to_string(node.port) + "|" +
-           node.interfaceName + "|" + username + "|" + node.option("sni");
+           node.interfaceName + "|" + crypto::base64Encode(credDigest) + "|" +
+           node.option("sni") + "|" + (node.flag("skip-cert-verify") ? "1" : "0") + "|" +
+           node.option("alpn");
 }
 
-void acquireTrustTunnelQUIC(const Node &node, const std::string &username,
+void readHttp3ResponseHeaders(std::shared_ptr<quic::Connection> connection,
+                              std::shared_ptr<Stream> stream,
+                              std::shared_ptr<Reader> reader,
+                              unsigned skippedFrames,
+                              StreamCallback completion) {
+    if (skippedFrames > 16) {
+        stream->close();
+        completion(nullptr, "Too many HTTP/3 frames before HEADERS");
+        return;
+    }
+    readQuicVarint(reader, [connection, stream, reader, skippedFrames, completion = std::move(completion)](uint64_t fType, Error tErr) mutable {
+        if (!tErr.empty() || connection->isClosed()) {
+            stream->close();
+            completion(nullptr, tErr.empty() ? "TrustTunnel QUIC cancelled" : tErr);
+            return;
+        }
+        // RFC 9114 §7.2: Reject DATA (before HEADERS) and control/HTTP2-reserved frames on request streams.
+        const bool forbiddenBeforeHeaders =
+            fType == 0x00 || fType == 0x02 || fType == 0x03 || fType == 0x04 ||
+            fType == 0x06 || fType == 0x07 || fType == 0x08 || fType == 0x09 || fType == 0x0d;
+        if (forbiddenBeforeHeaders) {
+            stream->close();
+            completion(nullptr, "Unexpected HTTP/3 frame before HEADERS");
+            return;
+        }
+        readQuicVarint(reader, [connection, stream, reader, skippedFrames, fType, completion = std::move(completion)](uint64_t fLen, Error lErr) mutable {
+            if (!lErr.empty() || fLen > 65536) {
+                stream->close();
+                completion(nullptr, lErr.empty() ? "Oversized HTTP/3 frame" : lErr);
+                return;
+            }
+            reader->exactly(static_cast<size_t>(fLen), [connection, stream, reader, skippedFrames, fType, completion = std::move(completion)](Buffer block, Error bErr) mutable {
+                if (!bErr.empty()) {
+                    stream->close();
+                    completion(nullptr, bErr);
+                    return;
+                }
+                // RFC 9114 §7.2.8: Unknown and GREASE frame types MUST be ignored.
+                if (fType != 0x01) {
+                    readHttp3ResponseHeaders(std::move(connection), std::move(stream), std::move(reader),
+                                             skippedFrames + 1, std::move(completion));
+                    return;
+                }
+                try {
+                    auto fields = decodeQpack(block);
+                    std::string status;
+                    for (auto &f : fields) {
+                        if (f.first == ":status") {
+                            if (!status.empty()) throw std::runtime_error("Duplicate HTTP/3 :status pseudo-header");
+                            status = f.second;
+                        }
+                    }
+                    // RFC 9114 §4.1: Skip 1xx informational responses prior to final status.
+                    if (status.size() == 3 && status[0] == '1') {
+                        readHttp3ResponseHeaders(std::move(connection), std::move(stream), std::move(reader),
+                                                 skippedFrames + 1, std::move(completion));
+                        return;
+                    }
+                    if (status != "200") {
+                        stream->close();
+                        completion(nullptr, "TrustTunnel HTTP/3 CONNECT rejected");
+                        return;
+                    }
+                    connection->authenticated();
+                    completion(std::make_shared<HTTP3ConnectStream>(connection, stream, reader), {});
+                } catch (const std::exception &e) {
+                    stream->close();
+                    completion(nullptr, e.what());
+                }
+            });
+        });
+    });
+}
+
+void acquireTrustTunnelQUIC(const Node &node, const std::string &username, const std::string &password,
                             std::shared_ptr<TransportFactory> factory,
                             std::function<void(std::shared_ptr<quic::Connection>, Error)> completion) {
-    std::string key = trustTunnelPoolKey(node, username, factory);
+    std::string key = trustTunnelPoolKey(node, username, password, factory);
     std::shared_ptr<PooledTrustTunnelQUIC> entry;
+    std::vector<std::shared_ptr<PooledTrustTunnelQUIC>> evicted;
     {
         std::lock_guard<std::mutex> lock(trustTunnelQuicPoolMutex());
-        if (trustTunnelQuicPool().size() > 64) trustTunnelQuicPool().clear();
+        if (trustTunnelQuicPool().size() >= 64 && !trustTunnelQuicPool().count(key)) {
+            for (auto &kv : trustTunnelQuicPool()) {
+                if (kv.second) evicted.push_back(kv.second);
+            }
+            trustTunnelQuicPool().clear();
+        }
         auto &slot = trustTunnelQuicPool()[key];
         if (!slot) {
             slot = std::make_shared<PooledTrustTunnelQUIC>();
@@ -297,29 +398,57 @@ void acquireTrustTunnelQUIC(const Node &node, const std::string &username,
         }
         entry = slot;
     }
-    if (entry->connection && !entry->connection->isClosed()) {
-        completion(entry->connection, {});
+    for (auto &old : evicted) old->closeEntry();
+
+    std::shared_ptr<quic::Connection> readyConn;
+    bool startDial = false;
+    {
+        std::lock_guard<std::mutex> entryLock(entry->mtx);
+        if (entry->connection && !entry->connection->isClosed()) {
+            readyConn = entry->connection;
+        } else {
+            entry->connection.reset();
+            entry->settingsSent = false;
+            entry->waiters.push_back(std::move(completion));
+            if (!entry->connecting) {
+                entry->connecting = true;
+                startDial = true;
+            }
+        }
+    }
+    if (readyConn) {
+        completion(std::move(readyConn), {});
         return;
     }
-    entry->connection.reset();
-    entry->settingsSent = false;
-    entry->waiters.push_back(std::move(completion));
-    if (entry->connecting) return;
-    entry->connecting = true;
+    if (!startDial) return;
 
     quic::Connection::connect(node, factory, [entry](std::shared_ptr<quic::Connection> conn, Error err) {
-        entry->connecting = false;
+        std::vector<std::function<void(std::shared_ptr<quic::Connection>, Error)>> pending;
+        bool needSettings = false;
         if (!err.empty() || !conn || conn->isClosed()) {
             if (conn) conn->close();
-            auto pending = std::move(entry->waiters);
-            entry->waiters.clear();
+            {
+                std::lock_guard<std::mutex> entryLock(entry->mtx);
+                entry->connecting = false;
+                pending = std::move(entry->waiters);
+                entry->waiters.clear();
+            }
             Error finalErr = err.empty() ? Error("TrustTunnel QUIC connection failed") : err;
             for (auto &w : pending) w(nullptr, finalErr);
             return;
         }
-        entry->connection = conn;
-        if (!entry->settingsSent) {
-            entry->settingsSent = true;
+        {
+            std::lock_guard<std::mutex> entryLock(entry->mtx);
+            entry->connecting = false;
+            entry->connection = conn;
+            if (!entry->settingsSent) {
+                entry->settingsSent = true;
+                needSettings = true;
+            }
+            pending = std::move(entry->waiters);
+            entry->waiters.clear();
+        }
+        if (needSettings) {
             // Open HTTP/3 control stream (uni stream type 0x00 + SETTINGS frame 0x04 with RFC 9220/9297 SETTINGS_ENABLE_CONNECT_PROTOCOL = 0x08 : 1)
             conn->open(true, [conn](std::shared_ptr<Stream> ctrl, Error ctrlErr) {
                 if (!ctrlErr.empty() || !ctrl) return;
@@ -327,8 +456,6 @@ void acquireTrustTunnelQUIC(const Node &node, const std::string &username,
                 ctrl->write(std::move(settings), [](Error) {});
             });
         }
-        auto pending = std::move(entry->waiters);
-        entry->waiters.clear();
         for (auto &w : pending) w(conn, {});
     });
 }
@@ -336,7 +463,7 @@ void acquireTrustTunnelQUIC(const Node &node, const std::string &username,
 void connectTrustTunnelQUIC(const Node &node, const Target &target,
                             const std::string &username, const std::string &password,
                             std::shared_ptr<TransportFactory> factory, StreamCallback completion) {
-    acquireTrustTunnelQUIC(node, username, factory, [node, target, username, password, completion = std::move(completion)](std::shared_ptr<quic::Connection> connection, Error err) mutable {
+    acquireTrustTunnelQUIC(node, username, password, factory, [node, target, username, password, completion = std::move(completion)](std::shared_ptr<quic::Connection> connection, Error err) mutable {
         if (!err.empty() || !connection || connection->isClosed()) {
             completion(nullptr, err.empty() ? "TrustTunnel QUIC connection failed" : err);
             return;
@@ -351,6 +478,7 @@ void connectTrustTunnelQUIC(const Node &node, const Target &target,
                 cred.push_back(':');
                 cred.insert(cred.end(), password.begin(), password.end());
                 std::string auth = "Basic " + crypto::base64Encode(cred);
+                OPENSSL_cleanse(cred.data(), cred.size());
 
                 Fields headers;
                 if (target.udp) {
@@ -382,6 +510,7 @@ void connectTrustTunnelQUIC(const Node &node, const Target &target,
                 appendVarint(h3Req, qpackBlock.size());
                 h3Req.insert(h3Req.end(), qpackBlock.begin(), qpackBlock.end());
 
+                OPENSSL_cleanse(auth.data(), auth.size());
                 auto reader = std::make_shared<Reader>(stream);
                 stream->write(std::move(h3Req), [connection, stream, reader, completion = std::move(completion)](Error writeErr) mutable {
                     if (!writeErr.empty() || connection->isClosed()) {
@@ -389,44 +518,7 @@ void connectTrustTunnelQUIC(const Node &node, const Target &target,
                         completion(nullptr, writeErr.empty() ? "TrustTunnel QUIC cancelled" : writeErr);
                         return;
                     }
-                    readQuicVarint(reader, [connection, stream, reader, completion = std::move(completion)](uint64_t fType, Error tErr) mutable {
-                        if (!tErr.empty() || fType != 0x01) {
-                            stream->close();
-                            completion(nullptr, tErr.empty() ? "Expected HTTP/3 HEADERS frame" : tErr);
-                            return;
-                        }
-                        readQuicVarint(reader, [connection, stream, reader, completion = std::move(completion)](uint64_t fLen, Error lErr) mutable {
-                            if (!lErr.empty() || fLen > 65536) {
-                                stream->close();
-                                completion(nullptr, lErr.empty() ? "Oversized HTTP/3 HEADERS frame" : lErr);
-                                return;
-                            }
-                            reader->exactly(static_cast<size_t>(fLen), [connection, stream, reader, completion = std::move(completion)](Buffer block, Error bErr) mutable {
-                                if (!bErr.empty()) {
-                                    stream->close();
-                                    completion(nullptr, bErr);
-                                    return;
-                                }
-                                try {
-                                    auto fields = decodeQpack(block);
-                                    std::string status;
-                                    for (auto &f : fields) {
-                                        if (f.first == ":status") status = f.second;
-                                    }
-                                    if (status != "200") {
-                                        stream->close();
-                                        completion(nullptr, "TrustTunnel HTTP/3 CONNECT rejected");
-                                        return;
-                                    }
-                                    connection->authenticated();
-                                    completion(std::make_shared<HTTP3ConnectStream>(connection, stream, reader), {});
-                                } catch (const std::exception &e) {
-                                    stream->close();
-                                    completion(nullptr, e.what());
-                                }
-                            });
-                        });
-                    });
+                    readHttp3ResponseHeaders(std::move(connection), std::move(stream), std::move(reader), 0, std::move(completion));
                 });
             } catch (const std::exception &e) {
                 stream->close();
@@ -705,10 +797,17 @@ void connectTrustTunnel(const Node &node, const Target &target,
             });
         }
         try {
+            auto hasInvalidHeaderChar = [](const std::string &s) {
+                return s.find_first_of("\r\n\0") != std::string::npos;
+            };
+            if (hasInvalidHeaderChar(target.host) || hasInvalidHeaderChar(node.host) || hasInvalidHeaderChar(node.option("sni"))) {
+                throw std::runtime_error("Invalid control character in TrustTunnel target/host");
+            }
             Buffer cred(username.begin(), username.end());
             cred.push_back(':');
             cred.insert(cred.end(), password.begin(), password.end());
             std::string auth = crypto::base64Encode(cred);
+            OPENSSL_cleanse(cred.data(), cred.size());
 
             std::string request;
             if (target.udp) {
@@ -731,9 +830,12 @@ void connectTrustTunnel(const Node &node, const Target &target,
                     "User-Agent: TrustTunnel-Client/1.0\r\n"
                     "Proxy-Connection: keep-alive\r\n\r\n";
             }
+            OPENSSL_cleanse(auth.data(), auth.size());
 
+            Buffer reqWire(request.begin(), request.end());
+            OPENSSL_cleanse(request.data(), request.size());
             auto reader = std::make_shared<Reader>(raw);
-            raw->write(Buffer(request.begin(), request.end()),
+            raw->write(std::move(reqWire),
                        [raw, reader, target, completion = std::move(completion)](Error writeErr) mutable {
                 if (!writeErr.empty()) {
                     raw->close();
@@ -747,12 +849,22 @@ void connectTrustTunnel(const Node &node, const Target &target,
                         completion(nullptr, readErr);
                         return;
                     }
+                    // Strict RFC 9112 §4 status-line parsing: HTTP-version SP status-code SP
                     std::string statusLine(header.begin(), header.end());
                     auto eol = statusLine.find("\r\n");
                     if (eol != std::string::npos) statusLine.resize(eol);
+                    int statusCode = -1;
+                    if ((statusLine.compare(0, 9, "HTTP/1.1 ") == 0 || statusLine.compare(0, 9, "HTTP/1.0 ") == 0) &&
+                        statusLine.size() >= 12 &&
+                        std::isdigit(static_cast<unsigned char>(statusLine[9])) &&
+                        std::isdigit(static_cast<unsigned char>(statusLine[10])) &&
+                        std::isdigit(static_cast<unsigned char>(statusLine[11])) &&
+                        (statusLine.size() == 12 || statusLine[12] == ' ')) {
+                        statusCode = (statusLine[9] - '0') * 100 + (statusLine[10] - '0') * 10 + (statusLine[11] - '0');
+                    }
                     const bool accepted = target.udp
-                        ? (statusLine.find(" 101") != std::string::npos || statusLine.find(" 200") != std::string::npos)
-                        : (statusLine.find(" 200") != std::string::npos);
+                        ? (statusCode == 101 || statusCode == 200)
+                        : (statusCode == 200);
                     if (!accepted) {
                         raw->close();
                         completion(nullptr, "TrustTunnel CONNECT rejected by endpoint");

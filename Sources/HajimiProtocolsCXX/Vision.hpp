@@ -12,6 +12,7 @@ struct VisionTraffic {
 };
 class VisionCodec {
     Buffer uuid_, input_;
+    size_t inputOffset_ = 0;
     std::shared_ptr<VisionTraffic> traffic_;
     bool canDirect_, firstWrite_ = true, paddingWrite_ = true, directWrite_ = false;
     bool firstRead_ = true, paddingRead_ = true;
@@ -24,6 +25,6 @@ public:
     Buffer initialPadding();
     Buffer encode(const Buffer &, bool &switchDirect);
     Buffer decode(const Buffer &, bool &switchDirect);
-    bool truncated() const { return !input_.empty(); }
+    bool truncated() const { return inputOffset_ < input_.size(); }
 };
 } // namespace hajimi

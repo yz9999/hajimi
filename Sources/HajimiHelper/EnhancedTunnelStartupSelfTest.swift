@@ -678,8 +678,12 @@ enum EnhancedTunnelStartupSelfTest {
             _ = try service.stop(caller: owner, sessionToken: ready.state.sessionToken)
         }
         try expect(HelperSocketServer.isAuthorizedPeerExecutablePath("/Applications/哈基米.app/Contents/MacOS/HajimiApp")
+                   && HelperSocketServer.isAuthorizedPeerExecutablePath("/Applications/哈基米.app/Contents/MacOS/Hajimi")
                    && HelperSocketServer.isAuthorizedPeerExecutablePath("/Users/test/Build/Products/Release/HajimiApp")
                    && HelperSocketServer.isAuthorizedPeerExecutablePath("/tmp/hajimi-test-support/HajimiHelperSelfTest")
+                   && !HelperSocketServer.isAuthorizedPeerExecutablePath("/tmp/HajimiApp")
+                   && !HelperSocketServer.isAuthorizedPeerExecutablePath("/private/tmp/HajimiApp")
+                   && !HelperSocketServer.isAuthorizedPeerExecutablePath("/Users/test/Downloads/unknown-tool")
                    && !HelperSocketServer.isAuthorizedPeerExecutablePath("/usr/bin/python3")
                    && !HelperSocketServer.isAuthorizedPeerExecutablePath("/usr/bin/nc"),
                    "HelperSocketServer peer executable path whitelist rejected valid client or allowed foreign process")

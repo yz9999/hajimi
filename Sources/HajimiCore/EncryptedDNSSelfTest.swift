@@ -94,6 +94,43 @@ extension EncryptedDNSSelfTest {
         }
         try expect(ddrQ.name == "_dns.resolver.arpa" && ddrQ.type == 64 && ddrQ.class == 1,
                    "RFC 9462 DDR 探测问题名称或 SVCB (64) 类型错误")
+
+        // 6. RFC 9460 / RFC 9849 ECHConfigList extraction & RFC 9462 DDR IP-binding verification
+        var ddrResp = Data([0x42, 0x42, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00])
+        ddrResp.append(ddr.dropFirst(12)) // Question: _dns.resolver.arpa IN SVCB
+        ddrResp.append(contentsOf: [0xC0, 0x0C, 0x00, 0x40, 0x00, 0x01, 0x00, 0x00, 0x0E, 0x10]) // Owner ptr, SVCB(64), IN, TTL=3600
+        var svcbRdata = Data([0x00, 0x01]) // SvcPriority = 1
+        // TargetName: dns.cloudflare.com.
+        svcbRdata.append(UInt8(3))
+        svcbRdata.append(contentsOf: "dns".utf8)
+        svcbRdata.append(UInt8(10))
+        svcbRdata.append(contentsOf: "cloudflare".utf8)
+        svcbRdata.append(UInt8(3))
+        svcbRdata.append(contentsOf: "com".utf8)
+        svcbRdata.append(UInt8(0))
+        // key 1 (alpn): h2
+        svcbRdata.append(contentsOf: [0x00, 0x01, 0x00, 0x03, 0x02] as [UInt8])
+        svcbRdata.append(contentsOf: "h2".utf8)
+        // key 4 (ipv4hint): 1.1.1.1
+        svcbRdata.append(contentsOf: [0x00, 0x04, 0x00, 0x04, 1, 1, 1, 1])
+        // key 5 (ech): ECHConfigList { len=8, version=0xfe0d, cfgLen=4, body=[1,2,3,4] }
+        let sampleECHList = Data([0x00, 0x08, 0xFE, 0x0D, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04])
+        svcbRdata.append(contentsOf: [0x00, 0x05, 0x00, UInt8(sampleECHList.count)])
+        svcbRdata.append(sampleECHList)
+        // key 7 (dohpath): /dns-query{?dns}
+        let dohTemplate = Array("/dns-query{?dns}".utf8)
+        svcbRdata.append(contentsOf: [0x00, 0x07, 0x00, UInt8(dohTemplate.count)] + dohTemplate)
+        ddrResp.append(contentsOf: [UInt8(svcbRdata.count >> 8), UInt8(svcbRdata.count & 0xFF)])
+        ddrResp.append(svcbRdata)
+
+        let matchedDDR = DNSMessageInspection.verifiedDDRBindings(in: ddrResp, resolverAddress: "1.1.1.1")
+        let mismatchedDDR = DNSMessageInspection.verifiedDDRBindings(in: ddrResp, resolverAddress: "9.9.9.9")
+        try expect(matchedDDR.count == 1
+                   && matchedDDR[0].hasECHConfig
+                   && matchedDDR[0].echConfigList == sampleECHList
+                   && matchedDDR[0].dohPathTemplate == "/dns-query{?dns}"
+                   && mismatchedDDR.isEmpty,
+                   "RFC 9462 DDR IP 归属校验或 RFC 9849 ECHConfigList 提取失败")
     }
 
 

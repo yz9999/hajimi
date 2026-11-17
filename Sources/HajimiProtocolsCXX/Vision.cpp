@@ -2,6 +2,7 @@
 #include "Crypto.hpp"
 #include "ProtocolStream.hpp"
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 
 namespace hajimi {
@@ -103,13 +104,25 @@ Buffer VisionCodec::encode(const Buffer &data, bool &switchDirect) {
 Buffer VisionCodec::decode(const Buffer &data, bool &switchDirect) {
     switchDirect = false;
     if (!paddingRead_) { traffic_->downlink(data.data(), data.size()); return data; }
-    if (data.size() > maximumQueuedBytes - input_.size()) throw std::runtime_error("Vision buffer limit exceeded");
+    const size_t unreadBefore = input_.size() - inputOffset_;
+    if (data.size() > maximumQueuedBytes - unreadBefore) throw std::runtime_error("Vision buffer limit exceeded");
+    if (inputOffset_ > 0 && (inputOffset_ >= 4096 || input_.size() + data.size() > maximumQueuedBytes)) {
+        if (unreadBefore == 0) {
+            input_.clear();
+        } else {
+            std::memmove(input_.data(), input_.data() + inputOffset_, unreadBefore);
+            input_.resize(unreadBefore);
+        }
+        inputOffset_ = 0;
+    }
     input_.insert(input_.end(), data.begin(), data.end());
-    size_t cursor = 0;
+    size_t cursor = inputOffset_;
     if (firstRead_) {
-        if (input_.size() < 16) return {};
-        if (!std::equal(uuid_.begin(), uuid_.end(), input_.begin())) throw std::runtime_error("Vision response UUID mismatch");
-        cursor = 16; firstRead_ = false;
+        if (input_.size() - cursor < 16) return {};
+        if (!std::equal(uuid_.begin(), uuid_.end(), input_.begin() + cursor)) {
+            throw std::runtime_error("Vision response UUID mismatch");
+        }
+        cursor += 16; firstRead_ = false;
     }
     Buffer output;
     output.reserve(input_.size() - cursor);
@@ -135,9 +148,11 @@ Buffer VisionCodec::decode(const Buffer &data, bool &switchDirect) {
             }
         }
     }
-    if (cursor > 0) {
-        if (cursor >= input_.size()) input_.clear();
-        else input_.erase(input_.begin(), input_.begin() + cursor);
+    inputOffset_ = cursor;
+    if (inputOffset_ >= input_.size()) {
+        input_.clear();
+        inputOffset_ = 0;
+        if (!paddingRead_) input_.shrink_to_fit();
     }
     return output;
 }

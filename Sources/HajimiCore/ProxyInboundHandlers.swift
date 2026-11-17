@@ -405,8 +405,22 @@ enum TunnelConnector {
     private static func httpConnect(connection: any OutboundByteStream, proxy: ProxyPolicy,
                                     target: RequestTarget,
                                     completion: @escaping (Result<(any OutboundByteStream, Data), Error>) -> Void) {
-        var request = "CONNECT \(hostPort(target.host, target.port)) HTTP/1.1\r\nHost: \(hostPort(target.host, target.port))\r\nProxy-Connection: Keep-Alive\r\n"
+        guard !target.host.isEmpty,
+              target.port > 0,
+              !target.host.utf8.contains(where: { $0 <= 0x20 || $0 == 0x7F }) else {
+            connection.cancel()
+            completion(.failure(EngineError("上游 HTTP CONNECT 目标主机或端口包含非法控制字符")))
+            return
+        }
+        let authority = hostPort(target.host, target.port)
+        var request = "CONNECT \(authority) HTTP/1.1\r\nHost: \(authority)\r\nProxy-Connection: Keep-Alive\r\n"
         if let username = proxy.username, let password = proxy.password {
+            guard !username.contains("\r"), !username.contains("\n"), !username.contains("\0"),
+                  !password.contains("\r"), !password.contains("\n"), !password.contains("\0") else {
+                connection.cancel()
+                completion(.failure(EngineError("上游 HTTP 代理凭据包含非法控制字符")))
+                return
+            }
             let token = Data("\(username):\(password)".utf8).base64EncodedString()
             request += "Proxy-Authorization: Basic \(token)\r\n"
         }
@@ -423,8 +437,12 @@ enum TunnelConnector {
                     case .failure(let error): completion(.failure(error))
                     case .success(let pair):
                         let line = String(data: pair.0, encoding: .utf8)?.components(separatedBy: "\r\n").first ?? ""
-                        let fields = line.split(separator: " ")
-                        guard fields.count >= 2, let code = Int(fields[1]), (200...299).contains(code) else {
+                        let fields = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+                        guard fields.count >= 2,
+                              fields[0].hasPrefix("HTTP/1."),
+                              fields[1].count == 3,
+                              let code = Int(fields[1]),
+                              (200...299).contains(code) else {
                             completion(.failure(EngineError("上游 HTTP 代理拒绝连接：\(line)")))
                             return
                         }

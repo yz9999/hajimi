@@ -285,16 +285,63 @@ int hajimi_parse_ip(const uint8_t *bytes, size_t length, hajimi_ip_packet *out) 
         if (payload_length > length - 40) {
             payload_length = length - 40;
         }
+        const size_t frame_end = 40 + payload_length;
+
+        // Traverse standard RFC 8200 IPv6 extension headers (bounded to 8 hops)
+        // so upper-layer TCP/UDP/ICMPv6 protocol and offset are accurately resolved.
+        uint8_t next_header = bytes[6];
+        size_t offset = 40;
+        for (unsigned ext = 0; ext < 8; ++ext) {
+            if (next_header == 0 || next_header == 43 || next_header == 60) {
+                // Hop-by-Hop (0), Routing (43), Destination Options (60)
+                if (offset + 2 > frame_end) {
+                    return HAJIMI_PARSE_MALFORMED;
+                }
+                const size_t ext_len = ((size_t)bytes[offset + 1] + 1u) * 8u;
+                if (ext_len < 8 || ext_len > frame_end - offset) {
+                    return HAJIMI_PARSE_MALFORMED;
+                }
+                next_header = bytes[offset];
+                offset += ext_len;
+            } else if (next_header == 51) {
+                // RFC 4302 Authentication Header (length in 4-octet units minus 2)
+                if (offset + 2 > frame_end) {
+                    return HAJIMI_PARSE_MALFORMED;
+                }
+                const size_t ext_len = ((size_t)bytes[offset + 1] + 2u) * 4u;
+                if (ext_len < 8 || ext_len > frame_end - offset) {
+                    return HAJIMI_PARSE_MALFORMED;
+                }
+                next_header = bytes[offset];
+                offset += ext_len;
+            } else if (next_header == 44) {
+                // RFC 8200 §4.5 / RFC 6946 Fragment Header (fixed 8 octets).
+                // Atomic fragments (FragOffset == 0 && M == 0) are traversed;
+                // non-atomic fragments are rejected because L3 reassembly is unsupported.
+                if (offset + 8 > frame_end) {
+                    return HAJIMI_PARSE_MALFORMED;
+                }
+                uint16_t frag_field;
+                memcpy(&frag_field, bytes + offset + 2, 2);
+                if ((ntohs(frag_field) & 0xfff9u) != 0) {
+                    return HAJIMI_PARSE_UNSUPPORTED;
+                }
+                next_header = bytes[offset];
+                offset += 8;
+            } else {
+                break;
+            }
+        }
 
         memcpy(out->source, bytes + 8, 16);
         memcpy(out->destination, bytes + 24, 16);
 
         out->version = 6;
-        out->protocol = bytes[6];
+        out->protocol = next_header;
         out->address_length = 16;
-        out->header_length = 40;
-        out->payload_offset = 40;
-        out->payload_length = (uint32_t)payload_length;
+        out->header_length = (uint32_t)offset;
+        out->payload_offset = (uint32_t)offset;
+        out->payload_length = (uint32_t)(frame_end - offset);
         return HAJIMI_PARSE_OK;
     }
 
@@ -389,7 +436,11 @@ int hajimi_parse_udp(const uint8_t *bytes, size_t length, hajimi_udp_datagram *o
     memcpy(&checksum, bytes + 6, 2);
 
     size_t total_length = ntohs(declared);
-    if (total_length < 8 || total_length > length) {
+    // RFC 768 requires UDP length >= 8 (0 is reserved for RFC 2675 IPv6 jumbograms).
+    if (total_length != 0 && total_length < 8) {
+        return HAJIMI_PARSE_MALFORMED;
+    }
+    if (total_length == 0 || total_length > length) {
         total_length = length;
     }
 
@@ -799,6 +850,34 @@ int hajimi_dataplane_self_test(void) {
         hajimi_parse_ipv4_literal("01.1.1.1", 8, parsed_ip) ||
         hajimi_parse_ipv4_literal("256.1.1.1", 9, parsed_ip)) {
         return 32;
+    }
+
+    // Verify RFC 8200 IPv6 extension header traversal (Hop-by-Hop + Atomic Fragment -> TCP)
+    uint8_t ipv6_ext[56];
+    memset(ipv6_ext, 0, sizeof(ipv6_ext));
+    ipv6_ext[0] = 0x60;
+    write16(ipv6_ext + 4, 16); // 8B Hop-by-Hop + 8B Atomic Fragment + 0B TCP body in header test
+    ipv6_ext[6] = 0;           // Next Header = Hop-by-Hop (0)
+    ipv6_ext[7] = 64;
+    ipv6_ext[8] = 0x20; ipv6_ext[9] = 0x01; ipv6_ext[23] = 0x01;
+    ipv6_ext[24] = 0x20; ipv6_ext[25] = 0x01; ipv6_ext[39] = 0x02;
+    ipv6_ext[40] = 44;         // Next Header = Fragment (44)
+    ipv6_ext[41] = 0;          // Hdr Ext Len = 0 -> 8 bytes
+    ipv6_ext[48] = 6;          // Next Header = TCP (6)
+    ipv6_ext[50] = 0; ipv6_ext[51] = 0; // Atomic fragment (offset=0, M=0)
+    if (hajimi_parse_ip(ipv6_ext, sizeof(ipv6_ext), &packet) != HAJIMI_PARSE_OK ||
+        packet.protocol != 6 || packet.payload_offset != 56 || packet.payload_length != 0) {
+        return 33;
+    }
+    // Non-atomic IPv6 fragment (M=1) must return HAJIMI_PARSE_UNSUPPORTED
+    ipv6_ext[51] = 0x01;
+    if (hajimi_parse_ip(ipv6_ext, sizeof(ipv6_ext), &packet) != HAJIMI_PARSE_UNSUPPORTED) {
+        return 34;
+    }
+    // Malformed UDP header with length = 5 (< 8) must be rejected
+    static const uint8_t bad_udp[8] = {0x30, 0x39, 0x00, 0x35, 0x00, 0x05, 0x00, 0x00};
+    if (hajimi_parse_udp(bad_udp, sizeof(bad_udp), &udp) != HAJIMI_PARSE_MALFORMED) {
+        return 35;
     }
 
     return 0;

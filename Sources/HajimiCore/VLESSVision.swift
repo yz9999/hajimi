@@ -15,29 +15,7 @@ enum VLESSVisionCommand: UInt8 {
     case direct = 2
 }
 
-/// Adaptive Traffic Morphing modes defending against nested TLS-in-TLS and
-/// website fingerprinting classifiers (USENIX Security '24 / PETS '22 RegulaTor).
-enum VLESSVisionMorphingMode: String, Equatable {
-    case standard = "standard"
-    case regulatorLogBucket = "regulator"
 
-    static let logBuckets: [Int] = [256, 384, 512, 768, 1024, 1280, 1536, 2048, 3072, 4096, 6144, 8171]
-
-    /// Computes padding length that aligns early handshake frames onto discrete
-    /// log-spaced buckets with front-loaded exponential burst decay (RegulaTor / FRONT).
-    static func regulatorPaddingLength(contentLength: Int, packetIndex: Int,
-                                       longPadding: Bool, maximumPadding: Int,
-                                       jitterByte: UInt8 = UInt8.random(in: 0...255)) -> Int {
-        guard maximumPadding > 0 else { return 0 }
-        let decay = exp(-0.22 * Double(max(0, packetIndex)))
-        let frontSurplus = longPadding ? Int(Double(320) * decay) : Int(Double(96) * decay)
-        let jitter = Int(jitterByte % 64)
-        let targetTotal = contentLength + frontSurplus + jitter
-        let bucket = logBuckets.first(where: { $0 >= targetTotal }) ?? 8171
-        let desiredPadding = max(0, bucket - contentLength)
-        return min(maximumPadding, desiredPadding)
-    }
-}
 
 /// Shared observation state for the two directions of one Vision stream.
 /// The client hello travels uplink; the server hello travels downlink. Only
@@ -116,16 +94,12 @@ final class VLESSVisionEncoder {
     private let uuid: Data
     private let traffic: VLESSVisionTrafficState
     private let canDirect: Bool
-    private let morphingMode: VLESSVisionMorphingMode
     private var includeUUID = true
     private var padding = true
     private var direct = false
-    private var encodedFrameCount = 0
 
-    init(uuid: Data, traffic: VLESSVisionTrafficState, canDirect: Bool,
-         morphingMode: VLESSVisionMorphingMode = .standard) {
+    init(uuid: Data, traffic: VLESSVisionTrafficState, canDirect: Bool) {
         self.uuid = uuid; self.traffic = traffic; self.canDirect = canDirect
-        self.morphingMode = morphingMode
     }
 
     var isDirect: Bool { direct }
@@ -172,17 +146,8 @@ final class VLESSVisionEncoder {
     private func encodeFrame(_ content: Data, command: VLESSVisionCommand,
                              longPadding: Bool) -> Data {
         let maximum = max(0, 8_192 - 21 - content.count)
-        let frameIndex = encodedFrameCount
-        encodedFrameCount += 1
         let paddingLength: Int
-        if morphingMode == .regulatorLogBucket {
-            paddingLength = VLESSVisionMorphingMode.regulatorPaddingLength(
-                contentLength: content.count,
-                packetIndex: frameIndex,
-                longPadding: longPadding,
-                maximumPadding: maximum
-            )
-        } else if content.count < 900, longPadding {
+        if content.count < 900, longPadding {
             paddingLength = min(maximum, Int.random(in: 0..<500) + 900 - content.count)
         } else {
             paddingLength = min(maximum, Int.random(in: 0..<256))
@@ -477,18 +442,16 @@ public enum VLESSVisionSelfTest {
             throw NativeOutboundError.protocolError("Surge Vision security/flow 参数解析自测失败")
         }
 
-        // Verify RegulaTor / FRONT log-bucket adaptive traffic morphing round-trip and bucket alignment.
-        let morphTraffic = VLESSVisionTrafficState()
-        let morphEncoder = VLESSVisionEncoder(uuid: uuid, traffic: morphTraffic,
-                                              canDirect: false, morphingMode: .regulatorLogBucket)
-        let morphDecoder = VLESSVisionDecoder(uuid: uuid, traffic: VLESSVisionTrafficState())
+        // Verify standard XTLS-Vision specification long-padding (>= 900B) round-trip.
+        let stdTraffic = VLESSVisionTrafficState()
+        let stdEncoder = VLESSVisionEncoder(uuid: uuid, traffic: stdTraffic, canDirect: false)
+        let stdDecoder = VLESSVisionDecoder(uuid: uuid, traffic: VLESSVisionTrafficState())
         let sampleHello = Data([0x16, 0x03, 0x01, 0x00, 0xc8] + Array(repeating: UInt8(0x41), count: 200))
-        let morphed = morphEncoder.encode(sampleHello).bytes
-        // UUID (16) + header (5) + content (205) + padding == bucket + 21
-        let totalContentPlusPad = morphed.count - 16 - 5
-        guard VLESSVisionMorphingMode.logBuckets.contains(totalContentPlusPad),
-              try morphDecoder.feed(morphed).chunks.reduce(Data(), +) == sampleHello else {
-            throw NativeOutboundError.protocolError("Vision RegulaTor 对数桶流量整形往返或桶对齐自测失败")
+        let framedHello = stdEncoder.encode(sampleHello).bytes
+        let totalContentPlusPad = framedHello.count - 16 - 5
+        guard totalContentPlusPad >= 900 && totalContentPlusPad < 1400,
+              try stdDecoder.feed(framedHello).chunks.reduce(Data(), +) == sampleHello else {
+            throw NativeOutboundError.protocolError("标准 XTLS-Vision 握手长填充往返自测失败")
         }
     }
 }

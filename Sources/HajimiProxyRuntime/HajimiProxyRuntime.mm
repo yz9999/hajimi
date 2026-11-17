@@ -521,8 +521,20 @@ void FlushCachedRuntimeInterfaces() {
         NSArray<NSString *> *protocols = _alpn;
         BOOL skip = _skipVerify;
         dispatch_queue_t queue = _queue;
+        BOOL requireTLS13Only = protocols.count > 0;
+        for (NSString *protocol in protocols) {
+            if (![protocol isEqualToString:@"h3"] && ![protocol isEqualToString:@"doq"]) {
+                requireTLS13Only = NO;
+                break;
+            }
+        }
         tlsConfiguration = ^(nw_protocol_options_t options) {
             sec_protocol_options_t security = nw_tls_copy_sec_protocol_options(options);
+            // RFC 8996: Strictly forbid deprecated TLS 1.0 and TLS 1.1 across all Apple Network.framework streams.
+            sec_protocol_options_set_min_tls_protocol_version(
+                security,
+                requireTLS13Only ? tls_protocol_version_TLSv13 : tls_protocol_version_TLSv12
+            );
             sec_protocol_options_set_tls_server_name(security, name.UTF8String);
             for (NSString *protocol in protocols)
                 sec_protocol_options_add_tls_application_protocol(security, protocol.UTF8String);
@@ -541,6 +553,7 @@ void FlushCachedRuntimeInterfaces() {
         [self finish:nil error:RuntimeError(HJProxyRuntimeErrorInvalidArgument, @"Cannot create TCP/TLS parameters")];
         return;
     }
+    nw_parameters_set_service_class(_parameters, nw_service_class_responsive_data);
     _deadline = Now() + DurationNanos(_timeout);
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
     __weak HJNetworkConnectAttempt *weakSelf = self;

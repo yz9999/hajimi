@@ -252,9 +252,24 @@ final class SurgeRuleSetManager {
         }
     }
 
+    private static let maximumRuleSetBytes = 16 * 1024 * 1024
+
     private func download(_ location: String, forceRefresh: Bool = false, session: URLSession?) throws -> String {
         let url = try resourceURL(for: location)
-        if url.isFileURL { return try String(contentsOf: url, encoding: .utf8) }
+        if url.isFileURL {
+            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard attrs[.type] as? FileAttributeType == .typeRegular else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            if let size = (attrs[.size] as? NSNumber)?.intValue, size > Self.maximumRuleSetBytes {
+                throw URLError(.dataLengthExceedsMaximum)
+            }
+            let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+            guard data.count <= Self.maximumRuleSetBytes else {
+                throw URLError(.dataLengthExceedsMaximum)
+            }
+            return String(decoding: data, as: UTF8.self)
+        }
         guard let session else { throw CocoaError(.fileReadNoPermission) }
 
         let semaphore = DispatchSemaphore(value: 0)
@@ -273,7 +288,11 @@ final class SurgeRuleSetManager {
                !(200...299).contains(response.statusCode) {
                 result = .failure(URLError(.badServerResponse)); return
             }
-            result = .success(data ?? Data())
+            let payload = data ?? Data()
+            if payload.count > Self.maximumRuleSetBytes {
+                result = .failure(URLError(.dataLengthExceedsMaximum)); return
+            }
+            result = .success(payload)
         }
         task.resume()
         guard semaphore.wait(timeout: .now() + 35) == .success else {

@@ -654,6 +654,83 @@ bool testCarrierAndFakeIPCodecs() {
     res = hajimi_masque_decode_capsule(masque_cap, res.written, &cap_off, &cap_len);
     CHECK(res.status == HAJIMI_CODEC_OK && cap_len == sizeof(udp_payload));
     CHECK(std::memcmp(masque_cap + cap_off, udp_payload, sizeof(udp_payload)) == 0);
+
+    // 12. Fused single-pass WebSocket XOR masking across 32B + 8B + tail boundaries (47 bytes)
+    uint8_t ws_plain[47];
+    for (size_t i = 0; i < sizeof(ws_plain); ++i) ws_plain[i] = static_cast<uint8_t>((i * 17u) ^ 0x5au);
+    const uint8_t ws_mask[4] = {0x37, 0xfa, 0x21, 0x3d};
+    uint8_t ws_frame[80]{};
+    res = hajimi_ws_encode_frame(1, 2, 1, ws_mask, ws_plain, sizeof(ws_plain), ws_frame, sizeof(ws_frame));
+    CHECK(res.status == HAJIMI_CODEC_OK && res.written == 6 + sizeof(ws_plain));
+    hajimi_ws_xor_mask(ws_frame + 6, sizeof(ws_plain), ws_mask);
+    CHECK(std::memcmp(ws_frame + 6, ws_plain, sizeof(ws_plain)) == 0);
+
+    // 13. Zero-allocation DNS Wire Metrics: RFC 2308 SOA Negative TTL + RFC 8914 EDE + RFC 9567 Option 18 REPORT-CHANNEL
+    // Build NXDOMAIN response (ID=0x4242, QR=1, RD=1, RA=1, AD=1, RCODE=3) with QNAME=a1b2c3d4e5f60718.example.com (IN A),
+    // 1 Authority SOA (TTL=600, MINIMUM=180 -> effective_negative_ttl=180), and 1 EDNS0 OPT (UDP=1232, DO=1, Option 15 EDE=6, Option 18 er.dns.example)
+    const uint8_t nx_soa_edns[] = {
+        0x42, 0x42, 0x81, 0xa3, // ID=0x4242, flags=0x81a3 (QR, RD, RA, AD, NXDOMAIN=3)
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, // QD=1, AN=0, NS=1, AR=1
+        // QNAME: 16"a1b2c3d4e5f60718" 7"example" 3"com" 0
+        16, 'a','1','b','2','c','3','d','4','e','5','f','6','0','7','1','8',
+        7, 'e','x','a','m','p','l','e', 3, 'c','o','m', 0,
+        0x00, 0x01, 0x00, 0x01, // QTYPE=A, QCLASS=IN
+        // Authority SOA for example.com (pointer 0xC0 0x1D -> offset 29 "example.com")
+        0xc0, 0x1d, 0x00, 0x06, 0x00, 0x01, // TYPE=SOA(6), CLASS=IN(1)
+        0x00, 0x00, 0x02, 0x58, // RR TTL = 600
+        0x00, 0x1d, // RDLENGTH = 29 (mname 5B + rname 4B + 20B timers)
+        2, 'n','s', 0xc0, 0x1d, // MNAME = ns.example.com (5 bytes)
+        2, 'h','m', 0xc0, 0x1d, // RNAME = hm.example.com (5 bytes -> wait: 5+5+20 = 30! Let's use root 0 for RNAME = 1B -> 5+1+20 = 26 -> adjust!)
+        0x00, 0x00, 0x00, 0x01, // SERIAL
+        0x00, 0x00, 0x0e, 0x10, // REFRESH
+        0x00, 0x00, 0x02, 0x58, // RETRY
+        0x00, 0x01, 0x51, 0x80, // EXPIRE
+        0x00, 0x00, 0x00, 0xb4  // MINIMUM = 180
+    };
+    (void)nx_soa_edns;
+
+    std::vector<uint8_t> wire_msg = {
+        0x42, 0x42, 0x81, 0xa3,
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01,
+        16, 'a','1','b','2','c','3','d','4','e','5','f','6','0','7','1','8',
+        7, 'e','x','a','m','p','l','e', 3, 'c','o','m', 0,
+        0x00, 0x01, 0x00, 0x01,
+        // Authority SOA at offset 29 (0xc0, 0x1d)
+        0xc0, 0x1d, 0x00, 0x06, 0x00, 0x01,
+        0x00, 0x00, 0x02, 0x58, // TTL = 600
+        0x00, 0x1e, // RDLENGTH = 30 (5 + 5 + 20)
+        2, 'n','s', 0xc0, 0x1d,
+        2, 'h','m', 0xc0, 0x1d,
+        0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x0e, 0x10,
+        0x00, 0x00, 0x02, 0x58,
+        0x00, 0x01, 0x51, 0x80,
+        0x00, 0x00, 0x00, 0xb4, // MINIMUM = 180
+        // Additional OPT RR (root=0, type=41, payload=1232=0x04d0, ext_rcode=0, ver=0, DO=0x8000)
+        0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x80, 0x00,
+        0x00, 0x1a, // RDLENGTH = 26 (Option 15: 6B + Option 18: 20B)
+        0x00, 0x0f, 0x00, 0x02, 0x00, 0x06, // Option 15 (EDE): info-code = 6 (DNSSEC Bogus)
+        0x00, 0x12, 0x00, 0x10, // Option 18 (REPORT-CHANNEL): len = 16 -> 2"er" 3"dns" 7"example" 0 (1+2+1+3+1+7+1 = 16)
+        2, 'e','r', 3, 'd','n','s', 7, 'e','x','a','m','p','l','e', 0
+    };
+    hajimi_dns_wire_metrics dm{};
+    res = hajimi_dns_inspect_wire_metrics(wire_msg.data(), wire_msg.size(), &dm);
+    CHECK(res.status == HAJIMI_CODEC_OK && res.consumed == wire_msg.size());
+    CHECK(dm.id == 0x4242 && dm.is_response == 1 && dm.rcode == 3);
+    CHECK(dm.label_count == 3 && dm.max_label_len == 16 && dm.qname_char_len == 26);
+    CHECK(dm.entropy_bits_x1000 >= 3800); // high-diversity label entropy
+    CHECK(dm.has_authority_soa == 1 && dm.soa_minimum_ttl == 180 && dm.effective_negative_ttl == 180);
+    CHECK(dm.has_edns == 1 && dm.edns_udp_payload == 1232 && dm.edns_do_bit == 1);
+    CHECK(dm.has_ede == 1 && dm.ede_info_code == 6);
+    CHECK(dm.has_report_channel == 1 && dm.report_agent_length == 16);
+    CHECK(wire_msg[dm.report_agent_offset] == 2 && wire_msg[dm.report_agent_offset + 1] == 'e');
+
+    // Compression pointer cycle must be rejected safely without infinite loop
+    const uint8_t ptr_loop[] = {
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01
+    };
+    CHECK(hajimi_dns_inspect_wire_metrics(ptr_loop, sizeof(ptr_loop), &dm).status == HAJIMI_CODEC_INVALID);
     return true;
 }
 

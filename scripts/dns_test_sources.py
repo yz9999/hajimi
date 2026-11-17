@@ -23,6 +23,7 @@ MODULE_FILES = {
     "DNSAdaptiveUpstreamSelector.swift", "DNSQueryExecutionContext.swift",
     "DNSQueryCoordinator.swift", "DNSQueryContracts.swift",
     "DNSProtocolRulePolicy.swift",
+    "DNSWireAnalyzer.swift",
 }
 SPLIT_CORE_DNS_FILES = (
     "EncryptedDNSRoutedTLSAttempt.swift",
@@ -33,6 +34,7 @@ SPLIT_CORE_DNS_FILES = (
     "ProxyInboundHandlers.swift",
     "NetworkConnectivityDiagnosticsRouting.swift",
     "LocalProcessSocketCache.swift",
+    "ProxyEngineDNSTransports.swift",
 )
 _INPUTS: dict[Path, str] = {}
 

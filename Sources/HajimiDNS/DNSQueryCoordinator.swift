@@ -110,13 +110,18 @@ package final class DNSQueryCoordinator {
     // These slots describe logical queries, not native cancellation/FD ACKs.
     private var running = Set<UUID>()
     private var waiting: [QueuedLeader] = []
+    private let serveStaleOnFailure: Bool
+    private let failureDampeningTTL: TimeInterval
+    private var failureCooldowns: [Key: DispatchTime] = [:]
     private var pumping = false, invalidating = false
-    private var upstreamQueries = 0, cacheHits = 0, mergedQueries = 0
+    private var upstreamQueries = 0, cacheHits = 0, mergedQueries = 0, staleFallbacks = 0
 
     package init(cache: DNSQueryCache = DNSQueryCache(), maximumPending: Int = 512,
          maximumWaiters: Int = 512, maximumWaitersPerQuery: Int = 64,
          maximumActiveUpstreams: Int = 16,
          timeout: DispatchTimeInterval = .seconds(8),
+         serveStaleOnFailure: Bool = false,
+         failureDampeningTTL: TimeInterval = 0,
          observer: any DNSQueryObserver,
          classifyFailure: @escaping (Error) -> DNSQueryFailureClassification,
          makeInvalidResponseError: @escaping () -> Error) {
@@ -129,6 +134,8 @@ package final class DNSQueryCoordinator {
         self.maximumWaitersPerQuery = max(0, maximumWaitersPerQuery)
         self.maximumActiveUpstreams = min(max(0, maximumActiveUpstreams), max(0, maximumPending))
         self.timeout = timeout
+        self.serveStaleOnFailure = serveStaleOnFailure
+        self.failureDampeningTTL = max(0, min(failureDampeningTTL, 300))
     }
 
     @discardableResult
@@ -158,6 +165,14 @@ package final class DNSQueryCoordinator {
             let identity = prepared.coalescingIdentity
             let key = Key(scope: scope, question: identity ?? query,
                           unique: identity == nil ? id : nil)
+            if self.failureDampeningTTL > 0, key.unique == nil,
+               let cooldownUntil = self.failureCooldowns[key] {
+                if DispatchTime.now() < cooldownUntil {
+                    self.deliver(nil, to: waiter, failureReason: .upstreamOrResponse)
+                    return
+                }
+                self.failureCooldowns.removeValue(forKey: key)
+            }
             if let active = self.pending[key], DispatchTime.now() >= active.deadline {
                 self.finish(key, token: active.token, answer: nil, deadlineExpired: true)
             }
@@ -222,6 +237,7 @@ package final class DNSQueryCoordinator {
             // An epoch flush must first revoke EVERY old queued factory.
             self.invalidating = true
             self.cache.removeAll()
+            self.failureCooldowns.removeAll()
             for (key, active) in Array(self.pending) {
                 self.finish(key, token: active.token, answer: nil, cancelled: true,
                             cancellationReason: .policyChanged)
@@ -311,14 +327,33 @@ package final class DNSQueryCoordinator {
                 : (permissionRevoked ? .policyChanged : cancellationReason), completion: {})
         } else { active.transport?.cancel() }
         active.transport = nil
-        let accepted = answer.flatMap { response -> Data? in
-            guard !interrupted, !expired,
-                  DNSMessageInspection.responseMatchesQuery(response, query: active.query) else { return nil }
-            return response
-        }
-        if let accepted, !fromCache, active.prepared.cacheEligible {
+        var servedFromStale = false
+        let accepted: Data? = {
+            if let response = answer, !interrupted, !expired,
+               DNSMessageInspection.responseMatchesQuery(response, query: active.query) {
+                return response
+            }
+            if !interrupted, serveStaleOnFailure, active.prepared.cacheEligible,
+               active.retirementBarrier == nil,
+               (expired || (error.map { classifyFailure($0).permitsProxyFallback } ?? true)),
+               let stale = cache.lookupStale(scopeKey: key.scope, prepared: active.prepared) {
+                servedFromStale = true
+                staleFallbacks += 1
+                diagnostics.recordDNS(.cacheHit)
+                return stale
+            }
+            return nil
+        }()
+        if let accepted, !fromCache, !servedFromStale, active.prepared.cacheEligible {
+            failureCooldowns.removeValue(forKey: key)
             let stored = cache.store(scopeKey: key.scope, prepared: active.prepared, response: accepted)
             diagnostics.recordDNS(stored ? .cacheStore : .cacheStoreRejected)
+        } else if accepted == nil, !interrupted, failureDampeningTTL > 0, key.unique == nil,
+                  (expired || failureReason == .upstreamOrResponse || failureReason == .timeout) {
+            if failureCooldowns.count >= 256, let firstKey = failureCooldowns.keys.first {
+                failureCooldowns.removeValue(forKey: firstKey)
+            }
+            failureCooldowns[key] = .now() + failureDampeningTTL
         }
         for (id, waiter) in active.waiters {
             requests.removeValue(forKey: id)

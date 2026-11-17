@@ -1,15 +1,59 @@
 #include "include/HajimiProtocolsCXX.h"
 #include "BasicProtocols.hpp"
+#include "ProtocolStream.hpp"
 #include "Crypto.hpp"
 #include "ServerProtocols.hpp"
 #include "ModernProtocols.hpp"
 #include "SSH.hpp"
+#include <array>
+#include <openssl/crypto.h>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 
 using namespace hajimi;
 static Buffer hex(const std::string &value){
     Buffer result;for(size_t offset=0;offset<value.size();offset+=2)result.push_back(uint8_t(std::stoul(value.substr(offset,2),nullptr,16)));return result;
+}
+static bool orderedWriterCoalesceSelfTest(){
+    struct DeferredCarrier final : Stream {
+        std::vector<Buffer> writes;
+        std::vector<WriteCallback> pending;
+        bool finCalled = false;
+        void write(Buffer data, WriteCallback completion) override {
+            writes.push_back(std::move(data));
+            pending.push_back(std::move(completion));
+        }
+        void read(size_t, ReadCallback cb) override { cb({}, true, {}); }
+        void close() override {}
+        void shutdownWrite(WriteCallback completion) override {
+            finCalled = true;
+            pending.push_back(std::move(completion));
+        }
+        bool supportsHalfClose() const override { return true; }
+        void step() {
+            if (pending.empty()) return;
+            auto cb = std::move(pending.front());
+            pending.erase(pending.begin());
+            cb({});
+        }
+    };
+    auto carrier = std::make_shared<DeferredCarrier>();
+    auto writer = std::make_shared<OrderedWriter>(carrier, maximumQueuedBytes, 128, 32768);
+    std::vector<int> order;
+    // First write starts active carrier write immediately; next 3 queue behind it and coalesce into 1 write!
+    writer->write({1, 2}, [&](Error e) { if (e.empty()) order.push_back(1); });
+    writer->write({3, 4, 5}, [&](Error e) { if (e.empty()) order.push_back(2); });
+    writer->write({6}, [&](Error e) { if (e.empty()) order.push_back(3); });
+    writer->write({7, 8, 9}, [&](Error e) { if (e.empty()) order.push_back(4); });
+    writer->finish([&](Error e) { if (e.empty()) order.push_back(5); });
+    if (carrier->writes.size() != 1 || carrier->writes[0] != Buffer{1, 2}) return false;
+    carrier->step(); // completes {1, 2} and flushes coalesced {3, 4, 5, 6, 7, 8, 9}
+    if (carrier->writes.size() != 2 || carrier->writes[1] != Buffer{3, 4, 5, 6, 7, 8, 9}) return false;
+    carrier->step(); // completes coalesced batch and flushes FIN
+    if (!carrier->finCalled) return false;
+    carrier->step(); // completes FIN
+    return order == std::vector<int>{1, 2, 3, 4, 5};
 }
 extern "C" int hajimi_cpp_protocol_self_test(void){
     try{
@@ -53,6 +97,28 @@ extern "C" int hajimi_cpp_protocol_self_test(void){
             if (!validateProtocol(ssrNode, false).empty() || !validateProtocol(ssrNode, true).empty()) return 11;
         }
         if (!sshSessionPoolSelfTest()) return 12;
+        if (hajimi_cpp_mlkem768_available()) {
+            std::array<uint8_t, crypto::kMLKEM768PublicKeyBytes> pk{};
+            std::array<uint8_t, crypto::kMLKEM768PrivateKeyBytes> sk{};
+            std::array<uint8_t, crypto::kMLKEM768CiphertextBytes> ct{};
+            std::array<uint8_t, crypto::kMLKEM768SharedSecretBytes> ssEnc{}, ssDec{};
+            if (!hajimi_cpp_mlkem768_keygen(pk.data(), pk.size(), sk.data(), sk.size())) return 13;
+            if (!crypto::mlkem768Encaps(pk.data(), pk.size(), ct.data(), ct.size(), ssEnc.data(), ssEnc.size())) return 14;
+            if (!hajimi_cpp_mlkem768_decaps(sk.data(), sk.size(), ct.data(), ct.size(), ssDec.data(), ssDec.size())) return 15;
+            if (CRYPTO_memcmp(ssEnc.data(), ssDec.data(), ssEnc.size()) != 0) return 16;
+            ct[0] ^= 0xff; // NIST FIPS 203 implicit rejection must yield an independent secret
+            std::array<uint8_t, crypto::kMLKEM768SharedSecretBytes> ssTampered{};
+            if (hajimi_cpp_mlkem768_decaps(sk.data(), sk.size(), ct.data(), ct.size(), ssTampered.data(), ssTampered.size()) &&
+                CRYPTO_memcmp(ssEnc.data(), ssTampered.data(), ssEnc.size()) == 0) return 17;
+            OPENSSL_cleanse(sk.data(), sk.size());
+            OPENSSL_cleanse(ssEnc.data(), ssEnc.size());
+            OPENSSL_cleanse(ssDec.data(), ssDec.size());
+            OPENSSL_cleanse(ssTampered.data(), ssTampered.size());
+        } else {
+            uint8_t dummy[32]{};
+            if (hajimi_cpp_mlkem768_keygen(dummy, sizeof(dummy), dummy, sizeof(dummy)) != 0) return 18;
+        }
+        if (!orderedWriterCoalesceSelfTest()) return 19;
         return 0;
     }catch(const std::exception &){return 99;}
 }
@@ -62,8 +128,11 @@ extern "C" size_t hajimi_cpp_http_basic_authorization(const uint8_t *username,si
         Buffer input;if(usernameLength)input.insert(input.end(),username,username+usernameLength);input.push_back(':');
         if(passwordLength)input.insert(input.end(),password,password+passwordLength);
         auto value=std::string("Basic ")+crypto::base64Encode(input);
+        OPENSSL_cleanse(input.data(), input.size());
         if(output && capacity>=value.size())std::memcpy(output,value.data(),value.size());
-        return value.size();
+        size_t outLen = value.size();
+        OPENSSL_cleanse(value.data(), value.size());
+        return outLen;
     }catch(const std::exception &){return 0;}
 }
 extern "C" size_t hajimi_cpp_socks5_reply(uint8_t reply,const uint8_t *host,size_t hostLength,uint16_t port,uint8_t *output,size_t capacity){
@@ -72,4 +141,13 @@ extern "C" size_t hajimi_cpp_socks5_reply(uint8_t reply,const uint8_t *host,size
         auto value=socksReply(reply,target);if(output && capacity>=value.size())std::memcpy(output,value.data(),value.size());
         return value.size();
     }catch(const std::exception &){return 0;}
+}
+extern "C" int hajimi_cpp_mlkem768_available(void){
+    return crypto::mlkem768Available() ? 1 : 0;
+}
+extern "C" int hajimi_cpp_mlkem768_keygen(uint8_t *publicKey,size_t publicCapacity,uint8_t *privateKey,size_t privateCapacity){
+    return crypto::mlkem768Keygen(publicKey, publicCapacity, privateKey, privateCapacity) ? 1 : 0;
+}
+extern "C" int hajimi_cpp_mlkem768_decaps(const uint8_t *privateKey,size_t privateLength,const uint8_t *ciphertext,size_t ciphertextLength,uint8_t *sharedSecret,size_t secretCapacity){
+    return crypto::mlkem768Decaps(privateKey, privateLength, ciphertext, ciphertextLength, sharedSecret, secretCapacity) ? 1 : 0;
 }

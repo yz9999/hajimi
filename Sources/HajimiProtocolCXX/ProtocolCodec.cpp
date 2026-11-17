@@ -1149,9 +1149,43 @@ extern "C" hajimi_codec_result hajimi_ws_encode_frame(
         w.bytes(mask, 4);
     }
     const size_t payload_offset = w.size;
-    w.bytes(payload, payload_length);
     if (masked != 0 && payload_length > 0) {
-        hajimi_ws_xor_mask(output + payload_offset, payload_length, mask);
+        size_t next = 0;
+        if (!w.valid || !add(w.size, payload_length, next)) { return error(HAJIMI_CODEC_LIMIT); }
+        uint8_t *dst = output + payload_offset;
+        uint64_t mask64 = 0;
+        const uint8_t mask8[8] = {
+            mask[0], mask[1], mask[2], mask[3],
+            mask[0], mask[1], mask[2], mask[3]
+        };
+        std::memcpy(&mask64, mask8, 8);
+        size_t i = 0;
+        while (i + 32 <= payload_length) {
+            uint64_t w0, w1, w2, w3;
+            std::memcpy(&w0, payload + i, 8);
+            std::memcpy(&w1, payload + i + 8, 8);
+            std::memcpy(&w2, payload + i + 16, 8);
+            std::memcpy(&w3, payload + i + 24, 8);
+            w0 ^= mask64; w1 ^= mask64; w2 ^= mask64; w3 ^= mask64;
+            std::memcpy(dst + i, &w0, 8);
+            std::memcpy(dst + i + 8, &w1, 8);
+            std::memcpy(dst + i + 16, &w2, 8);
+            std::memcpy(dst + i + 24, &w3, 8);
+            i += 32;
+        }
+        while (i + 8 <= payload_length) {
+            uint64_t word;
+            std::memcpy(&word, payload + i, 8);
+            word ^= mask64;
+            std::memcpy(dst + i, &word, 8);
+            i += 8;
+        }
+        for (; i < payload_length; ++i) {
+            dst[i] = static_cast<uint8_t>(payload[i] ^ mask[i & 3u]);
+        }
+        w.size = next;
+    } else {
+        w.bytes(payload, payload_length);
     }
     return ok(0, w.size);
 }
@@ -2109,4 +2143,261 @@ extern "C" hajimi_codec_result hajimi_masque_decode_capsule(
     *payload_offset_out = prefix + ctx_res.consumed;
     *payload_length_out = static_cast<size_t>(capsule_len) - ctx_res.consumed;
     return ok(prefix + static_cast<size_t>(capsule_len), *payload_length_out);
+}
+
+
+namespace {
+
+bool skipOrMeasureDNSName(
+    const uint8_t *msg, size_t msg_len, size_t start, size_t *next_offset,
+    uint16_t *char_len_out, uint16_t *label_count_out, uint8_t *max_label_out,
+    uint16_t *hex_chars_out, uint32_t *entropy_x1000_out) noexcept {
+    if (start >= msg_len) { return false; }
+    size_t cur = start;
+    size_t after_first_ptr = 0;
+    bool jumped = false;
+    size_t jumps = 0;
+    size_t total_wire = 0;
+    uint16_t char_len = 0;
+    uint16_t labels = 0;
+    uint8_t max_label = 0;
+    uint16_t hex_chars = 0;
+    uint16_t freq[256]{};
+    const bool measure = (entropy_x1000_out != nullptr);
+
+    while (true) {
+        if (cur >= msg_len) { return false; }
+        const uint8_t len = msg[cur];
+        if (len == 0) {
+            if (!jumped) { after_first_ptr = cur + 1; }
+            break;
+        }
+        if ((len & 0xc0u) == 0xc0u) {
+            if (cur + 1 >= msg_len) { return false; }
+            const size_t target = (static_cast<size_t>(len & 0x3fu) << 8) | msg[cur + 1];
+            if (target >= cur || target >= msg_len || ++jumps > 64) { return false; }
+            if (!jumped) {
+                after_first_ptr = cur + 2;
+                jumped = true;
+            }
+            cur = target;
+            continue;
+        }
+        if ((len & 0xc0u) != 0 || len > 63 || cur + 1 + len > msg_len) {
+            return false;
+        }
+        total_wire += 1 + len;
+        if (total_wire > 255) { return false; }
+        ++labels;
+        if (len > max_label) { max_label = len; }
+        if (measure) {
+            for (size_t i = 0; i < len; ++i) {
+                const uint8_t ch = lower(msg[cur + 1 + i]);
+                ++freq[ch];
+                ++char_len;
+                if ((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
+                    ++hex_chars;
+                }
+            }
+        }
+        cur += 1 + len;
+    }
+
+    if (next_offset != nullptr) { *next_offset = after_first_ptr; }
+    if (char_len_out != nullptr) { *char_len_out = char_len; }
+    if (label_count_out != nullptr) { *label_count_out = labels; }
+    if (max_label_out != nullptr) { *max_label_out = max_label; }
+    if (hex_chars_out != nullptr) { *hex_chars_out = hex_chars; }
+    if (entropy_x1000_out != nullptr) {
+        if (char_len == 0) {
+            *entropy_x1000_out = 0;
+        } else {
+            double h = 0.0;
+            const double inv_n = 1.0 / static_cast<double>(char_len);
+            for (int b = 0; b < 256; ++b) {
+                if (freq[b] != 0) {
+                    const double p = static_cast<double>(freq[b]) * inv_n;
+                    h -= p * std::log2(p);
+                }
+            }
+            *entropy_x1000_out = static_cast<uint32_t>(h * 1000.0 + 0.5);
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+extern "C" hajimi_codec_result hajimi_dns_inspect_wire_metrics(
+    const uint8_t *dns_message, size_t message_length,
+    hajimi_dns_wire_metrics *metrics_out) {
+    if (dns_message == nullptr || metrics_out == nullptr) {
+        return error(HAJIMI_CODEC_INVALID);
+    }
+    if (message_length < 12) {
+        return more(12);
+    }
+    hajimi_dns_wire_metrics m{};
+    m.id = read16(dns_message);
+    m.flags = read16(dns_message + 2);
+    m.is_response = static_cast<uint8_t>((m.flags >> 15) & 1u);
+    m.rcode = static_cast<uint8_t>(m.flags & 0x0fu);
+    m.qdcount = read16(dns_message + 4);
+    m.ancount = read16(dns_message + 6);
+    m.nscount = read16(dns_message + 8);
+    m.arcount = read16(dns_message + 10);
+
+    size_t pos = 12;
+    for (uint16_t q = 0; q < m.qdcount; ++q) {
+        size_t next = 0;
+        const bool ok_name = (q == 0)
+            ? skipOrMeasureDNSName(dns_message, message_length, pos, &next,
+                                   &m.qname_char_len, &m.label_count, &m.max_label_len,
+                                   &m.digit_or_hex_chars, &m.entropy_bits_x1000)
+            : skipOrMeasureDNSName(dns_message, message_length, pos, &next,
+                                   nullptr, nullptr, nullptr, nullptr, nullptr);
+        if (!ok_name || next + 4 > message_length) {
+            return error(HAJIMI_CODEC_INVALID);
+        }
+        if (q == 0) {
+            m.qtype = read16(dns_message + next);
+            m.qclass = read16(dns_message + next + 2);
+        }
+        pos = next + 4;
+    }
+
+    bool have_pos_ttl = false;
+    bool have_neg_ttl = false;
+    const uint32_t total_rrs = static_cast<uint32_t>(m.ancount) +
+                               static_cast<uint32_t>(m.nscount) +
+                               static_cast<uint32_t>(m.arcount);
+    if (total_rrs > 512) {
+        return error(HAJIMI_CODEC_LIMIT);
+    }
+
+    uint32_t rr_index = 0;
+    const uint32_t an_end = m.ancount;
+    const uint32_t ns_end = an_end + m.nscount;
+
+    for (; rr_index < total_rrs; ++rr_index) {
+        size_t next_name = 0;
+        if (!skipOrMeasureDNSName(dns_message, message_length, pos, &next_name,
+                                  nullptr, nullptr, nullptr, nullptr, nullptr)) {
+            return error(HAJIMI_CODEC_INVALID);
+        }
+        if (next_name + 10 > message_length) {
+            return error(HAJIMI_CODEC_INVALID);
+        }
+        const uint16_t rtype = read16(dns_message + next_name);
+        const uint16_t rclass = read16(dns_message + next_name + 2);
+        const uint32_t rttl = read32(dns_message + next_name + 4);
+        const uint16_t rdlen = read16(dns_message + next_name + 8);
+        const size_t rdata = next_name + 10;
+        if (rdata + rdlen > message_length) {
+            return error(HAJIMI_CODEC_INVALID);
+        }
+
+        if (rr_index < an_end) {
+            if (rtype != 41) {
+                if (!have_pos_ttl || rttl < m.min_positive_ttl) {
+                    m.min_positive_ttl = rttl;
+                    have_pos_ttl = true;
+                }
+            }
+            if (rtype == 5) { // CNAME
+                if (m.cname_hops < 255) { ++m.cname_hops; }
+            } else if (rtype == 64 || rtype == 65) { // SVCB / HTTPS (RFC 9460)
+                m.has_svcb_or_https = 1;
+                size_t sp = rdata;
+                if (rdlen >= 2) {
+                    const uint16_t priority = read16(dns_message + sp);
+                    sp += 2;
+                    size_t target_end = 0;
+                    if (skipOrMeasureDNSName(dns_message, rdata + rdlen, sp, &target_end,
+                                             nullptr, nullptr, nullptr, nullptr, nullptr) &&
+                        priority > 0) {
+                        sp = target_end;
+                        while (sp + 4 <= rdata + rdlen) {
+                            const uint16_t skey = read16(dns_message + sp);
+                            const uint16_t slen = read16(dns_message + sp + 2);
+                            sp += 4;
+                            if (sp + slen > rdata + rdlen) { break; }
+                            if (skey == 5 && slen > 0) { m.has_ech_config = 1; }
+                            if (skey == 7 && slen > 0 && dns_message[sp] == '/') { m.has_dohpath = 1; }
+                            sp += slen;
+                        }
+                    }
+                }
+            }
+        } else if (rr_index < ns_end) {
+            // Authority section: RFC 2308 §3 & §5 SOA negative caching TTL
+            if (rtype == 6 && (rclass & 0x7fffu) == 1) {
+                size_t mname_end = 0;
+                size_t rname_end = 0;
+                if (skipOrMeasureDNSName(dns_message, message_length, rdata, &mname_end,
+                                         nullptr, nullptr, nullptr, nullptr, nullptr) &&
+                    mname_end <= rdata + rdlen &&
+                    skipOrMeasureDNSName(dns_message, message_length, mname_end, &rname_end,
+                                         nullptr, nullptr, nullptr, nullptr, nullptr) &&
+                    rname_end + 20 <= rdata + rdlen) {
+                    const uint32_t soa_min = read32(dns_message + rname_end + 16);
+                    const uint32_t neg_ttl = std::min(rttl, soa_min);
+                    m.has_authority_soa = 1;
+                    if (!have_neg_ttl || neg_ttl < m.effective_negative_ttl) {
+                        m.soa_minimum_ttl = soa_min;
+                        m.effective_negative_ttl = neg_ttl;
+                        have_neg_ttl = true;
+                    }
+                }
+            }
+        } else {
+            // Additional section: RFC 6891 EDNS(0) OPT record (type 41)
+            if (rtype == 41 && next_name == pos + 1 && dns_message[pos] == 0) {
+                m.has_edns = 1;
+                m.edns_udp_payload = rclass;
+                m.edns_do_bit = static_cast<uint8_t>((rttl >> 15) & 1u);
+                const uint8_t ext_rcode = static_cast<uint8_t>((rttl >> 24) & 0xffu);
+                if (ext_rcode != 0) {
+                    // Preserve 4-bit low RCODE if standard, or saturate extended RCODE indicator
+                    m.rcode = static_cast<uint8_t>(std::min<uint16_t>(255u, (static_cast<uint16_t>(ext_rcode) << 4) | (m.flags & 0x0fu)));
+                }
+                size_t opt = rdata;
+                while (opt + 4 <= rdata + rdlen) {
+                    const uint16_t opt_code = read16(dns_message + opt);
+                    const uint16_t opt_len = read16(dns_message + opt + 2);
+                    opt += 4;
+                    if (opt + opt_len > rdata + rdlen) {
+                        return error(HAJIMI_CODEC_INVALID);
+                    }
+                    if (opt_code == 15 && opt_len >= 2 && !m.has_ede) { // RFC 8914 EDE
+                        m.has_ede = 1;
+                        m.ede_info_code = read16(dns_message + opt);
+                    } else if (opt_code == 18 && opt_len >= 1 && !m.has_report_channel) { // RFC 9567 REPORT-CHANNEL
+                        // Must be an uncompressed wire-format domain name inside the option payload
+                        size_t agent_end = 0;
+                        bool uncompressed = true;
+                        for (size_t k = 0; k < opt_len; ) {
+                            const uint8_t lbl = dns_message[opt + k];
+                            if (lbl == 0) { agent_end = opt + k + 1; break; }
+                            if ((lbl & 0xc0u) != 0 || lbl > 63 || k + 1 + lbl > opt_len) {
+                                uncompressed = false;
+                                break;
+                            }
+                            k += 1 + lbl;
+                        }
+                        if (uncompressed && agent_end == opt + opt_len && opt_len > 1) {
+                            m.has_report_channel = 1;
+                            m.report_agent_offset = opt;
+                            m.report_agent_length = opt_len;
+                        }
+                    }
+                    opt += opt_len;
+                }
+            }
+        }
+        pos = rdata + rdlen;
+    }
+
+    *metrics_out = m;
+    return ok(pos, 0);
 }

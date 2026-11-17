@@ -262,29 +262,51 @@ class PreparedStreamDatagram final:public Datagram,public std::enable_shared_fro
         if (closed_ || !native_ || sending_ || writeQueue_.empty()) return;
         sending_ = true;
         auto self = shared_from_this();
-        NSData *payload = data(std::move(writeQueue_.front().framed));
-        const size_t sentBytes = payload.length;
+        static constexpr size_t kMaxCoalescedDatagramBytes = 32768;
+        size_t batchCount = 1;
+        size_t sentBytes = writeQueue_.front().framed.size();
+        while (batchCount < writeQueue_.size() &&
+               sentBytes + writeQueue_[batchCount].framed.size() <= kMaxCoalescedDatagramBytes) {
+            sentBytes += writeQueue_[batchCount].framed.size();
+            ++batchCount;
+        }
+        Buffer coalesced;
+        if (batchCount == 1) {
+            coalesced = std::move(writeQueue_.front().framed);
+        } else {
+            coalesced.reserve(sentBytes);
+            for (size_t i = 0; i < batchCount; ++i) {
+                coalesced.insert(coalesced.end(), writeQueue_[i].framed.begin(), writeQueue_[i].framed.end());
+                Buffer().swap(writeQueue_[i].framed);
+            }
+        }
+        NSData *payload = data(std::move(coalesced));
         const auto dispatchBytes = dispatch_data_create(payload.bytes, payload.length, nullptr, ^{ (void)payload; });
         [native_ sendContent:dispatchBytes isComplete:NO completion:^(NSError *error) {
             auto failure = cppError(error);
-            post(self->queue_, [self, sentBytes, failure] {
+            post(self->queue_, [self, batchCount, sentBytes, failure] {
                 if (self->closed_) return;
                 self->sending_ = false;
                 if (self->writeQueue_.empty()) return;
-                auto current = std::move(self->writeQueue_.front());
-                self->writeQueue_.pop_front();
+                const size_t popCount = std::min(batchCount, self->writeQueue_.size());
+                std::vector<WriteCallback> completed;
+                completed.reserve(popCount);
+                for (size_t i = 0; i < popCount; ++i) {
+                    completed.push_back(std::move(self->writeQueue_.front().completion));
+                    self->writeQueue_.pop_front();
+                }
                 self->queuedWriteBytes_ = self->queuedWriteBytes_ >= sentBytes ? self->queuedWriteBytes_ - sentBytes : 0;
                 if (!failure.empty()) {
                     auto remaining = std::move(self->writeQueue_);
                     self->writeQueue_.clear();
                     self->queuedWriteBytes_ = 0;
-                    if (current.completion) current.completion(failure);
+                    for (auto &cb : completed) if (cb) cb(failure);
                     for (auto &item : remaining) {
                         if (item.completion) item.completion(failure);
                     }
                     return;
                 }
-                if (current.completion) current.completion({});
+                for (auto &cb : completed) if (cb) cb({});
                 self->flushWrites();
             });
         }];
@@ -307,7 +329,7 @@ class PreparedStreamDatagram final:public Datagram,public std::enable_shared_fro
                     if (self->rxOffset_ == self->rxBuffer_.size()) {
                         self->rxBuffer_.clear();
                         self->rxOffset_ = 0;
-                    } else if (self->rxOffset_ >= 65536 && self->rxOffset_ * 2 >= self->rxBuffer_.size()) {
+                    } else if (self->rxOffset_ >= 16384 && self->rxOffset_ * 2 >= self->rxBuffer_.size()) {
                         self->rxBuffer_.erase(self->rxBuffer_.begin(), self->rxBuffer_.begin() + self->rxOffset_);
                         self->rxOffset_ = 0;
                     }

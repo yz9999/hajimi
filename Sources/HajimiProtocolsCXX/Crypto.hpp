@@ -34,6 +34,21 @@ std::string base64Encode(const Buffer &input);
 Buffer base64Decode(const std::string &input, bool urlSafe = false);
 bool constantTimeEqual(const Buffer &a, const Buffer &b);
 
+// NIST FIPS 203 ML-KEM-768 via OpenSSL 3.5+ EVP_PKEY provider API (RFC 10024).
+inline constexpr size_t kMLKEM768PublicKeyBytes = 1184;
+inline constexpr size_t kMLKEM768PrivateKeyBytes = 2400;
+inline constexpr size_t kMLKEM768CiphertextBytes = 1088;
+inline constexpr size_t kMLKEM768SharedSecretBytes = 32;
+bool mlkem768Available() noexcept;
+bool mlkem768Keygen(uint8_t *publicKey, size_t publicCap,
+                    uint8_t *privateKey, size_t privateCap) noexcept;
+bool mlkem768Encaps(const uint8_t *publicKey, size_t publicLen,
+                    uint8_t *ciphertext, size_t ciphertextCap,
+                    uint8_t *sharedSecret, size_t secretCap) noexcept;
+bool mlkem768Decaps(const uint8_t *privateKey, size_t privateLen,
+                    const uint8_t *ciphertext, size_t ciphertextLen,
+                    uint8_t *sharedSecret, size_t secretCap) noexcept;
+
 // Stateful, non-padding cipher: AES-{128,192,256}-CFB/CTR and ChaCha20.
 class CipherStream {
 public:

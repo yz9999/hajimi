@@ -2,6 +2,7 @@
 #include "Crypto.hpp"
 #include "ProtocolStream.hpp"
 #include <algorithm>
+#include <openssl/crypto.h>
 #include <cctype>
 #include <stdexcept>
 
@@ -38,9 +39,13 @@ void connectHttpProxyProtocol(
     request += destination;
     request += "\r\nProxy-Connection: Keep-Alive\r\n";
     if (!node.option("username").empty()) {
+        Buffer cred = bytes(node.option("username") + ":" + node.option("password"));
+        std::string encoded = crypto::base64Encode(cred);
+        OPENSSL_cleanse(cred.data(), cred.size());
         request += "Proxy-Authorization: Basic ";
-        request += crypto::base64Encode(bytes(node.option("username") + ":" + node.option("password")));
+        request += encoded;
         request += "\r\n";
+        OPENSSL_cleanse(encoded.data(), encoded.size());
     }
     request += "\r\n";
 
@@ -63,7 +68,9 @@ void connectHttpProxyProtocol(
             }
         });
     }
-    source->write(bytes(request), [source, reader, callback, finish](Error error) mutable {
+    Buffer reqWire = bytes(request);
+    OPENSSL_cleanse(request.data(), request.size());
+    source->write(std::move(reqWire), [source, reader, callback, finish](Error error) mutable {
         if (!error.empty()) {
             source->close();
             finish(nullptr, error);

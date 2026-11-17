@@ -46,7 +46,7 @@ BUILD="$ROOT/.build/$ARCH-apple-macosx/$CONFIGURATION"
 MODULE="$BUILD/HajimiCore.swiftmodule"
 if [[ ! -f "$MODULE" ]]; then MODULE="$BUILD/Modules/HajimiCore.swiftmodule"; fi
 [[ -f "$MODULE" ]] || fail "missing $CONFIGURATION HajimiCore module; complete the external build first"
-for source in ProxyEngine.swift DNSQueryModuleAdapter.swift NetworkPerformanceDiagnostics.swift; do
+for source in ProxyEngine.swift ProxyEngineDNSTransports.swift DNSQueryModuleAdapter.swift NetworkPerformanceDiagnostics.swift; do
     [[ ! "$ROOT/Sources/HajimiCore/$source" -nt "$MODULE" ]] \
         || fail "the $CONFIGURATION Core module is older than $source; complete the external build first"
 done

@@ -202,6 +202,7 @@ enum DNSModuleMain {
     static func main() throws {
         try DNSQueryCacheSelfTest.run()
         try DNSAdaptiveUpstreamSelectorSelfTest.run()
+        try DNSWireAnalyzerSelfTest.run()
         try coordinatorBoundary()
         try deadlineCapabilityBoundary()
         print("DNS module boundary passed: real import, existing wire/cache/selector vectors, coordinator merge/cache/cancel/deadline/permission, held ACK authentication/REFUSED barriers")

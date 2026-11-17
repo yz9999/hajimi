@@ -1939,6 +1939,7 @@ private enum DoHHTTPWire {
             + "Accept: application/dns-message\r\n"
             + "Content-Type: application/dns-message\r\n"
             + "Content-Length: \(query.count)\r\n"
+            + "Priority: u=0, i\r\n"
             + "Connection: keep-alive\r\n\r\n"
         var bytes = Data(headers.utf8)
         bytes.append(query)
@@ -2133,12 +2134,20 @@ private struct DoHHTTPResponseParser {
         let start = buffer.startIndex
         let end = start + count
         let prefix = Data(buffer[start..<end])
-        buffer = Data(buffer[end...])
+        if count >= buffer.count {
+            buffer.removeAll(keepingCapacity: true)
+        } else {
+            buffer.removeFirst(count)
+        }
         return prefix
     }
 
     private mutating func discardBytes(_ count: Int) {
-        buffer = Data(buffer[(buffer.startIndex + count)...])
+        if count >= buffer.count {
+            buffer.removeAll(keepingCapacity: true)
+        } else {
+            buffer.removeFirst(count)
+        }
     }
 
     private static func isHeaderToken(_ value: String) -> Bool {
@@ -2889,6 +2898,8 @@ public enum EncryptedDNSSelfTest {
                    "DoH HTTP Host 被 bootstrap 地址替换")
         try expect(headers.contains("\r\nContent-Length: \(query.count)\r\n"),
                    "DoH DNS 请求长度错误")
+        try expect(headers.contains("\r\nPriority: u=0, i\r\n"),
+                   "DoH 请求缺少 RFC 9218 交互式最高优先级标头")
         try expect(Data(wire[end.upperBound...]) == query, "DoH 请求体不匹配")
         guard let literal = DoHEndpoint("https://[::1]:8443/dns-query"),
               let literalWire = DoHHTTPWire.request(endpoint: literal, query: query) else {

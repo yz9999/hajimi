@@ -488,9 +488,27 @@ final class SubscriptionManager {
         try? String(contentsOf: cacheURL(for: location), encoding: .utf8)
     }
 
+    private static let maximumSubscriptionBytes = 16 * 1024 * 1024
+
     private func download(_ location: String) throws -> String {
         guard let url = URL(string: location) else { throw ManagerError.invalidURL(location) }
-        if url.isFileURL { return try String(contentsOf: url, encoding: .utf8) }
+        if url.isFileURL {
+            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard attrs[.type] as? FileAttributeType == .typeRegular else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            if let size = (attrs[.size] as? NSNumber)?.intValue, size > Self.maximumSubscriptionBytes {
+                throw URLError(.dataLengthExceedsMaximum)
+            }
+            let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+            guard data.count <= Self.maximumSubscriptionBytes else {
+                throw URLError(.dataLengthExceedsMaximum)
+            }
+            return String(decoding: data, as: UTF8.self)
+        }
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+            throw ManagerError.invalidURL(location)
+        }
         let semaphore = DispatchSemaphore(value: 0)
         let resultLock = NSLock()
         var result: Result<Data, Error>?
@@ -502,7 +520,11 @@ final class SubscriptionManager {
                !(200...299).contains(response.statusCode) {
                 result = .failure(ManagerError.http(response.statusCode)); return
             }
-            result = .success(data ?? Data())
+            let payload = data ?? Data()
+            if payload.count > Self.maximumSubscriptionBytes {
+                result = .failure(URLError(.dataLengthExceedsMaximum)); return
+            }
+            result = .success(payload)
         }
         task.resume()
         guard semaphore.wait(timeout: .now() + 45) == .success else {

@@ -1,3 +1,6 @@
+#if defined(__APPLE__) && !defined(__APPLE_USE_RFC_3542)
+#define __APPLE_USE_RFC_3542 1
+#endif
 #include "QUICTransport.hpp"
 #include "ProtocolCommon.hpp"
 #include "Crypto.hpp"
@@ -6,7 +9,13 @@
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <ngtcp2/ngtcp2_crypto_ossl.h>
 #include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/crypto.h>
 #include <openssl/rand.h>
+#include <netinet/in.h>
+#ifndef NGTCP2_PROTO_VER_V2
+#define NGTCP2_PROTO_VER_V2 0x6b3343cfU
+#endif
 #include <openssl/x509v3.h>
 #if defined(__APPLE__)
 #include <Security/Security.h>
@@ -450,6 +459,25 @@ Error Connection::Impl::setupSocket() {
         for (int bufSize : {4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024}) {
             if (setsockopt(candidate, SOL_SOCKET, SO_SNDBUF, &bufSize, sizeof(bufSize)) == 0) break;
         }
+        // RFC 9000 §14: QUIC packets MUST NOT be fragmented at the IP layer;
+        // enabling Don't-Fragment lets oversized probes surface EMSGSIZE to DPLPMTUD.
+#if defined(__APPLE__)
+        if (address->ai_family == AF_INET) {
+            int df = 1;
+            (void)setsockopt(candidate, IPPROTO_IP, IP_DONTFRAG, &df, sizeof(df));
+        } else if (address->ai_family == AF_INET6) {
+            int df = 1;
+            (void)setsockopt(candidate, IPPROTO_IPV6, IPV6_DONTFRAG, &df, sizeof(df));
+        }
+#elif defined(__linux__)
+        if (address->ai_family == AF_INET) {
+            int df = IP_PMTUDISC_DO;
+            (void)setsockopt(candidate, IPPROTO_IP, IP_MTU_DISCOVER, &df, sizeof(df));
+        } else if (address->ai_family == AF_INET6) {
+            int df = IPV6_PMTUDISC_DO;
+            (void)setsockopt(candidate, IPPROTO_IPV6, IPV6_MTU_DISCOVER, &df, sizeof(df));
+        }
+#endif
         if (::connect(candidate, address->ai_addr, address->ai_addrlen)) {
             ::close(candidate); continue;
         }
@@ -475,6 +503,17 @@ Error Connection::Impl::setupTLS() {
     tlsContext = SSL_CTX_new(TLS_client_method());
     if (!tlsContext || !SSL_CTX_set_min_proto_version(tlsContext, TLS1_3_VERSION))
         return "QUIC TLS context creation failed";
+    // RFC 10024 / NIST FIPS 203: Prefer post-quantum hybrid X25519MLKEM768 on OpenSSL 3.5+
+    // with seamless fallback to classical X25519 / NIST P-curves when unavailable or disabled.
+    auto pqOption = proto_common::lowerAscii(node.option("pqc", node.option("pq", "auto")));
+    bool enablePQC = (pqOption != "false" && pqOption != "0" && pqOption != "off");
+    ERR_set_mark();
+    if (!enablePQC || SSL_CTX_set1_groups_list(tlsContext, "X25519MLKEM768:X25519:P-256:P-384") != 1) {
+        ERR_pop_to_mark();
+        (void)SSL_CTX_set1_groups_list(tlsContext, "X25519:P-256:P-384");
+    } else {
+        ERR_clear_last_mark();
+    }
     auto options = tlsOptions(node, true);
     SSL_CTX_set_verify(tlsContext, options.skipVerify ? SSL_VERIFY_NONE : SSL_VERIFY_PEER, nullptr);
     verifyName = options.serverName.empty() ? node.host : options.serverName;
@@ -650,8 +689,19 @@ Error Connection::Impl::setupQUIC() {
     params.initial_max_streams_bidi = 64; params.initial_max_streams_uni = 64;
     params.max_idle_timeout = 60 * NGTCP2_SECONDS;
     params.max_datagram_frame_size = 1200;
+    // RFC 9287: Grease the QUIC fixed bit when supported by the peer.
+    params.grease_quic_bit = 1;
+    // RFC 9369 (QUIC v2) & RFC 9368 (Compatible Version Negotiation):
+    static const uint32_t kPreferredQuicVersions[] = {NGTCP2_PROTO_VER_V2, NGTCP2_PROTO_VER_V1};
+    auto quicVerOpt = proto_common::lowerAscii(node.option("quic-version", "auto"));
+    uint32_t clientQuicVersion = (quicVerOpt == "2" || quicVerOpt == "v2")
+        ? NGTCP2_PROTO_VER_V2 : NGTCP2_PROTO_VER_V1;
+    if (quicVerOpt != "1" && quicVerOpt != "v1") {
+        settings.preferred_versions = kPreferredQuicVersions;
+        settings.preferred_versionslen = 2;
+    }
     int code = ngtcp2_conn_client_new(&conn, &destination, &source, &path,
-        NGTCP2_PROTO_VER_V1, &callbacks, &settings, &params, nullptr, this);
+        clientQuicVersion, &callbacks, &settings, &params, nullptr, this);
     if (code) return "QUIC connection creation failed";
     ngtcp2_conn_set_tls_native_handle(conn, cryptoContext);
     ngtcp2_conn_set_keep_alive_timeout(conn, 10 * NGTCP2_SECONDS);
@@ -899,6 +949,8 @@ Buffer Connection::Impl::obfuscate(const uint8_t *data, size_t size, bool outbou
     result.reserve(result.size() + size - offset);
     for (size_t index = offset; index < size; ++index)
         result.push_back(data[index] ^ key[(index - offset) % key.size()]);
+    if (!material.empty()) OPENSSL_cleanse(material.data(), material.size());
+    if (!key.empty()) OPENSSL_cleanse(key.data(), key.size());
     return result;
 }
 

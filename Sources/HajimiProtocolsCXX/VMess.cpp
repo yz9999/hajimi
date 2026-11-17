@@ -2,7 +2,9 @@
 #include "Crypto.hpp"
 #include "ProtocolCommon.hpp"
 #include "ProtocolStream.hpp"
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <functional>
@@ -11,21 +13,48 @@
 #include <unordered_map>
 
 namespace hajimi {
-using Hash=std::function<Buffer(const Buffer &)>;
-static Buffer genericHMAC(const Buffer &key,const Buffer &message,const Hash &hash) {
-    Buffer normalized=key.size()>64?hash(key):key; normalized.resize(64);
-    Buffer inner(64),outer(64);
-    inner.reserve(64 + message.size());
-    outer.reserve(96);
-    for(size_t i=0;i<64;++i){inner[i]=normalized[i]^0x36;outer[i]=normalized[i]^0x5c;}
-    inner.insert(inner.end(),message.begin(),message.end()); auto result=hash(inner);
-    outer.insert(outer.end(),result.begin(),result.end()); return hash(outer);
+static void vmessKDFEval(size_t depth, const std::vector<Buffer> &path,
+                         const uint8_t *msg, size_t msgLen, uint8_t out[32]) {
+    if (depth == 0) {
+        static const uint8_t kRootSalt[] = "VMess AEAD KDF";
+        Buffer mac = crypto::hmacSlice("SHA256", kRootSalt, sizeof(kRootSalt) - 1, msg, msgLen);
+        std::memcpy(out, mac.data(), 32);
+        OPENSSL_cleanse(mac.data(), mac.size());
+        return;
+    }
+    const Buffer &salt = path[depth - 1];
+    uint8_t kPad[64]{};
+    if (salt.size() > 64) {
+        vmessKDFEval(depth - 1, path, salt.data(), salt.size(), kPad);
+    } else if (!salt.empty()) {
+        std::memcpy(kPad, salt.data(), salt.size());
+    }
+    uint8_t midHash[32];
+    if (msgLen <= 192) {
+        uint8_t innerStack[256];
+        for (size_t i = 0; i < 64; ++i) innerStack[i] = kPad[i] ^ 0x36;
+        if (msgLen > 0) std::memcpy(innerStack + 64, msg, msgLen);
+        vmessKDFEval(depth - 1, path, innerStack, 64 + msgLen, midHash);
+        OPENSSL_cleanse(innerStack, 64 + msgLen);
+    } else {
+        Buffer innerHeap(64 + msgLen);
+        for (size_t i = 0; i < 64; ++i) innerHeap[i] = kPad[i] ^ 0x36;
+        std::memcpy(innerHeap.data() + 64, msg, msgLen);
+        vmessKDFEval(depth - 1, path, innerHeap.data(), innerHeap.size(), midHash);
+        OPENSSL_cleanse(innerHeap.data(), innerHeap.size());
+    }
+    uint8_t outerStack[96];
+    for (size_t i = 0; i < 64; ++i) outerStack[i] = kPad[i] ^ 0x5c;
+    std::memcpy(outerStack + 64, midHash, 32);
+    vmessKDFEval(depth - 1, path, outerStack, 96, out);
+    OPENSSL_cleanse(kPad, sizeof(kPad));
+    OPENSSL_cleanse(midHash, sizeof(midHash));
+    OPENSSL_cleanse(outerStack, sizeof(outerStack));
 }
-Buffer vmessKDF(const Buffer &key,const std::vector<Buffer> &path) {
-    static const Buffer kVmessKdfSalt = bytes("VMess AEAD KDF");
-    Hash creator=[](const Buffer &message){return crypto::hmac("SHA256",kVmessKdfSalt,message);};
-    for(auto &salt:path){auto parent=creator;creator=[salt,parent](const Buffer &message){return genericHMAC(salt,message,parent);};}
-    return creator(key);
+Buffer vmessKDF(const Buffer &key, const std::vector<Buffer> &path) {
+    Buffer out(32);
+    vmessKDFEval(path.size(), path, key.data(), key.size(), out.data());
+    return out;
 }
 static uint32_t fnv1a(const Buffer &data) { uint32_t hash=2166136261U;for(auto byte:data)hash=(hash^byte)*16777619U;return hash; }
 static uint32_t crc32(const Buffer &data) noexcept {

@@ -8,10 +8,14 @@ extension DNSQueryCoordinator {
                      maximumWaiters: Int = 512, maximumWaitersPerQuery: Int = 64,
                      maximumActiveUpstreams: Int = 16,
                      timeout: DispatchTimeInterval = .seconds(8),
+                     serveStaleOnFailure: Bool = false,
+                     failureDampeningTTL: TimeInterval = 0,
                      diagnostics: NetworkPerformanceDiagnostics = .shared) {
         self.init(cache: cache, maximumPending: maximumPending,
                   maximumWaiters: maximumWaiters, maximumWaitersPerQuery: maximumWaitersPerQuery,
                   maximumActiveUpstreams: maximumActiveUpstreams, timeout: timeout,
+                  serveStaleOnFailure: serveStaleOnFailure,
+                  failureDampeningTTL: failureDampeningTTL,
                   observer: CoreDNSQueryObserver(diagnostics),
                   classifyFailure: CoreDNSQueryFailureAdapter.classify,
                   makeInvalidResponseError: { EncryptedDNSQueryFailure.invalidResponse })

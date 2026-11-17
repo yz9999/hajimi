@@ -1,5 +1,6 @@
 #include "Crypto.hpp"
 #include <openssl/crypto.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/core_names.h>
 #include <openssl/params.h>
@@ -258,8 +259,11 @@ Buffer passwordToKeyMD5(const std::string &password, size_t count) {
     while (result.size() < count) {
         Buffer input = previous; input.insert(input.end(),bytes.begin(),bytes.end());
         previous = digest("MD5",input);
+        OPENSSL_cleanse(input.data(), input.size());
         result.insert(result.end(),previous.begin(),previous.end());
     }
+    if (!previous.empty()) OPENSSL_cleanse(previous.data(), previous.size());
+    if (!bytes.empty()) OPENSSL_cleanse(bytes.data(), bytes.size());
     result.resize(count); return result;
 }
 
@@ -394,6 +398,16 @@ struct CipherStream::Impl {
     uint64_t chachaCounter = 0;
     std::array<uint8_t, 64> chachaBlock{};
     size_t chachaOffset = 64;
+    ~Impl() {
+        OPENSSL_cleanse(rc4S.data(), rc4S.size());
+        OPENSSL_cleanse(chachaKey.data(), chachaKey.size());
+        OPENSSL_cleanse(chachaNonce.data(), chachaNonce.size());
+        OPENSSL_cleanse(chachaBlock.data(), chachaBlock.size());
+        rc4I = 0;
+        rc4J = 0;
+        chachaCounter = 0;
+        chachaOffset = 64;
+    }
 };
 CipherStream::CipherStream(const std::string &name,const Buffer &key,const Buffer &iv,bool encrypt)
     : impl_(std::make_unique<Impl>()) {
@@ -417,6 +431,7 @@ CipherStream::CipherStream(const std::string &name,const Buffer &key,const Buffe
             j = static_cast<uint8_t>(j + impl_->rc4S[i] + actualKey[i % actualKey.size()]);
             std::swap(impl_->rc4S[i], impl_->rc4S[j]);
         }
+        OPENSSL_cleanse(actualKey.data(), actualKey.size());
         return;
     }
     if (name == "CHACHA20" || name == "chacha20") {
@@ -464,29 +479,52 @@ Buffer CipherStream::update(const Buffer &input) {
         return output;
     }
     if (impl_->mode == Impl::Mode::ChaCha20Legacy) {
-        Buffer output(input.size());
-        for (size_t idx = 0; idx < input.size(); ++idx) {
-            if (impl_->chachaOffset >= 64) {
-                std::array<uint32_t, 16> state{0x61707865, 0x3320646e, 0x79622d32, 0x6b206574};
-                for (unsigned i = 0; i < 8; ++i) state[i + 4] = load32(impl_->chachaKey.data() + i * 4);
-                state[12] = static_cast<uint32_t>(impl_->chachaCounter & 0xffffffffu);
-                state[13] = static_cast<uint32_t>((impl_->chachaCounter >> 32) & 0xffffffffu);
-                state[14] = load32(impl_->chachaNonce.data());
-                state[15] = load32(impl_->chachaNonce.data() + 4);
-                auto working = state;
-                for (unsigned i = 0; i < 10; ++i) {
-                    quarter(working, 0, 4, 8, 12); quarter(working, 1, 5, 9, 13);
-                    quarter(working, 2, 6, 10, 14); quarter(working, 3, 7, 11, 15);
-                    quarter(working, 0, 5, 10, 15); quarter(working, 1, 6, 11, 12);
-                    quarter(working, 2, 7, 8, 13); quarter(working, 3, 4, 9, 14);
-                }
-                for (unsigned i = 0; i < 16; ++i) {
-                    store32(working[i] + state[i], impl_->chachaBlock.data() + i * 4);
-                }
-                ++impl_->chachaCounter;
-                impl_->chachaOffset = 0;
+        auto refillBlock = [&]() {
+            std::array<uint32_t, 16> state{0x61707865, 0x3320646e, 0x79622d32, 0x6b206574};
+            for (unsigned i = 0; i < 8; ++i) state[i + 4] = load32(impl_->chachaKey.data() + i * 4);
+            state[12] = static_cast<uint32_t>(impl_->chachaCounter & 0xffffffffu);
+            state[13] = static_cast<uint32_t>((impl_->chachaCounter >> 32) & 0xffffffffu);
+            state[14] = load32(impl_->chachaNonce.data());
+            state[15] = load32(impl_->chachaNonce.data() + 4);
+            auto working = state;
+            for (unsigned i = 0; i < 10; ++i) {
+                quarter(working, 0, 4, 8, 12); quarter(working, 1, 5, 9, 13);
+                quarter(working, 2, 6, 10, 14); quarter(working, 3, 7, 11, 15);
+                quarter(working, 0, 5, 10, 15); quarter(working, 1, 6, 11, 12);
+                quarter(working, 2, 7, 8, 13); quarter(working, 3, 4, 9, 14);
             }
+            for (unsigned i = 0; i < 16; ++i) {
+                store32(working[i] + state[i], impl_->chachaBlock.data() + i * 4);
+            }
+            OPENSSL_cleanse(state.data(), sizeof(state));
+            OPENSSL_cleanse(working.data(), sizeof(working));
+            ++impl_->chachaCounter;
+            impl_->chachaOffset = 0;
+        };
+        Buffer output(input.size());
+        size_t idx = 0;
+        while (idx < input.size() && impl_->chachaOffset < 64) {
             output[idx] = input[idx] ^ impl_->chachaBlock[impl_->chachaOffset++];
+            ++idx;
+        }
+        while (input.size() - idx >= 64) {
+            refillBlock();
+            for (size_t w = 0; w < 64; w += 8) {
+                uint64_t a, b;
+                std::memcpy(&a, input.data() + idx + w, 8);
+                std::memcpy(&b, impl_->chachaBlock.data() + w, 8);
+                a ^= b;
+                std::memcpy(output.data() + idx + w, &a, 8);
+            }
+            impl_->chachaOffset = 64;
+            idx += 64;
+        }
+        if (idx < input.size()) {
+            refillBlock();
+            while (idx < input.size()) {
+                output[idx] = input[idx] ^ impl_->chachaBlock[impl_->chachaOffset++];
+                ++idx;
+            }
         }
         return output;
     }
@@ -494,5 +532,118 @@ Buffer CipherStream::update(const Buffer &input) {
     require(EVP_CipherUpdate(impl_->context.get(),output.data(),&written,input.data(),length(input.size())) == 1,
             "Stream cipher processing failed");
     output.resize(written); return output;
+}
+
+bool mlkem768Available() noexcept {
+    static const bool supported = []() noexcept {
+        ERR_set_mark();
+        EVP_KEYMGMT *mgmt = EVP_KEYMGMT_fetch(nullptr, "ML-KEM-768", nullptr);
+        if (mgmt) {
+            EVP_KEYMGMT_free(mgmt);
+            ERR_clear_last_mark();
+            return true;
+        }
+        ERR_pop_to_mark();
+        return false;
+    }();
+    return supported;
+}
+
+bool mlkem768Keygen(uint8_t *publicKey, size_t publicCap,
+                    uint8_t *privateKey, size_t privateCap) noexcept {
+    if (!publicKey || !privateKey ||
+        publicCap < kMLKEM768PublicKeyBytes || privateCap < kMLKEM768PrivateKeyBytes ||
+        !mlkem768Available()) {
+        return false;
+    }
+    ERR_set_mark();
+    std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> kctx(
+        EVP_PKEY_CTX_new_from_name(nullptr, "ML-KEM-768", nullptr), EVP_PKEY_CTX_free);
+    if (!kctx || EVP_PKEY_keygen_init(kctx.get()) <= 0) {
+        ERR_pop_to_mark();
+        return false;
+    }
+    EVP_PKEY *rawKey = nullptr;
+    if (EVP_PKEY_generate(kctx.get(), &rawKey) <= 0 || !rawKey) {
+        ERR_pop_to_mark();
+        return false;
+    }
+    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> pkey(rawKey, EVP_PKEY_free);
+    size_t pubLen = 0, privLen = 0;
+    if (EVP_PKEY_get_octet_string_param(pkey.get(), OSSL_PKEY_PARAM_PUB_KEY,
+                                        publicKey, publicCap, &pubLen) != 1 ||
+        EVP_PKEY_get_octet_string_param(pkey.get(), OSSL_PKEY_PARAM_PRIV_KEY,
+                                        privateKey, privateCap, &privLen) != 1 ||
+        pubLen != kMLKEM768PublicKeyBytes || privLen != kMLKEM768PrivateKeyBytes) {
+        OPENSSL_cleanse(privateKey, privateCap);
+        ERR_pop_to_mark();
+        return false;
+    }
+    ERR_clear_last_mark();
+    return true;
+}
+
+bool mlkem768Encaps(const uint8_t *publicKey, size_t publicLen,
+                    uint8_t *ciphertext, size_t ciphertextCap,
+                    uint8_t *sharedSecret, size_t secretCap) noexcept {
+    if (!publicKey || !ciphertext || !sharedSecret ||
+        publicLen != kMLKEM768PublicKeyBytes ||
+        ciphertextCap < kMLKEM768CiphertextBytes ||
+        secretCap < kMLKEM768SharedSecretBytes ||
+        !mlkem768Available()) {
+        return false;
+    }
+    ERR_set_mark();
+    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> pkey(
+        EVP_PKEY_new_raw_public_key_ex(nullptr, "ML-KEM-768", nullptr, publicKey, publicLen),
+        EVP_PKEY_free);
+    if (!pkey) {
+        ERR_pop_to_mark();
+        return false;
+    }
+    std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> ctx(
+        EVP_PKEY_CTX_new_from_pkey(nullptr, pkey.get(), nullptr), EVP_PKEY_CTX_free);
+    size_t ctLen = ciphertextCap, ssLen = secretCap;
+    if (!ctx || EVP_PKEY_encapsulate_init(ctx.get(), nullptr) <= 0 ||
+        EVP_PKEY_encapsulate(ctx.get(), ciphertext, &ctLen, sharedSecret, &ssLen) <= 0 ||
+        ctLen != kMLKEM768CiphertextBytes || ssLen != kMLKEM768SharedSecretBytes) {
+        OPENSSL_cleanse(sharedSecret, secretCap);
+        ERR_pop_to_mark();
+        return false;
+    }
+    ERR_clear_last_mark();
+    return true;
+}
+
+bool mlkem768Decaps(const uint8_t *privateKey, size_t privateLen,
+                    const uint8_t *ciphertext, size_t ciphertextLen,
+                    uint8_t *sharedSecret, size_t secretCap) noexcept {
+    if (!privateKey || !ciphertext || !sharedSecret ||
+        privateLen != kMLKEM768PrivateKeyBytes ||
+        ciphertextLen != kMLKEM768CiphertextBytes ||
+        secretCap < kMLKEM768SharedSecretBytes ||
+        !mlkem768Available()) {
+        return false;
+    }
+    ERR_set_mark();
+    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> pkey(
+        EVP_PKEY_new_raw_private_key_ex(nullptr, "ML-KEM-768", nullptr, privateKey, privateLen),
+        EVP_PKEY_free);
+    if (!pkey) {
+        ERR_pop_to_mark();
+        return false;
+    }
+    std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> ctx(
+        EVP_PKEY_CTX_new_from_pkey(nullptr, pkey.get(), nullptr), EVP_PKEY_CTX_free);
+    size_t ssLen = secretCap;
+    if (!ctx || EVP_PKEY_decapsulate_init(ctx.get(), nullptr) <= 0 ||
+        EVP_PKEY_decapsulate(ctx.get(), sharedSecret, &ssLen, ciphertext, ciphertextLen) <= 0 ||
+        ssLen != kMLKEM768SharedSecretBytes) {
+        OPENSSL_cleanse(sharedSecret, secretCap);
+        ERR_pop_to_mark();
+        return false;
+    }
+    ERR_clear_last_mark();
+    return true;
 }
 } // namespace hajimi::crypto

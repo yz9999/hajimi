@@ -61,22 +61,36 @@ uint16_t get16LE(const uint8_t *p) {
 uint32_t get32LE(const uint8_t *p) {
     return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
 }
-uint32_t crc32IEEE(const uint8_t *data, size_t len) {
+uint32_t crc32IEEE(const uint8_t *data, size_t len) noexcept {
+    static constexpr std::array<uint32_t, 256> kTable = []() constexpr {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t v = i;
+            for (unsigned b = 0; b < 8; ++b) v = (v >> 1) ^ ((v & 1u) ? 0xedb88320u : 0u);
+            t[i] = v;
+        }
+        return t;
+    }();
     uint32_t crc = 0xffffffffu;
     for (size_t i = 0; i < len; ++i) {
-        crc ^= data[i];
-        for (unsigned b = 0; b < 8; ++b) {
-            crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
-        }
+        crc = (crc >> 8) ^ kTable[(crc ^ data[i]) & 0xffu];
     }
     return ~crc;
 }
-uint32_t crc32IEEE(const Buffer &buf) { return crc32IEEE(buf.data(), buf.size()); }
-uint32_t adler32Checksum(const uint8_t *data, size_t len) {
+uint32_t crc32IEEE(const Buffer &buf) noexcept { return crc32IEEE(buf.data(), buf.size()); }
+uint32_t adler32Checksum(const uint8_t *data, size_t len) noexcept {
+    constexpr size_t kNMax = 5552; // Largest n such that 255*n*(n+1)/2 + (n+1)*(65520) <= UINT32_MAX
     uint32_t a = 1, b = 0;
-    for (size_t i = 0; i < len; ++i) {
-        a = (a + data[i]) % 65521u;
-        b = (b + a) % 65521u;
+    size_t offset = 0;
+    while (offset < len) {
+        const size_t chunk = std::min(len - offset, kNMax);
+        for (size_t i = 0; i < chunk; ++i) {
+            a += data[offset + i];
+            b += a;
+        }
+        a %= 65521u;
+        b %= 65521u;
+        offset += chunk;
     }
     return (b << 16) | a;
 }

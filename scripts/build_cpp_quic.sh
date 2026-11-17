@@ -14,7 +14,7 @@ fetch() {
     NAME=$1 VERSION=$2 HASH=$3
     ARCHIVE="$BUILD/downloads/$NAME-$VERSION.tar.xz"
     if [ ! -f "$ARCHIVE" ]; then
-        curl --fail --location --retry 2 --max-time 120 \
+        curl --proto '=https' --tlsv1.2 --fail --location --retry 2 --max-time 120 \
             "https://github.com/ngtcp2/$NAME/releases/download/v$VERSION/$NAME-$VERSION.tar.xz" \
             -o "$ARCHIVE"
     fi

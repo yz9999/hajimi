@@ -6,6 +6,7 @@
 #include "Crypto.hpp"
 #include "ProtocolStream.hpp"
 #include <libssh2.h>
+#include <openssl/crypto.h>
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
@@ -89,10 +90,36 @@ std::vector<HostPin> pins(const Node &node) {
     return result;
 }
 
+void cleanseString(std::string &s) noexcept {
+    if (!s.empty()) {
+        OPENSSL_cleanse(s.data(), s.size());
+        s.clear();
+    }
+}
+
 void initializeSSH() {
     static std::once_flag once; static int status = -1;
     std::call_once(once, [] { status = libssh2_init(0); });
     if (status) throw std::runtime_error("Cannot initialize native SSH crypto");
+}
+
+std::string selectSupportedSSHAlgorithms(LIBSSH2_SESSION *session, int methodType,
+                                         const std::vector<std::string> &preferred) {
+    const char **supported = nullptr;
+    int count = libssh2_session_supported_algs(session, methodType, &supported);
+    if (count <= 0 || !supported) return {};
+    std::set<std::string> available;
+    for (int i = 0; i < count; ++i) {
+        if (supported[i]) available.insert(supported[i]);
+    }
+    libssh2_free(session, supported);
+    std::string joined;
+    for (const auto &alg : preferred) {
+        if (!available.count(alg)) continue;
+        if (!joined.empty()) joined += ',';
+        joined += alg;
+    }
+    return joined;
 }
 
 std::string hostAlgorithms(const Node &node) {
@@ -214,6 +241,10 @@ public:
         closed_ = true;
         if (carrier_) carrier_->close();
         releaseNative();
+        cleanseString(privateKey_);
+        cleanseString(password_);
+        cleanseString(passphrase_);
+        for (auto &kv : node_.parameters) cleanseString(kv.second);
     }
 
     bool canReserveChannel() const {
@@ -563,6 +594,30 @@ void SSHConnectionSession::initializeNative() {
     auto algorithms = hostAlgorithms(node_);
     if (!algorithms.empty() && libssh2_session_method_pref(session_, LIBSSH2_METHOD_HOSTKEY, algorithms.c_str()))
         throw std::runtime_error("Cannot configure SSH host-key algorithms");
+    // Harden KEX, AEAD/CTR ciphers, and SHA-2 MACs against SHA-1/CBC downgrades and
+    // Terrapin (CVE-2023-48795) sequence-number manipulation (prefer AES-GCM over ChaCha20/EtM).
+    auto kexPref = selectSupportedSSHAlgorithms(session_, LIBSSH2_METHOD_KEX, {
+        "curve25519-sha256", "curve25519-sha256@libssh.org",
+        "ecdh-sha2-nistp256", "ecdh-sha2-nistp384", "ecdh-sha2-nistp521",
+        "diffie-hellman-group-exchange-sha256", "diffie-hellman-group14-sha256"
+    });
+    if (!kexPref.empty()) (void)libssh2_session_method_pref(session_, LIBSSH2_METHOD_KEX, kexPref.c_str());
+    auto cipherPref = selectSupportedSSHAlgorithms(session_, LIBSSH2_METHOD_CRYPT_CS, {
+        "aes128-gcm@openssh.com", "aes256-gcm@openssh.com",
+        "chacha20-poly1305@openssh.com", "aes128-ctr", "aes192-ctr", "aes256-ctr"
+    });
+    if (!cipherPref.empty()) {
+        (void)libssh2_session_method_pref(session_, LIBSSH2_METHOD_CRYPT_CS, cipherPref.c_str());
+        (void)libssh2_session_method_pref(session_, LIBSSH2_METHOD_CRYPT_SC, cipherPref.c_str());
+    }
+    auto macPref = selectSupportedSSHAlgorithms(session_, LIBSSH2_METHOD_MAC_CS, {
+        "hmac-sha2-256", "hmac-sha2-512",
+        "hmac-sha2-256-etm@openssh.com", "hmac-sha2-512-etm@openssh.com"
+    });
+    if (!macPref.empty()) {
+        (void)libssh2_session_method_pref(session_, LIBSSH2_METHOD_MAC_CS, macPref.c_str());
+        (void)libssh2_session_method_pref(session_, LIBSSH2_METHOD_MAC_SC, macPref.c_str());
+    }
 }
 
 void SSHConnectionSession::releaseNative() {
@@ -658,7 +713,7 @@ bool SSHConnectionSession::stepSessionSetup() {
                 return false;
             }
             stage_ = Stage::Ready;
-            password_.clear(); privateKey_.clear(); passphrase_.clear();
+            cleanseString(password_); cleanseString(privateKey_); cleanseString(passphrase_);
             return true;
         case Stage::Password:
             code = libssh2_userauth_password_ex(session_, username_.data(), unsigned(username_.size()), password_.data(),
@@ -670,7 +725,7 @@ bool SSHConnectionSession::stepSessionSetup() {
                 return false;
             }
             stage_ = Stage::Ready;
-            password_.clear(); privateKey_.clear(); passphrase_.clear();
+            cleanseString(password_); cleanseString(privateKey_); cleanseString(passphrase_);
             return true;
         case Stage::KeyboardInteractive:
             code = libssh2_userauth_keyboard_interactive_ex(session_, username_.data(), unsigned(username_.size()),
@@ -681,7 +736,7 @@ bool SSHConnectionSession::stepSessionSetup() {
                 return false;
             }
             stage_ = Stage::Ready;
-            password_.clear(); privateKey_.clear(); passphrase_.clear();
+            cleanseString(password_); cleanseString(privateKey_); cleanseString(passphrase_);
             return true;
         case Stage::Ready:
             return false;
@@ -776,7 +831,7 @@ void SSHConnectionSession::failSession(Error error) {
     releaseNative();
     incoming_.clear(); outgoing_.clear();
     incomingBytes_ = incomingOffset_ = outgoingBytes_ = 0;
-    privateKey_.clear(); password_.clear(); passphrase_.clear(); node_.parameters.clear();
+    cleanseString(privateKey_); cleanseString(password_); cleanseString(passphrase_); for (auto &kv : node_.parameters) cleanseString(kv.second); node_.parameters.clear();
 }
 
 class SSHSessionPool {
@@ -788,7 +843,10 @@ class SSHSessionPool {
             node.option("password") + "|" + privateKey + "|" + node.option("private-key-passphrase") + "|" +
             node.option("host-key") + "|" + node.option("host-key-algorithms") + "|" +
             (node.flag("skip-cert-verify") ? "1" : "0");
-        auto digest = crypto::digest("SHA256", Buffer(authMaterial.begin(), authMaterial.end()));
+        Buffer authBuf(authMaterial.begin(), authMaterial.end());
+        cleanseString(authMaterial);
+        auto digest = crypto::digest("SHA256", authBuf);
+        if (!authBuf.empty()) OPENSSL_cleanse(authBuf.data(), authBuf.size());
         return std::to_string(reinterpret_cast<uintptr_t>(factory)) + "|" +
                node.dialHost() + ":" + std::to_string(node.port) + "|" + crypto::base64Encode(digest);
     }

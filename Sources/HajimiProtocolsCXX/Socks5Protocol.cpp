@@ -1,5 +1,6 @@
 #include "Socks5Protocol.hpp"
 #include "BasicProtocols.hpp"
+#include <openssl/crypto.h>
 #include <stdexcept>
 #include <utility>
 
@@ -12,8 +13,11 @@ void readSocksAddressFromReader(
     if (type == 1 || type == 4) {
         reader->exactly(type == 1 ? 6 : 18, [type, completion = std::move(completion)](Buffer tail, Error error) mutable {
             if (!error.empty()) { completion({}, error); return; }
-            tail.insert(tail.begin(), type);
-            completion(std::move(tail), {});
+            Buffer out;
+            out.reserve(1 + tail.size());
+            out.push_back(type);
+            out.insert(out.end(), tail.begin(), tail.end());
+            completion(std::move(out), {});
         });
     } else if (type == 3) {
         reader->exactly(1, [reader, completion = std::move(completion)](Buffer length, Error error) mutable {
@@ -24,8 +28,12 @@ void readSocksAddressFromReader(
             uint8_t count = length[0];
             reader->exactly(size_t(count) + 2, [count, completion = std::move(completion)](Buffer tail, Error error) mutable {
                 if (!error.empty()) { completion({}, error); return; }
-                tail.insert(tail.begin(), {3, count});
-                completion(std::move(tail), {});
+                Buffer out;
+                out.reserve(2 + tail.size());
+                out.push_back(3);
+                out.push_back(count);
+                out.insert(out.end(), tail.begin(), tail.end());
+                completion(std::move(out), {});
             });
         });
     } else {
@@ -87,6 +95,12 @@ class SocksHandshake : public std::enable_shared_from_this<SocksHandshake> {
 
     void authenticate() {
         auto username = node_.option("username"), password = node_.option("password");
+        if (username.size() > 255 || password.size() > 255) {
+            if (!username.empty()) OPENSSL_cleanse(username.data(), username.size());
+            if (!password.empty()) OPENSSL_cleanse(password.data(), password.size());
+            fail("SOCKS5 RFC 1929 credential exceeds 255 octets");
+            return;
+        }
         Buffer req;
         req.reserve(3 + username.size() + password.size());
         req.push_back(1);
@@ -94,6 +108,8 @@ class SocksHandshake : public std::enable_shared_from_this<SocksHandshake> {
         req.insert(req.end(), username.begin(), username.end());
         req.push_back(uint8_t(password.size()));
         req.insert(req.end(), password.begin(), password.end());
+        if (!username.empty()) OPENSSL_cleanse(username.data(), username.size());
+        if (!password.empty()) OPENSSL_cleanse(password.data(), password.size());
         auto self = shared_from_this();
         source_->write(std::move(req), [self](Error error) {
             if (!error.empty()) { self->fail(error); return; }

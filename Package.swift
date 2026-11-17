@@ -49,6 +49,7 @@ let cppProtocolTarget: Target = .target(
     dependencies: [.target(name: "HajimiProtocolCXX")],
     publicHeadersPath: "include",
     cxxSettings: [
+        .define("__APPLE_USE_RFC_3542", .when(platforms: [.macOS, .iOS])),
         .headerSearchPath("VendorInclude"),
         .unsafeFlags(nativeProtocolIncludes)
     ],

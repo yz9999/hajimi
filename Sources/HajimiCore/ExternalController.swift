@@ -247,17 +247,81 @@ public final class ExternalController {
 
     public func handleHTTP(method: String, path: String, query: [String: String],
                            headers: [String: String], body: Data) -> (Int, Data, String) {
-        stateLock.lock(); let key = httpKey; stateLock.unlock()
-        return handleHTTP(method: method, path: path, query: query, headers: headers, body: body, key: key)
+        stateLock.lock()
+        let key = httpKey
+        let boundHost = httpAddress?.host
+        stateLock.unlock()
+        return handleHTTP(method: method, path: path, query: query, headers: headers,
+                          body: body, key: key, boundHost: boundHost)
+    }
+
+    private static func extractHostOnly(_ authorityOrOrigin: String) -> String {
+        var value = authorityOrOrigin.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let schemeSep = value.range(of: "://") {
+            value = String(value[schemeSep.upperBound...])
+        }
+        if let slash = value.firstIndex(of: "/") {
+            value = String(value[..<slash])
+        }
+        if value.hasPrefix("[") {
+            if let close = value.firstIndex(of: "]") {
+                return String(value[...close])
+            }
+            return value
+        }
+        if let colon = value.lastIndex(of: ":") {
+            return String(value[..<colon])
+        }
+        return value
+    }
+
+    private static func isLoopbackOrBoundHost(_ rawHeader: String, boundHost: String?) -> Bool {
+        let host = extractHostOnly(rawHeader)
+        if host == "127.0.0.1" || host == "localhost" || host == "[::1]" || host == "::1" {
+            return true
+        }
+        if let boundHost, !boundHost.isEmpty {
+            let normBound = extractHostOnly(boundHost)
+            if normBound != "0.0.0.0" && normBound != "::" && normBound != "[::]" && host == normBound {
+                return true
+            }
+        }
+        return false
     }
 
     private func handleHTTP(method: String, path: String, query: [String: String],
-                            headers: [String: String], body: Data, key: String) -> (Int, Data, String) {
-        let presented = headers["x-key"] ?? query["x-key"] ?? ""
+                            headers: [String: String], body: Data, key: String,
+                            boundHost: String? = nil) -> (Int, Data, String) {
+        // 1. DNS Rebinding defense: reject foreign Host headers on control API.
+        if let hostHeader = headers["host"], !hostHeader.isEmpty,
+           !Self.isLoopbackOrBoundHost(hostHeader, boundHost: boundHost) {
+            return json(403, ["error": "forbidden host"])
+        }
+        let verb = method.uppercased()
+        // 2. Browser CSRF defense on state-mutating requests (POST/PUT/DELETE/PATCH).
+        if verb != "GET" && verb != "HEAD" {
+            if let secFetchSite = headers["sec-fetch-site"]?.lowercased(),
+               secFetchSite != "none" && secFetchSite != "same-origin" {
+                return json(403, ["error": "cross-site request blocked"])
+            }
+            if let origin = headers["origin"], !origin.isEmpty {
+                if origin.lowercased() == "null" || !Self.isLoopbackOrBoundHost(origin, boundHost: boundHost) {
+                    return json(403, ["error": "forbidden origin"])
+                }
+            }
+            if !body.isEmpty, let contentType = headers["content-type"]?.lowercased() {
+                if contentType.hasPrefix("text/plain") ||
+                   contentType.hasPrefix("application/x-www-form-urlencoded") ||
+                   contentType.hasPrefix("multipart/form-data") {
+                    return json(415, ["error": "unsupported media type"])
+                }
+            }
+        }
+        // 3. Constant-time X-Key header authentication (query-string key disabled to prevent URL leakage).
+        let presented = headers["x-key"] ?? ""
         if !key.isEmpty, !Self.constantTimeEqual(presented, expected: key) {
             return json(401, ["error": "invalid key"])
         }
-        let verb = method.uppercased()
         switch (verb, path) {
         case ("GET", "/v1/outbound"):
             return json(200, ["mode": snapshot().mode.rawValue])
@@ -611,12 +675,16 @@ public final class ExternalController {
         case 200: reason = "OK"
         case 400: reason = "Bad Request"
         case 401: reason = "Unauthorized"
+        case 403: reason = "Forbidden"
         case 413: reason = "Content Too Large"
+        case 415: reason = "Unsupported Media Type"
         case 431: reason = "Request Header Fields Too Large"
         default: reason = "Error"
         }
         var header = "HTTP/1.1 \(status) \(reason)\r\n"
         header += "Content-Type: \(contentType)\r\n"
+        header += "X-Content-Type-Options: nosniff\r\n"
+        header += "Cache-Control: no-store\r\n"
         header += "Content-Length: \(body.count)\r\n"
         header += "Connection: close\r\n\r\n"
         var payload = Data(header.utf8)
@@ -952,6 +1020,23 @@ public enum ExternalControllerSelfTest {
                                       body: Data("{\"mode\":\"proxy\"}".utf8))
         try expect(posted.0 == 200, "设置 outbound 失败")
         try expect(backend.snapshot.mode == .proxy, "backend 未收到 outbound 切换")
+
+        // Verify query-string ?x-key= is rejected and DNS Rebinding / Browser CSRF are blocked.
+        let queryKeyLeak = keyed.handleHTTP(method: "GET", path: "/v1/outbound",
+                                            query: ["x-key": "secret"], headers: [:], body: Data())
+        try expect(queryKeyLeak.0 == 401, "URL 查询参数传递密钥必须拒绝以防日志泄露")
+        let rebindAttempt = controller.handleHTTP(method: "GET", path: "/v1/outbound",
+                                                  query: [:], headers: ["host": "rebind.attacker.example:6171"],
+                                                  body: Data())
+        try expect(rebindAttempt.0 == 403, "DNS Rebinding 非回环 Host 必须拦截")
+        let csrfOrigin = controller.handleHTTP(method: "POST", path: "/v1/outbound",
+                                               query: [:], headers: ["origin": "https://evil.example"],
+                                               body: Data("{\"mode\":\"direct\"}".utf8))
+        try expect(csrfOrigin.0 == 403, "跨源 Origin 变更请求必须拦截")
+        let csrfSecFetch = controller.handleHTTP(method: "POST", path: "/v1/outbound",
+                                                 query: [:], headers: ["sec-fetch-site": "cross-site"],
+                                                 body: Data("{\"mode\":\"direct\"}".utf8))
+        try expect(csrfSecFetch.0 == 403, "Sec-Fetch-Site: cross-site 变更请求必须拦截")
 
         let frame = ExternalController.encodeFrame(["command": "dump", "args": ["summary"]])
         try expect(frame != nil && (frame?.count ?? 0) > 4, "无法编码长度前缀帧")
