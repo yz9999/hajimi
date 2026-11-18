@@ -2,8 +2,10 @@
 #include "Crypto.hpp"
 #include "../HajimiProtocolCXX/include/HajimiProtocolCXX.h"
 #include <nghttp3/nghttp3.h>
+#include <openssl/ssl.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <cctype>
 #include <deque>
@@ -253,6 +255,9 @@ struct Authentication : std::enable_shared_from_this<Authentication> {
         if (abort()) return;
         auto self = shared_from_this();
         connection->receivePeerStreams([](std::shared_ptr<Stream> stream) { drain(stream); });
+        // Open HTTP/3 Control (0x00 + SETTINGS) and QPACK Encoder/Decoder (0x02, 0x03) streams
+        // first, then immediately open the /auth request stream in the same reactor turn (0 extra RTT)
+        // so RFC 9114 §6.2.1 SETTINGS ordering is strictly preserved and coalesced into one packet.
         connection->open(true, [self](std::shared_ptr<Stream> controlStream, Error error) {
             if (self->abort()) return;
             if (!error.empty()) { self->finish(false, error); return; }
@@ -263,29 +268,39 @@ struct Authentication : std::enable_shared_from_this<Authentication> {
                     if (self->abort()) return;
                     if (!writeErr.empty()) self->finish(false, writeErr);
                 });
-            } catch (const std::exception &e) { self->finish(false, e.what()); }
-        });
-        connection->open(false, [self](std::shared_ptr<Stream> stream, Error error) {
-            if (self->abort()) return;
-            if (!error.empty()) { self->finish(false, error); return; }
-            try {
-                auto padding = crypto::base64Encode(crypto::randomBytes(192));
-                Buffer header = qpack({{":method", "POST"}, {":scheme", "https"},
-                    {":authority", "hysteria"}, {":path", "/auth"},
-                    {"hysteria-auth", auth(self->node)}, {"hysteria-cc-rx", std::to_string(download(self->node))},
-                    {"hysteria-padding", padding}, {"content-length", "0"}});
-                Buffer request{1}; append(request, varint(header.size())); append(request, header);
-                auto response = std::make_shared<HTTP3Auth>(); response->connection = self->connection;
-                response->stream = stream; response->reader = std::make_shared<Reader>(stream, 65536);
-                response->completion = [self](bool udp, Error error) { self->finish(udp, error); };
-                response->response();
-                stream->write(std::move(request), [response](Error writeErr) {
-                    if (response->abort()) return;
-                    if (!writeErr.empty()) response->finish(false, writeErr);
-                });
-                stream->shutdownWrite([response](Error finErr) {
-                    if (response->abort()) return;
-                    if (!finErr.empty()) response->finish(false, finErr);
+                for (uint8_t uniType : {uint8_t(2), uint8_t(3)}) {
+                    self->connection->open(true, [self, uniType](std::shared_ptr<Stream> qpackStream, Error qErr) {
+                        if (self->abort()) return;
+                        if (!qErr.empty()) { self->finish(false, qErr); return; }
+                        qpackStream->write(Buffer{uniType}, [self](Error wErr) {
+                            if (self->abort()) return;
+                            if (!wErr.empty()) self->finish(false, wErr);
+                        });
+                    });
+                }
+                self->connection->open(false, [self](std::shared_ptr<Stream> stream, Error authOpenErr) {
+                    if (self->abort()) return;
+                    if (!authOpenErr.empty()) { self->finish(false, authOpenErr); return; }
+                    try {
+                        auto padding = crypto::base64Encode(crypto::randomBytes(192));
+                        Buffer header = qpack({{":method", "POST"}, {":scheme", "https"},
+                            {":authority", "hysteria"}, {":path", "/auth"},
+                            {"hysteria-auth", auth(self->node)}, {"hysteria-cc-rx", std::to_string(download(self->node))},
+                            {"hysteria-padding", padding}, {"content-length", "0"}});
+                        Buffer request{1}; append(request, varint(header.size())); append(request, header);
+                        auto response = std::make_shared<HTTP3Auth>(); response->connection = self->connection;
+                        response->stream = stream; response->reader = std::make_shared<Reader>(stream, 65536);
+                        response->completion = [self](bool udp, Error respErr) { self->finish(udp, respErr); };
+                        response->response();
+                        stream->write(std::move(request), [response](Error writeErr) {
+                            if (response->abort()) return;
+                            if (!writeErr.empty()) response->finish(false, writeErr);
+                        });
+                        stream->shutdownWrite([response](Error finErr) {
+                            if (response->abort()) return;
+                            if (!finErr.empty()) response->finish(false, finErr);
+                        });
+                    } catch (const std::exception &e) { self->finish(false, e.what()); }
                 });
             } catch (const std::exception &e) { self->finish(false, e.what()); }
         });
@@ -361,7 +376,7 @@ void hysteria1Request(std::shared_ptr<Connection> connection, Target target, boo
 
 class Hysteria2TCPStream final : public Stream, public std::enable_shared_from_this<Hysteria2TCPStream> {
     enum class HeaderStage : uint8_t { Status = 0, MsgLen, MsgBody, PadLen, PadBody, Done };
-    std::shared_ptr<quic::SharedStream> inner_;
+    std::shared_ptr<Stream> inner_;
     Buffer requestHeader_;
     bool requestDispatched_ = false;
     bool standaloneRequestInFlight_ = false;
@@ -554,7 +569,7 @@ class Hysteria2TCPStream final : public Stream, public std::enable_shared_from_t
     }
 
 public:
-    Hysteria2TCPStream(std::shared_ptr<quic::SharedStream> inner, Buffer requestHeader)
+    Hysteria2TCPStream(std::shared_ptr<Stream> inner, Buffer requestHeader)
         : inner_(std::move(inner)), requestHeader_(std::move(requestHeader)) {}
     ~Hysteria2TCPStream() override { close(); }
 
@@ -674,13 +689,22 @@ double heartbeatInterval(const Node &node) {
 }
 
 class QUICDatagram;
+class PooledQUICSession;
+static void evictQUICSession(const std::string &key, const PooledQUICSession *expected);
+static void ensureQuicPoolCleanupRegistered();
 
 class PooledQUICSession final : public std::enable_shared_from_this<PooledQUICSession> {
 public:
     using ReadyCallback = std::function<void(std::shared_ptr<PooledQUICSession>, Error)>;
 
-    PooledQUICSession(Node node, std::shared_ptr<TransportFactory> factory)
-        : node_(std::move(node)), factory_(std::move(factory)) {}
+    PooledQUICSession(Node node, const std::shared_ptr<TransportFactory> &factory, std::string poolKey, bool pooled)
+        : node_(std::move(node)),
+          factoryWeak_(factory),
+          factoryId_(reinterpret_cast<uintptr_t>(factory.get())),
+          poolKey_(std::move(poolKey)),
+          pooled_(pooled) {}
+
+    bool isPooled() const { return pooled_; }
 
     std::shared_ptr<Connection> connection() const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -693,41 +717,60 @@ public:
     }
 
     bool matchesFactory(const std::shared_ptr<TransportFactory> &f) const {
-        return !f || factory_ == f;
+        if (!f) return true;
+        if (factoryWeak_.expired()) return true;
+        return factoryId_ == reinterpret_cast<uintptr_t>(f.get());
     }
 
     bool isUsable() const {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (factoryWeak_.expired()) return false;
         return !closed_ && (!ready_ || (connection_ && !connection_->isClosed()));
     }
 
-    void ensureAuthenticated(ReadyCallback cb) {
+    void ensureAuthenticated(const std::shared_ptr<TransportFactory> &callerFactory, ReadyCallback cb) {
         bool startNow = false;
+        bool failClosed = false;
+        bool alreadyReady = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (closed_ || (ready_ && (!connection_ || connection_->isClosed()))) {
-                cb(nullptr, "QUIC connection closed");
-                return;
-            }
-            if (ready_) {
-                cb(shared_from_this(), {});
-                return;
-            }
-            waiters_.push_back(std::move(cb));
-            if (!authenticating_) {
-                authenticating_ = true;
-                startNow = true;
+                failClosed = true;
+            } else if (ready_) {
+                alreadyReady = true;
+            } else {
+                waiters_.push_back(std::move(cb));
+                if (!authenticating_) {
+                    authenticating_ = true;
+                    startNow = true;
+                }
             }
         }
+        if (failClosed) {
+            if (pooled_) evictQUICSession(poolKey_, this);
+            cb(nullptr, "QUIC connection closed");
+            return;
+        }
+        if (alreadyReady) {
+            cb(shared_from_this(), {});
+            return;
+        }
         if (!startNow) return;
+        auto dialFactory = callerFactory ? callerFactory : factoryWeak_.lock();
+        if (!dialFactory) {
+            closeSession();
+            return;
+        }
         auto self = shared_from_this();
-        authenticate(node_, factory_, [self](std::shared_ptr<Connection> conn, bool udp, Error err) {
+        authenticate(node_, dialFactory, [self](std::shared_ptr<Connection> conn, bool udp, Error err) {
             std::vector<ReadyCallback> pending;
+            bool shouldEvict = false;
             {
                 std::lock_guard<std::mutex> lock(self->mutex_);
                 self->authenticating_ = false;
                 if (!err.empty() || !conn || conn->isClosed() || self->closed_) {
                     self->closed_ = true;
+                    shouldEvict = self->pooled_;
                     if (conn) conn->close();
                     if (err.empty()) err = "QUIC connection cancelled";
                     pending = std::move(self->waiters_);
@@ -737,12 +780,15 @@ public:
                     self->ready_ = true;
                     conn->authenticated();
                     if (self->node_.type == "tuic") {
-                        heartbeat(conn, self->factory_, heartbeatInterval(self->node_));
+                        if (auto f = self->factoryWeak_.lock()) {
+                            heartbeat(conn, f, heartbeatInterval(self->node_));
+                        }
                     }
                     self->setupDatagramDispatchLocked();
                     pending = std::move(self->waiters_);
                 }
             }
+            if (shouldEvict) evictQUICSession(self->poolKey_, self.get());
             for (auto &w : pending) {
                 w(err.empty() ? self : nullptr, err);
             }
@@ -755,8 +801,16 @@ public:
     }
 
     void unregisterDatagram(uint32_t sessionId) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        udpSessions_.erase(sessionId);
+        std::shared_ptr<Connection> unpooledConn;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            udpSessions_.erase(sessionId);
+            if (!pooled_ && udpSessions_.empty()) {
+                closed_ = true;
+                unpooledConn = std::move(connection_);
+            }
+        }
+        if (unpooledConn) unpooledConn->close();
     }
 
     void closeSession() {
@@ -770,6 +824,7 @@ public:
             pending = std::move(waiters_);
             udpSessions_.clear();
         }
+        if (pooled_) evictQUICSession(poolKey_, this);
         if (conn) conn->close();
         for (auto &w : pending) w(nullptr, "QUIC connection cancelled");
     }
@@ -782,7 +837,10 @@ private:
 
     mutable std::mutex mutex_;
     Node node_;
-    std::shared_ptr<TransportFactory> factory_;
+    std::weak_ptr<TransportFactory> factoryWeak_;
+    uintptr_t factoryId_ = 0;
+    std::string poolKey_;
+    bool pooled_ = true;
     std::shared_ptr<Connection> connection_;
     bool udpSupported_ = false;
     bool authenticating_ = false;
@@ -879,20 +937,54 @@ std::string quicPoolKey(const Node &node, const std::shared_ptr<TransportFactory
     return oss.str();
 }
 
-std::shared_ptr<PooledQUICSession> acquireQUICSession(const Node &node,
-                                                      const std::shared_ptr<TransportFactory> &factory,
-                                                      bool forceNew = false) {
+static void evictQUICSession(const std::string &key, const PooledQUICSession *expected) {
+    if (key.empty()) return;
+    std::lock_guard<std::mutex> lock(quicPoolMutex());
+    auto it = quicPoolMap().find(key);
+    if (it != quicPoolMap().end() && it->second.get() == expected) {
+        quicPoolMap().erase(it);
+    }
+}
+
+static void ensureQuicPoolCleanupRegistered() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        // Initialize OpenSSL first so its OPENSSL_cleanup atexit handler is
+        // registered BEFORE resetQUICClients; LIFO atexit order then stops all
+        // QUIC background reactor threads before OpenSSL tears down providers.
+        (void)OPENSSL_init_ssl(0, nullptr);
+        std::atexit([] { resetQUICClients(); });
+    });
+}
+
+struct AcquiredQUICSession {
+    std::shared_ptr<PooledQUICSession> session;
+    bool reused = false;
+};
+
+AcquiredQUICSession acquireQUICSession(const Node &node,
+                                       const std::shared_ptr<TransportFactory> &factory,
+                                       bool forceNew = false) {
+    const bool allowPool = factory && bool(factory->after) && !node.flag("disable-session-pool", false);
+    if (!allowPool) {
+        return {std::make_shared<PooledQUICSession>(node, factory, std::string{}, false), false};
+    }
+    ensureQuicPoolCleanupRegistered();
     std::string key = quicPoolKey(node, factory);
     std::lock_guard<std::mutex> lock(quicPoolMutex());
+    for (auto it = quicPoolMap().begin(); it != quicPoolMap().end();) {
+        if (!it->second || !it->second->isUsable()) it = quicPoolMap().erase(it);
+        else ++it;
+    }
     if (!forceNew) {
         auto it = quicPoolMap().find(key);
         if (it != quicPoolMap().end() && it->second && it->second->isUsable()) {
-            return it->second;
+            return {it->second, true};
         }
     }
-    auto created = std::make_shared<PooledQUICSession>(node, factory);
+    auto created = std::make_shared<PooledQUICSession>(node, factory, key, true);
     quicPoolMap()[key] = created;
-    return created;
+    return {created, false};
 }
 
 } // namespace
@@ -932,10 +1024,12 @@ void resetQUICClient(const std::shared_ptr<TransportFactory> &factory) {
 static void connectQUICProtocolWithRetry(const Node &node, const Target &target,
                                          std::shared_ptr<TransportFactory> factory,
                                          bool forceNew, StreamCallback completion) {
-    auto session = acquireQUICSession(node, factory, forceNew);
-    session->ensureAuthenticated([node, target, factory, forceNew, completion](std::shared_ptr<PooledQUICSession> readySession, Error error) {
+    auto acquired = acquireQUICSession(node, factory, forceNew);
+    const bool wasReused = acquired.reused;
+    acquired.session->ensureAuthenticated(factory, [node, target, factory, forceNew, wasReused, completion](std::shared_ptr<PooledQUICSession> readySession, Error error) {
+        const bool isCancelled = factory && factory->cancelled && factory->cancelled();
         if (!error.empty() || !readySession) {
-            if (!forceNew) {
+            if (wasReused && !forceNew && !isCancelled) {
                 connectQUICProtocolWithRetry(node, target, factory, true, completion);
                 return;
             }
@@ -944,33 +1038,43 @@ static void connectQUICProtocolWithRetry(const Node &node, const Target &target,
         }
         auto connection = readySession->connection();
         if (!connection || connection->isClosed()) {
-            if (!forceNew) {
+            if (wasReused && !forceNew && !isCancelled) {
                 connectQUICProtocolWithRetry(node, target, factory, true, completion);
                 return;
             }
             completion(nullptr, "QUIC connection cancelled");
             return;
         }
+        const bool pooled = readySession->isPooled();
+        auto wrapStream = [pooled](std::shared_ptr<Connection> conn, std::shared_ptr<Stream> s,
+                                   std::shared_ptr<Reader> r = {}) -> std::shared_ptr<Stream> {
+            if (pooled) return std::make_shared<quic::SharedStream>(std::move(conn), std::move(s), std::move(r));
+            return std::make_shared<quic::OwnedStream>(std::move(conn), std::move(s), std::move(r));
+        };
         if (node.type == "hysteria") {
-            hysteria1Request(connection, target, false, [node, target, factory, forceNew, connection, completion](std::shared_ptr<Stream> stream,
+            hysteria1Request(connection, target, false, [node, target, factory, forceNew, wasReused, connection, wrapStream, completion](std::shared_ptr<Stream> stream,
                 std::shared_ptr<Reader> reader, uint32_t, Error error) {
+                const bool cancelledNow = factory && factory->cancelled && factory->cancelled();
                 if (!error.empty() || connection->isClosed()) {
-                    if (!forceNew && (error == "QUIC connection is closed or stream limit reached" ||
-                                      error == "QUIC peer stream limit reached" || connection->isClosed())) {
+                    if (wasReused && !forceNew && !cancelledNow &&
+                        (error == "QUIC connection is closed or stream limit reached" ||
+                         error == "QUIC peer stream limit reached" || connection->isClosed())) {
                         connectQUICProtocolWithRetry(node, target, factory, true, completion);
                         return;
                     }
                     completion(nullptr, error.empty() ? "QUIC connection cancelled" : error);
                     return;
                 }
-                completion(std::make_shared<quic::SharedStream>(connection, stream, reader), {});
+                completion(wrapStream(connection, stream, reader), {});
             });
             return;
         }
-        connection->open(false, [node, target, factory, forceNew, connection, completion](std::shared_ptr<Stream> stream, Error error) {
+        connection->open(false, [node, target, factory, forceNew, wasReused, connection, wrapStream, completion](std::shared_ptr<Stream> stream, Error error) {
+            const bool cancelledNow = factory && factory->cancelled && factory->cancelled();
             if (!error.empty() || connection->isClosed()) {
-                if (!forceNew && (error == "QUIC connection is closed or stream limit reached" ||
-                                  error == "QUIC peer stream limit reached" || connection->isClosed())) {
+                if (wasReused && !forceNew && !cancelledNow &&
+                    (error == "QUIC connection is closed or stream limit reached" ||
+                     error == "QUIC peer stream limit reached" || connection->isClosed())) {
                     connectQUICProtocolWithRetry(node, target, factory, true, completion);
                     return;
                 }
@@ -983,10 +1087,10 @@ static void connectQUICProtocolWithRetry(const Node &node, const Target &target,
                     Buffer request = encoded([&](uint8_t *out, size_t size) {
                         return hajimi_tuic5_encode_connect(&destination, out, size);
                     });
-                    stream->write(std::move(request), [stream, connection, completion](Error error) {
+                    stream->write(std::move(request), [stream, connection, wrapStream, completion](Error error) {
                         if (connection->isClosed()) { stream->close(); completion(nullptr, "QUIC connection cancelled"); return; }
                         if (!error.empty()) { stream->close(); completion(nullptr, error); return; }
-                        completion(std::make_shared<quic::SharedStream>(connection, stream), {});
+                        completion(wrapStream(connection, stream), {});
                     });
                     return;
                 }
@@ -994,8 +1098,8 @@ static void connectQUICProtocolWithRetry(const Node &node, const Target &target,
                 Buffer request = encoded([&](uint8_t *out, size_t size) {
                     return hajimi_hysteria2_encode_request(&destination, padding.data(), padding.size(), out, size);
                 });
-                auto shared = std::make_shared<quic::SharedStream>(connection, stream);
-                completion(std::make_shared<Hysteria2TCPStream>(std::move(shared), std::move(request)), {});
+                auto wrapped = wrapStream(connection, stream);
+                completion(std::make_shared<Hysteria2TCPStream>(std::move(wrapped), std::move(request)), {});
             } catch (const std::exception &e) { stream->close(); completion(nullptr, e.what()); }
         });
     });
@@ -1205,10 +1309,12 @@ void QUICDatagram::feed(Buffer bytes) {
 
 static void makeQUICDatagramWithRetry(const Node &node, std::shared_ptr<TransportFactory> factory,
                                       bool forceNew, DatagramCallback completion) {
-    auto pooled = acquireQUICSession(node, factory, forceNew);
-    pooled->ensureAuthenticated([node, factory, forceNew, completion](std::shared_ptr<PooledQUICSession> readySession, Error error) {
+    auto acquired = acquireQUICSession(node, factory, forceNew);
+    const bool wasReused = acquired.reused;
+    acquired.session->ensureAuthenticated(factory, [node, factory, forceNew, wasReused, completion](std::shared_ptr<PooledQUICSession> readySession, Error error) {
+        const bool isCancelled = factory && factory->cancelled && factory->cancelled();
         if (!error.empty() || !readySession) {
-            if (!forceNew) {
+            if (wasReused && !forceNew && !isCancelled) {
                 makeQUICDatagramWithRetry(node, factory, true, completion);
                 return;
             }
@@ -1217,7 +1323,7 @@ static void makeQUICDatagramWithRetry(const Node &node, std::shared_ptr<Transpor
         }
         auto connection = readySession->connection();
         if (!connection || connection->isClosed()) {
-            if (!forceNew) {
+            if (wasReused && !forceNew && !isCancelled) {
                 makeQUICDatagramWithRetry(node, factory, true, completion);
                 return;
             }

@@ -669,12 +669,14 @@ Error Connection::Impl::setupTLS() {
     tlsContext = SSL_CTX_new(TLS_client_method());
     if (!tlsContext || !SSL_CTX_set_min_proto_version(tlsContext, TLS1_3_VERSION))
         return "QUIC TLS context creation failed";
-    // RFC 10024 / NIST FIPS 203: Prefer post-quantum hybrid X25519MLKEM768 on OpenSSL 3.5+
-    // with seamless fallback to classical X25519 / NIST P-curves when unavailable or disabled.
-    auto pqOption = proto_common::lowerAscii(node.option("pqc", node.option("pq", "auto")));
-    bool enablePQC = (pqOption != "false" && pqOption != "0" && pqOption != "off");
+    // RFC 10024 / NIST FIPS 203: Post-quantum hybrid X25519MLKEM768 is opt-in for QUIC (`pqc=true`),
+    // because a 1216-byte hybrid key_share fragments QUIC Initial ClientHello across multiple UDP
+    // datagrams and breaks QUIC peers (e.g. aioquic / older quic-go) that lack HelloRetryRequest.
+    // When opted in, `*` prefixes instruct OpenSSL 3.5+ to send BOTH hybrid and X25519 key shares.
+    auto pqOption = proto_common::lowerAscii(node.option("pqc", node.option("pq", "off")));
+    bool enablePQC = (pqOption == "true" || pqOption == "1" || pqOption == "on");
     ERR_set_mark();
-    if (!enablePQC || SSL_CTX_set1_groups_list(tlsContext, "X25519MLKEM768:X25519:P-256:P-384") != 1) {
+    if (!enablePQC || SSL_CTX_set1_groups_list(tlsContext, "*X25519MLKEM768:*X25519:P-256:P-384") != 1) {
         ERR_pop_to_mark();
         (void)SSL_CTX_set1_groups_list(tlsContext, "X25519:P-256:P-384");
     } else {
@@ -883,6 +885,7 @@ Error Connection::Impl::setupQUIC() {
     if (node.type == "hysteria2" || node.type == "hysteria") {
         brutalUpBps_ = parseQuicBandwidthBytesPerSec(node.option("up", node.option("up-speed", node.option("upload-bandwidth"))));
         if (brutalUpBps_ > 0) {
+            brutalUpBps_ = std::max<uint64_t>(brutalUpBps_, 65536);
             brutalTokens_ = std::max<uint64_t>(65536, brutalUpBps_ / 20);
             brutalLastRefill_ = settings.initial_ts;
         }
@@ -895,14 +898,16 @@ Error Connection::Impl::setupQUIC() {
     params.initial_max_streams_bidi = 64; params.initial_max_streams_uni = 64;
     params.max_idle_timeout = 60 * NGTCP2_SECONDS;
     params.max_datagram_frame_size = 1200;
-    // RFC 9287: Grease the QUIC fixed bit when supported by the peer.
-    params.grease_quic_bit = 1;
-    // RFC 9369 (QUIC v2) & RFC 9368 (Compatible Version Negotiation):
+    if (node.flag("grease-quic-bit", false)) {
+        params.grease_quic_bit = 1;
+    }
+    // Default to RFC 9000 QUIC v1 for universal interoperability with sing-quic / quic-go / quinn;
+    // opt into RFC 9369 QUIC v2 / RFC 9368 compatible version negotiation via `quic-version=2|v2|auto`.
     static const uint32_t kPreferredQuicVersions[] = {NGTCP2_PROTO_VER_V2, NGTCP2_PROTO_VER_V1};
-    auto quicVerOpt = proto_common::lowerAscii(node.option("quic-version", "auto"));
+    auto quicVerOpt = proto_common::lowerAscii(node.option("quic-version", "1"));
     uint32_t clientQuicVersion = (quicVerOpt == "2" || quicVerOpt == "v2")
         ? NGTCP2_PROTO_VER_V2 : NGTCP2_PROTO_VER_V1;
-    if (quicVerOpt != "1" && quicVerOpt != "v1") {
+    if (quicVerOpt == "2" || quicVerOpt == "v2" || quicVerOpt == "auto") {
         settings.preferred_versions = kPreferredQuicVersions;
         settings.preferred_versionslen = 2;
     }
@@ -1282,8 +1287,9 @@ Error Connection::Impl::readPackets() {
 
 Error Connection::Impl::writePackets() {
     if (cancelled()) return "QUIC connection cancelled";
+    const bool enableOutboundEcn = !hasObfuscation() && node.flag("ecn", false);
     auto applySocketEcn = [&](uint8_t pktEcn) {
-        if (!hasObfuscation() && socket >= 0) {
+        if (enableOutboundEcn && socket >= 0) {
             int desiredEcn = static_cast<int>(pktEcn & NGTCP2_ECN_MASK);
             if (desiredEcn != lastSocketEcn_) {
                 int level = remote.ss_family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
@@ -1347,9 +1353,16 @@ Error Connection::Impl::writePackets() {
     std::vector<int64_t> ids;
     ids.reserve(streams.size());
     for (auto &entry : streams) if (!entry.second.closed) ids.push_back(entry.first);
+    std::sort(ids.begin(), ids.end(), [](int64_t a, int64_t b) {
+        bool aUni = (a & 2) != 0;
+        bool bUni = (b & 2) != 0;
+        if (aUni != bUni) return aUni > bUni;
+        return a < b;
+    });
     size_t cursor = 0;
     ngtcp2_tstamp timestamp = now();
-    if (brutalUpBps_ > 0) {
+    const bool useBrutalPacing = handshake && brutalUpBps_ > 0;
+    if (useBrutalPacing) {
         if (timestamp > brutalLastRefill_) {
             uint64_t elapsedNs = timestamp - brutalLastRefill_;
             uint64_t addBytes = static_cast<uint64_t>((static_cast<double>(brutalUpBps_) * static_cast<double>(elapsedNs)) / 1e9);
@@ -1358,7 +1371,7 @@ Error Connection::Impl::writePackets() {
             brutalLastRefill_ = timestamp;
         }
     }
-    const size_t sendQuantum = brutalUpBps_ == 0
+    const size_t sendQuantum = !useBrutalPacing
         ? std::max<size_t>(maxTxPayload_, ngtcp2_conn_get_send_quantum(conn))
         : SIZE_MAX;
     size_t burstSentBytes = 0;
@@ -1370,8 +1383,8 @@ Error Connection::Impl::writePackets() {
         return false;
     };
     for (size_t iteration = 0; iteration < 256; ++iteration) {
-        if (brutalUpBps_ > 0 && brutalTokens_ < maxTxPayload_ && iteration > 0) break;
-        if (brutalUpBps_ == 0 && burstSentBytes >= sendQuantum && iteration > 0) break;
+        if (useBrutalPacing && brutalTokens_ < maxTxPayload_ && iteration > 0) break;
+        if (!useBrutalPacing && burstSentBytes >= sendQuantum && iteration > 0) break;
         if (cancelled()) return "QUIC connection cancelled";
         ngtcp2_path_storage path; ngtcp2_path_storage_zero(&path);
         ngtcp2_pkt_info info{}; uint8_t output[1350]; ngtcp2_ssize written = 0;
@@ -1486,7 +1499,7 @@ Error Connection::Impl::writePackets() {
         if (!written) break;
         const size_t ulen = static_cast<size_t>(written);
         burstSentBytes += ulen;
-        if (brutalUpBps_ > 0) {
+        if (useBrutalPacing) {
             brutalTokens_ = (brutalTokens_ > ulen) ? (brutalTokens_ - ulen) : 0;
         }
         if (chainedDatagram) {

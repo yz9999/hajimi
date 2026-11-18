@@ -228,5 +228,180 @@ int main() {
     Target target; Buffer payload; bool malformed = false;
     try { snell::udpResponse(Buffer{4, 127, 0}, target, payload); } catch (const std::exception &) { malformed = true; }
     assert(malformed);
-    std::puts("C++ Snell: v4-v6 records (v1-v3 removed), Argon2id vector, stream EOF, UDP boundaries, and negative paths passed");
+
+    // Multi-mode Snell v4/v5 compatibility fallback + pre-reply ClientHello replay + endpoint caching
+    class CompatPeer final : public Stream, public std::enable_shared_from_this<CompatPeer> {
+    public:
+        CompatPeer(Loop &loop, unsigned version, snell::CompatMode acceptedMode, bool asyncDrop)
+            : loop_(loop), version_(version), acceptedMode_(acceptedMode), asyncDrop_(asyncDrop) {}
+        void write(Buffer data, WriteCallback completion) override {
+            auto self = shared_from_this();
+            loop_.post([self, data = std::move(data), completion = std::move(completion)]() mutable {
+                if (self->closed_) { completion("Connection reset by peer"); return; }
+                self->input_.insert(self->input_.end(), data.begin(), data.end());
+                if (self->asyncDrop_) {
+                    completion({});
+                    self->loop_.post([self] {
+                        try { self->consume(); }
+                        catch (const std::exception &) { self->close(); }
+                    });
+                    return;
+                }
+                try { self->consume(); completion({}); }
+                catch (const std::exception &) { self->close(); completion("Connection reset by peer"); }
+            });
+        }
+        void read(size_t maximum, ReadCallback completion) override {
+            assert(!pending_); maximum_ = maximum; pending_ = std::move(completion); deliver();
+        }
+        void close() override { closed_ = true; deliver(); }
+    private:
+        Loop &loop_;
+        unsigned version_;
+        snell::CompatMode acceptedMode_;
+        bool asyncDrop_ = false, closed_ = false, addressed_ = false;
+        Buffer key_, nonce_ = Buffer(12, 0);
+        std::unique_ptr<snell::Encoder> encoder_;
+        Buffer input_, output_;
+        ReadCallback pending_;
+        size_t maximum_ = 0;
+        void deliver() {
+            if (!pending_ || (output_.empty() && !closed_)) return;
+            size_t count = std::min(maximum_, output_.size());
+            Buffer result(output_.begin(), output_.begin() + count);
+            output_.erase(output_.begin(), output_.begin() + count);
+            auto cb = std::exchange(pending_, {});
+            bool eof = closed_ && output_.empty();
+            loop_.post([cb = std::move(cb), result = std::move(result), eof]() mutable {
+                cb(std::move(result), eof, {});
+            });
+        }
+        void emit(const Buffer &plain) {
+            if (!encoder_) {
+                Buffer salt(16, 0x5c);
+                encoder_ = std::make_unique<snell::Encoder>("testpsk", version_, salt, 0, acceptedMode_);
+            }
+            auto framed = encoder_->frame(plain);
+            output_.insert(output_.end(), framed.begin(), framed.end());
+            deliver();
+        }
+        void consume() {
+            if (closed_) return;
+            if (key_.empty()) {
+                if (input_.size() < 16) return;
+                Buffer salt(input_.begin(), input_.begin() + 16);
+                input_.erase(input_.begin(), input_.begin() + 16);
+                key_ = snell::deriveKeyWithMode("testpsk", salt, version_, acceptedMode_);
+            }
+            const bool extended = (acceptedMode_ == snell::CompatMode::Standard ||
+                                   acceptedMode_ == snell::CompatMode::StandardZeroPad);
+            const size_t hdrSize = extended ? 23 : 18;
+            while (input_.size() >= hdrSize) {
+                auto hdr = crypto::open(crypto::AEAD::AES128GCM, key_, nonce_,
+                                        Buffer(input_.begin(), input_.begin() + hdrSize));
+                size_t padLen = extended ? word(hdr.data() + 3) : 0;
+                size_t payLen = extended ? word(hdr.data() + 5) : word(hdr.data());
+                if (acceptedMode_ == snell::CompatMode::StandardZeroPad && padLen != 0) {
+                    throw std::runtime_error("Zero-pad server rejects non-zero padding");
+                }
+                size_t bodyCipher = payLen ? payLen + 16 : 0;
+                if (input_.size() < hdrSize + padLen + bodyCipher) return;
+                nonceNext(nonce_);
+                Buffer body(input_.begin() + hdrSize, input_.begin() + hdrSize + padLen + bodyCipher);
+                if (padLen > 0 && bodyCipher > 0) {
+                    for (size_t i = 0; i < std::min(padLen, bodyCipher); i += 2) {
+                        std::swap(body[i], body[padLen + i]);
+                    }
+                }
+                Buffer plain;
+                if (bodyCipher > 0) {
+                    plain = crypto::open(crypto::AEAD::AES128GCM, key_, nonce_,
+                                         Buffer(body.begin() + padLen, body.end()));
+                    nonceNext(nonce_);
+                }
+                input_.erase(input_.begin(), input_.begin() + hdrSize + padLen + bodyCipher);
+                if (!addressed_) {
+                    addressed_ = true;
+                    emit(Buffer{0});
+                } else {
+                    emit(plain);
+                }
+            }
+        }
+    };
+
+    const snell::CompatMode modes[] = {
+        snell::CompatMode::StandardZeroPad,
+        snell::CompatMode::Compat16Std32,
+        snell::CompatMode::Compat16RFC,
+        snell::CompatMode::Compat16Pool7
+    };
+    for (size_t idx = 0; idx < 4; ++idx) {
+        for (bool asyncDrop : {true, false}) {
+            Loop loop;
+            size_t dials = 0;
+            auto factory = std::make_shared<TransportFactory>();
+            factory->post = [&loop](std::function<void()> work) { loop.post(std::move(work)); };
+            factory->after = [&loop](double, std::function<void()> work) { loop.timers.push_back(std::move(work)); };
+            factory->tcp = [&loop, &dials, mode = modes[idx], asyncDrop](const Node &, const TLSOptions &tls, StreamCallback completion) {
+                assert(!tls.enabled);
+                ++dials;
+                auto peer = std::make_shared<CompatPeer>(loop, 4, mode, asyncDrop);
+                loop.post([peer, completion] { completion(peer, {}); });
+            };
+            Node compatNode;
+            compatNode.type = "snell";
+            compatNode.host = "compat-" + std::to_string(idx) + "-" + (asyncDrop ? "async" : "sync") + ".invalid";
+            compatNode.port = uint16_t(14430 + idx * 2 + (asyncDrop ? 1 : 0));
+            compatNode.parameters["psk"] = "testpsk";
+            compatNode.parameters["version"] = "4";
+
+            Target dest{"dns.google", 443, false, false};
+            std::shared_ptr<Stream> s1;
+            connectSnell(compatNode, dest, factory, [&](std::shared_ptr<Stream> connected, Error error) {
+                assert(error.empty() && connected);
+                s1 = std::move(connected);
+            });
+            loop.drain();
+            assert(s1);
+            Buffer clientHello = bytes("TLS-ClientHello-DoH-probe-payload");
+            bool helloSent = false;
+            Buffer echoed;
+            s1->write(clientHello, [&](Error err) { assert(err.empty()); helloSent = true; });
+            s1->read(256, [&](Buffer data, bool eof, Error err) {
+                assert(err.empty() && !eof);
+                echoed = std::move(data);
+            });
+            loop.drain();
+            assert(helloSent && echoed == clientHello);
+            assert(dials == idx + 2); // Standard + fallback steps up to modes[idx]
+            s1->close();
+            s1.reset();
+            loop.drain();
+
+            // Second connection to same endpoint must use cached mode immediately (1 dial, 0 retries)
+            size_t beforeCachedDials = dials;
+            std::shared_ptr<Stream> s2;
+            connectSnell(compatNode, dest, factory, [&](std::shared_ptr<Stream> connected, Error error) {
+                assert(error.empty() && connected);
+                s2 = std::move(connected);
+            });
+            loop.drain();
+            assert(s2);
+            Buffer secondPayload = bytes("cached-1rtt-snell-stream");
+            Buffer secondEcho;
+            s2->write(secondPayload, [](Error err) { assert(err.empty()); });
+            s2->read(256, [&](Buffer data, bool eof, Error err) {
+                assert(err.empty() && !eof);
+                secondEcho = std::move(data);
+            });
+            loop.drain();
+            assert(secondEcho == secondPayload);
+            assert(dials == beforeCachedDials + 1);
+            s2->close();
+            s2.reset();
+            loop.drain();
+        }
+    }
+    std::puts("C++ Snell: v4-v6 records (v1-v3 removed), Argon2id vector, multi-mode compat fallback/replay/cache, stream EOF, UDP boundaries, and negative paths passed");
 }

@@ -200,6 +200,11 @@ jobs:
     timeout-minutes: 15
 
     steps:
+      - name: Checkout Repository & History
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download All Architecture Artifacts
         uses: actions/download-artifact@v4
         with:
@@ -207,11 +212,12 @@ jobs:
           path: release_raw
           merge-multiple: true
 
-      - name: Prepare Release Assets & SHA256 Checksums
+      - name: Prepare Release Assets, Changelog & SHA256 Checksums
         id: meta
         shell: bash
         run: |
           set -euo pipefail
+          REPO_ROOT="$PWD"
           mkdir -p release_assets
           find release_raw -maxdepth 3 \( -name "*.dmg" -o -name "*.zip" \) -exec cp -f {} release_assets/ \;
 
@@ -225,7 +231,7 @@ jobs:
             BUILD_NO="44"
           fi
 
-          # 计算 Release 标签名：优先使用手动输入 -> Git Tag -> 自动生成的 v0.1.0-Build44
+          # 计算 Release 标签名：优先使用手动输入 -> Git Tag -> 自动生成的 v0.1.0-BuildXX
           INPUT_TAG="${{ inputs.release_tag }}"
           if [ -n "$INPUT_TAG" ]; then
             TAG_NAME="$INPUT_TAG"
@@ -238,10 +244,85 @@ jobs:
           echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
           echo "release_title=哈基米 (Hajimi) ${TAG_NAME} (Intel + Apple Silicon + Universal)" >> "$GITHUB_OUTPUT"
 
-          cd release_assets
-          sha256sum *.dmg *.zip > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-          ls -lh
+          (
+            cd release_assets
+            sha256sum *.dmg *.zip > SHA256SUMS.txt
+            cat SHA256SUMS.txt
+            ls -lh
+          )
+
+          # 生成包含详细更新内容、提交记录与安装包校验码的 Release 说明文档
+          TAG_ENV="$TAG_NAME" BUILD_ENV="$BUILD_NO" python3 - <<'PY' > "$REPO_ROOT/release_notes.md"
+          import os, pathlib, re, subprocess
+
+          tag = os.environ["TAG_ENV"]
+          build_no = os.environ["BUILD_ENV"]
+          notes_path = pathlib.Path("RELEASE_NOTES.md")
+          if not notes_path.exists():
+              found = list(pathlib.Path(".").glob("*/RELEASE_NOTES.md"))
+              if found:
+                  notes_path = found[0]
+
+          curated_section = ""
+          if notes_path.exists():
+              text = notes_path.read_text(encoding="utf-8")
+              pattern = re.compile(
+                  r"^##\s+" + re.escape(tag) + r"\b[^\n]*\n(.*?)(?=^##\s+v|\Z)",
+                  re.MULTILINE | re.DOTALL,
+              )
+              match = pattern.search(text)
+              if not match:
+                  pattern_build = re.compile(
+                      r"^##\s+[^\n]*Build\s*" + re.escape(build_no) + r"\b[^\n]*\n(.*?)(?=^##\s+v|\Z)",
+                      re.MULTILINE | re.DOTALL,
+                  )
+                  match = pattern_build.search(text)
+              if match:
+                  curated_section = match.group(1).strip()
+
+          prev_tag = ""
+          try:
+              tags_out = subprocess.check_output(
+                  ["git", "tag", "--sort=-creatordate"], text=True
+              ).splitlines()
+              for t in tags_out:
+                  t = t.strip()
+                  if t.startswith("v") and t != tag:
+                      prev_tag = t
+                      break
+          except Exception:
+              prev_tag = ""
+
+          rev_range = f"{prev_tag}..HEAD" if prev_tag else "-n 10"
+          log_cmd = ["git", "log", "--no-merges", "--pretty=format:- `%h` %s"]
+          if prev_tag:
+              log_cmd.append(rev_range)
+          else:
+              log_cmd.extend(["-n", "10"])
+          try:
+              commits_md = subprocess.check_output(log_cmd, text=True).strip()
+          except Exception:
+              commits_md = ""
+
+          checksums = pathlib.Path("release_assets/SHA256SUMS.txt").read_text(encoding="utf-8").strip()
+
+          parts = []
+          if curated_section:
+              parts.append("## 本次更新内容\n\n" + curated_section)
+          if commits_md:
+              heading = f"## 提交记录 ({prev_tag} → {tag})" if prev_tag else "## 最近提交记录"
+              parts.append(f"{heading}\n\n{commits_md}")
+          parts.append(
+              "## 安装包说明 (macOS 13.0+)\n\n"
+              "- **Apple Silicon (`arm64`) 专版**：适用于 M1 / M2 / M3 / M4 系列芯片 Mac（`哈基米-*-arm64.dmg` / `.zip`）\n"
+              "- **Intel (`x86_64`) 专版**：适用于 Intel 芯片 Mac（`哈基米-*-x86_64.dmg` / `.zip`）\n"
+              "- **Universal (`universal`) 通用版**：双架构合一，支持所有 Intel 与 Apple Silicon Mac（`哈基米-*-universal.dmg` / `.zip`）\n\n"
+              "### SHA-256 完整性校验\n\n"
+              f"```text\n{checksums}\n```"
+          )
+          print("\n\n---\n\n".join(parts))
+          PY
+          cat "$REPO_ROOT/release_notes.md"
 
       - name: Publish / Sync to GitHub Releases
         uses: softprops/action-gh-release@v2
@@ -249,13 +330,8 @@ jobs:
           tag_name: ${{ steps.meta.outputs.tag_name }}
           name: ${{ steps.meta.outputs.release_title }}
           target_commitish: ${{ github.sha }}
-          generate_release_notes: true
-          body: |
-            ### 哈基米 (Hajimi) for macOS 13.0+ 自动编译发布
-            - **Apple Silicon (`arm64`) 专版**：适用于 M1 / M2 / M3 / M4 系列芯片 Mac（`哈基米-*-arm64.dmg` / `.zip`）
-            - **Intel (`x86_64`) 专版**：适用于 Intel 芯片 Mac（`哈基米-*-x86_64.dmg` / `.zip`）
-            - **Universal (`universal`) 通用版**：双架构合一，支持所有 Intel 与 Apple Silicon Mac（`哈基米-*-universal.dmg` / `.zip`）
-            - **完整性校验**：详见附件 `SHA256SUMS.txt`
+          generate_release_notes: false
+          body_path: release_notes.md
           files: |
             release_assets/*.dmg
             release_assets/*.zip

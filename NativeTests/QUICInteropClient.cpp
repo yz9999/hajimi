@@ -262,7 +262,35 @@ int main(int argc, char **argv) {
         if (output != expected) throw std::runtime_error("TCP payload/prefix/half-close mismatch");
         factory->post([stream] { stream->close(); }); stream.reset();
         checkUDP(node, factory);
-        std::cout << node.type << " " << mode << " TLS/auth + TCP/half-close + UDP/fragments passed\n";
+        {
+            auto pooledFactory = std::make_shared<TransportFactory>();
+            pooledFactory->post = [queue](std::function<void()> task) { queue->post(std::move(task)); };
+            pooledFactory->after = [](double, std::function<void()>) {};
+            for (int idx = 0; idx < 2; ++idx) {
+                auto reusedStream = tcp(node, pooledFactory);
+                Buffer ping{'p','o','o','l','-',uint8_t('0' + idx)};
+                write(reusedStream, ping, pooledFactory);
+                write(reusedStream, {}, pooledFactory, true);
+                Buffer want{'s','e','r','v','e','r','-','p','r','e','f','i','x'};
+                want.insert(want.end(), ping.begin(), ping.end());
+                Buffer got; bool reusedEof = false;
+                while (!reusedEof) {
+                    auto part = read(reusedStream, pooledFactory, reusedEof, got.size());
+                    got.insert(got.end(), part.begin(), part.end());
+                }
+                if (got != want) throw std::runtime_error("Pooled TCP reuse payload mismatch");
+                pooledFactory->post([reusedStream] { reusedStream->close(); });
+            }
+            checkUDP(node, pooledFactory);
+            auto resetDone = std::make_shared<std::promise<void>>();
+            auto resetFuture = resetDone->get_future();
+            pooledFactory->post([pooledFactory, resetDone] {
+                resetQUICClient(pooledFactory);
+                resetDone->set_value();
+            });
+            wait(resetFuture, "Pooled QUIC session reset");
+        }
+        std::cout << node.type << " " << mode << " TLS/auth + TCP/half-close + UDP/fragments + pooled-reuse passed\n";
         return 0;
     } catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }
 }
