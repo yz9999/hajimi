@@ -639,6 +639,10 @@ enum TLS13 {
         init() {}
 
         mutating func append(_ data: Data) {
+            if offset == buffer.count && offset > 0 {
+                buffer.removeAll(keepingCapacity: true)
+                offset = 0
+            }
             buffer.append(contentsOf: data)
         }
 
@@ -677,17 +681,19 @@ enum TLS13 {
                                 header: header,
                                 fragment: Data(buffer[start..<(start + length)]))
             offset = start + length
-            if offset == buffer.count {
-                buffer.removeAll(keepingCapacity: true)
-                offset = 0
-            }
+            compact()
             return record
         }
 
         private mutating func compact() {
             guard offset > 0 else { return }
-            buffer.removeFirst(offset)
-            offset = 0
+            if offset == buffer.count {
+                buffer.removeAll(keepingCapacity: true)
+                offset = 0
+            } else if offset >= 16_384 && offset * 2 >= buffer.count {
+                buffer.removeFirst(offset)
+                offset = 0
+            }
         }
     }
 
@@ -696,29 +702,63 @@ enum TLS13 {
     /// Sequence numbers are per direction and reset to zero on every key change,
     /// which is why this is an object per direction rather than a shared counter.
     final class RecordProtector {
+        typealias NonceTuple = (
+            UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8
+        )
+
         let suite: CipherSuite
         private var trafficSecret: Data
-        private var key: Data
-        private var iv: Data
+        private var symmetricKey: SymmetricKey
+        private var ivTuple: NonceTuple
         private(set) var sequenceNumber: UInt64 = 0
 
         init(suite: CipherSuite, trafficSecret: Data) throws {
             self.suite = suite
             self.trafficSecret = trafficSecret
             let keys = try TLS13.trafficKeys(suite: suite, from: trafficSecret)
-            key = keys.key
-            iv = keys.iv
+            guard keys.key.count == suite.aead.keyLength,
+                  keys.iv.count == suite.aead.nonceLength else {
+                throw NativeOutboundError.crypto("TLS 1.3 流量密钥或 IV 长度异常")
+            }
+            self.symmetricKey = SymmetricKey(data: keys.key)
+            self.ivTuple = Self.makeIVTuple(from: keys.iv)
+        }
+
+        @inline(__always)
+        private static func makeIVTuple(from iv: Data) -> NonceTuple {
+            let b = iv.startIndex
+            return (
+                iv[b], iv[b + 1], iv[b + 2], iv[b + 3],
+                iv[b + 4], iv[b + 5], iv[b + 6], iv[b + 7],
+                iv[b + 8], iv[b + 9], iv[b + 10], iv[b + 11]
+            )
+        }
+
+        @inline(__always)
+        private func makeNonceTuple(for sequence: UInt64) -> NonceTuple {
+            (
+                ivTuple.0,
+                ivTuple.1,
+                ivTuple.2,
+                ivTuple.3,
+                ivTuple.4 ^ UInt8(truncatingIfNeeded: sequence >> 56),
+                ivTuple.5 ^ UInt8(truncatingIfNeeded: sequence >> 48),
+                ivTuple.6 ^ UInt8(truncatingIfNeeded: sequence >> 40),
+                ivTuple.7 ^ UInt8(truncatingIfNeeded: sequence >> 32),
+                ivTuple.8 ^ UInt8(truncatingIfNeeded: sequence >> 24),
+                ivTuple.9 ^ UInt8(truncatingIfNeeded: sequence >> 16),
+                ivTuple.10 ^ UInt8(truncatingIfNeeded: sequence >> 8),
+                ivTuple.11 ^ UInt8(truncatingIfNeeded: sequence)
+            )
         }
 
         /// `nonce = static_iv XOR seq`, the sequence number right-aligned in the
         /// IV as a big-endian 64-bit value. The IV itself never changes.
         func nonce(for sequence: UInt64) -> Data {
-            var nonce = iv
-            let base = nonce.endIndex - 8
-            for byte in 0..<8 {
-                nonce[base + byte] ^= UInt8(truncatingIfNeeded: sequence >> (8 * (7 - UInt64(byte))))
-            }
-            return nonce
+            var tuple = makeNonceTuple(for: sequence)
+            return withUnsafeBytes(of: &tuple) { Data($0) }
         }
 
         private func advanceSequence() throws {
@@ -731,28 +771,86 @@ enum TLS13 {
         }
 
         func protect(contentType: ContentType, content: Data, paddingLength: Int = 0) throws -> Data {
-            var inner = content
-            inner.append(contentType.rawValue)
-            if paddingLength > 0 { inner.append(Data(repeating: 0, count: paddingLength)) }
-            // RFC 8446 §5.4: the limit is on the *encoded TLSInnerPlaintext* —
-            // content plus the content-type byte plus the padding — and it is
-            // 2^14 + 1. Bounding the ciphertext by 2^14 + 256 instead would wave
-            // through 239 extra bytes of content, and the peer answers that with
-            // record_overflow (§5.2) rather than with anything diagnosable.
-            guard inner.count <= maximumPlaintextLength + 1 else {
-                throw NativeOutboundError.protocolError(
-                    "TLS 1.3 内层明文长度 \(inner.count)（含 content_type 与填充）超出上限 \(maximumPlaintextLength + 1)")
+            guard paddingLength >= 0 else {
+                throw NativeOutboundError.protocolError("TLS 1.3 记录填充长度不能为负")
             }
-            let length = inner.count + suite.aead.tagLength
-            var header = Data([ContentType.applicationData.rawValue,
-                               UInt8(truncatingIfNeeded: legacyRecordVersion >> 8),
-                               UInt8(truncatingIfNeeded: legacyRecordVersion)])
-            header.append(UInt8(truncatingIfNeeded: length >> 8))
-            header.append(UInt8(truncatingIfNeeded: length))
-            let sealed = try suite.aead.seal(key: key, nonce: nonce(for: sequenceNumber),
-                                             additionalData: header, plaintext: inner)
+            let innerLen = content.count + 1 + paddingLength
+            guard innerLen <= maximumPlaintextLength + 1 else {
+                throw NativeOutboundError.protocolError(
+                    "TLS 1.3 内层明文长度 \(innerLen)（含 content_type 与填充）超出上限 \(maximumPlaintextLength + 1)")
+            }
+            var out = Data(capacity: recordHeaderLength + innerLen + suite.aead.tagLength)
+            try protect(into: &out, contentType: contentType, content: content, paddingLength: paddingLength)
+            return out
+        }
+
+        func protect<C: DataProtocol>(into output: inout Data, contentType: ContentType,
+                                      content: C, paddingLength: Int = 0) throws {
+            guard paddingLength >= 0 else {
+                throw NativeOutboundError.protocolError("TLS 1.3 记录填充长度不能为负")
+            }
+            let contentCount = content.count
+            let innerLen = contentCount + 1 + paddingLength
+            // RFC 8446 §5.4: encoded TLSInnerPlaintext limit is 2^14 + 1.
+            guard innerLen <= maximumPlaintextLength + 1 else {
+                throw NativeOutboundError.protocolError(
+                    "TLS 1.3 内层明文长度 \(innerLen)（含 content_type 与填充）超出上限 \(maximumPlaintextLength + 1)")
+            }
+            let wireLen = innerLen + suite.aead.tagLength
+            var headerTuple: (UInt8, UInt8, UInt8, UInt8, UInt8) = (
+                ContentType.applicationData.rawValue,
+                UInt8(truncatingIfNeeded: legacyRecordVersion >> 8),
+                UInt8(truncatingIfNeeded: legacyRecordVersion),
+                UInt8(truncatingIfNeeded: wireLen >> 8),
+                UInt8(truncatingIfNeeded: wireLen)
+            )
+            var nonceTuple = makeNonceTuple(for: sequenceNumber)
+            let symKey = symmetricKey
+            let aead = suite.aead
+
+            try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: innerLen) { innerBuf in
+                let rawInner = UnsafeMutableRawBufferPointer(innerBuf)
+                if contentCount > 0 {
+                    _ = content.copyBytes(to: UnsafeMutableRawBufferPointer(rebasing: rawInner[0..<contentCount]))
+                }
+                innerBuf[contentCount] = contentType.rawValue
+                if paddingLength > 0 {
+                    innerBuf.baseAddress!.advanced(by: contentCount + 1).initialize(repeating: 0, count: paddingLength)
+                }
+                let plainSlice = UnsafeRawBufferPointer(innerBuf)
+
+                try withUnsafeBytes(of: &headerTuple) { headerRaw in
+                    try withUnsafeBytes(of: &nonceTuple) { nonceRaw in
+                        do {
+                            switch aead {
+                            case .aes128GCM, .aes256GCM:
+                                let box = try AES.GCM.seal(
+                                    plainSlice,
+                                    using: symKey,
+                                    nonce: try AES.GCM.Nonce(data: nonceRaw),
+                                    authenticating: headerRaw
+                                )
+                                output.append(headerRaw.bindMemory(to: UInt8.self))
+                                output.append(box.ciphertext)
+                                output.append(box.tag)
+                            case .chaCha20Poly1305:
+                                let box = try ChaChaPoly.seal(
+                                    plainSlice,
+                                    using: symKey,
+                                    nonce: try ChaChaPoly.Nonce(data: nonceRaw),
+                                    authenticating: headerRaw
+                                )
+                                output.append(headerRaw.bindMemory(to: UInt8.self))
+                                output.append(box.ciphertext)
+                                output.append(box.tag)
+                            }
+                        } catch {
+                            throw NativeOutboundError.crypto("TLS 1.3 记录加密失败：\(error.localizedDescription)")
+                        }
+                    }
+                }
+            }
             try advanceSequence()
-            return header + sealed
         }
 
         /// Returns the inner content type and content. A zero-length
@@ -762,9 +860,38 @@ enum TLS13 {
                 throw NativeOutboundError.protocolError(
                     "TLS 1.3 密文记录的外层 content_type 应为 23，实际 \(record.contentType)")
             }
-            let plaintext = try suite.aead.open(key: key, nonce: nonce(for: sequenceNumber),
-                                                additionalData: record.header,
-                                                ciphertext: record.fragment)
+            let tagLen = suite.aead.tagLength
+            guard record.fragment.count >= tagLen else {
+                throw NativeOutboundError.protocolError(
+                    "TLS 1.3 密文长度 \(record.fragment.count) 小于认证标签长度 \(tagLen)")
+            }
+            var nonceTuple = makeNonceTuple(for: sequenceNumber)
+            let symKey = symmetricKey
+            let body = record.fragment.prefix(record.fragment.count - tagLen)
+            let tag = record.fragment.suffix(tagLen)
+            let plaintext: Data
+            do {
+                plaintext = try withUnsafeBytes(of: &nonceTuple) { nonceRaw in
+                    switch suite.aead {
+                    case .aes128GCM, .aes256GCM:
+                        let box = try AES.GCM.SealedBox(
+                            nonce: try AES.GCM.Nonce(data: nonceRaw),
+                            ciphertext: body,
+                            tag: tag
+                        )
+                        return try AES.GCM.open(box, using: symKey, authenticating: record.header)
+                    case .chaCha20Poly1305:
+                        let box = try ChaChaPoly.SealedBox(
+                            nonce: try ChaChaPoly.Nonce(data: nonceRaw),
+                            ciphertext: body,
+                            tag: tag
+                        )
+                        return try ChaChaPoly.open(box, using: symKey, authenticating: record.header)
+                    }
+                }
+            } catch {
+                throw NativeOutboundError.crypto("TLS 1.3 记录解密失败（认证标签不匹配或密钥错误）")
+            }
             try advanceSequence()
             return try splitInnerPlaintext(plaintext)
         }
@@ -774,8 +901,12 @@ enum TLS13 {
         func updateKeys() throws {
             trafficSecret = try TLS13.updatedTrafficSecret(suite: suite, from: trafficSecret)
             let keys = try TLS13.trafficKeys(suite: suite, from: trafficSecret)
-            key = keys.key
-            iv = keys.iv
+            guard keys.key.count == suite.aead.keyLength,
+                  keys.iv.count == suite.aead.nonceLength else {
+                throw NativeOutboundError.crypto("TLS 1.3 KeyUpdate 流量密钥或 IV 长度异常")
+            }
+            symmetricKey = SymmetricKey(data: keys.key)
+            ivTuple = Self.makeIVTuple(from: keys.iv)
             sequenceNumber = 0
         }
     }
@@ -837,8 +968,13 @@ enum TLS13 {
 
         private mutating func compact() {
             guard offset > 0 else { return }
-            buffer.removeFirst(offset)
-            offset = 0
+            if offset == buffer.count {
+                buffer.removeAll(keepingCapacity: true)
+                offset = 0
+            } else if offset >= 16_384 && offset * 2 >= buffer.count {
+                buffer.removeFirst(offset)
+                offset = 0
+            }
         }
     }
 

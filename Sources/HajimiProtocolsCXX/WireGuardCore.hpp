@@ -58,6 +58,9 @@ struct WGConfig {
 };
 
 struct WGHandshakeState {
+    static constexpr size_t kReplayWindowBits = 2048;
+    static constexpr size_t kReplayWindowWords = kReplayWindowBits / 64;
+
     uint32_t clientIndex = 0;
     uint32_t serverIndex = 0;
     Buffer ephemeralPriv;
@@ -69,28 +72,48 @@ struct WGHandshakeState {
     Buffer lastMac1;
     uint64_t sendCounter = 0;
     uint64_t replayMax = 0;
-    uint64_t replayBitmap = 0;
+    std::array<uint64_t, kReplayWindowWords> replayBitmap{};
     bool replayInit = false;
 
-    bool acceptReplay(uint64_t counter) {
+    bool checkReplay(uint64_t counter) const noexcept {
         if (counter >= (1ULL << 60)) return false;
+        if (!replayInit) return true;
+        if (counter > replayMax) return true;
+        uint64_t diff = replayMax - counter;
+        if (diff >= kReplayWindowBits) return false;
+        return (replayBitmap[size_t(diff >> 6)] & (1ULL << (diff & 63))) == 0;
+    }
+
+    bool acceptReplay(uint64_t counter) noexcept {
+        if (!checkReplay(counter)) return false;
         if (!replayInit) {
             replayInit = true;
             replayMax = counter;
-            replayBitmap = 1ULL;
+            replayBitmap.fill(0);
+            replayBitmap[0] = 1ULL;
             return true;
         }
         if (counter > replayMax) {
             uint64_t shift = counter - replayMax;
-            replayBitmap = (shift >= 64) ? 1ULL : ((replayBitmap << shift) | 1ULL);
+            if (shift >= kReplayWindowBits) {
+                replayBitmap.fill(0);
+            } else {
+                size_t wordShift = size_t(shift >> 6);
+                unsigned bitShift = unsigned(shift & 63);
+                for (size_t i = kReplayWindowWords; i-- > 0;) {
+                    uint64_t val = (i >= wordShift) ? (replayBitmap[i - wordShift] << bitShift) : 0ULL;
+                    if (bitShift != 0 && i > wordShift) {
+                        val |= (replayBitmap[i - wordShift - 1] >> (64 - bitShift));
+                    }
+                    replayBitmap[i] = val;
+                }
+            }
             replayMax = counter;
+            replayBitmap[0] |= 1ULL;
             return true;
         }
         uint64_t diff = replayMax - counter;
-        if (diff >= 64) return false;
-        uint64_t mask = 1ULL << diff;
-        if (replayBitmap & mask) return false;
-        replayBitmap |= mask;
+        replayBitmap[size_t(diff >> 6)] |= (1ULL << (diff & 63));
         return true;
     }
 

@@ -332,11 +332,15 @@ struct hajimi_tcp_reassembly {
     size_t byteLimit, segmentLimit, buffered = 0;
     bool finPending = false, finished = false;
     uint32_t fin = 0;
+    uint32_t lastOooSequence = 0;
+    bool hasLastOoo = false;
     std::vector<PendingSegment> segments;
     void finishIfReady() {
         if (finPending && fin == expected) {
             ++expected; finished = true; finPending = false;
-            segments.clear(); buffered = 0;
+            segments.clear(); buffered = 0; hasLastOoo = false;
+        } else if (segments.empty()) {
+            hasLastOoo = false;
         }
     }
 };
@@ -401,6 +405,7 @@ extern "C" size_t hajimi_tcp_reassembly_ingest(hajimi_tcp_reassembly *s, uint32_
         s->finishIfReady();
         return released;
     }
+    const uint32_t triggerSequence = sequence;
     // Normalize & coalesce out-of-order overlaps (RFC 793 wrap-safe sequence arithmetic):
     // 1. Trim prefix/suffix already covered by buffered segments so overlapping OOO floods
     //    cannot inflate s->buffered or waste BufferBudgetLimit.
@@ -411,11 +416,17 @@ extern "C" size_t hajimi_tcp_reassembly_ingest(hajimi_tcp_reassembly *s, uint32_
         const uint32_t segEnd = seg.sequence + uint32_t(seg.length);
         const uint32_t inEnd = sequence + uint32_t(n);
         if (int32_t(segStart - sequence) <= 0 && int32_t(segEnd - inEnd) >= 0) {
+            s->lastOooSequence = triggerSequence;
+            s->hasLastOoo = true;
             return 0; // Incoming segment is completely covered by an existing segment.
         }
         if (int32_t(segStart - sequence) < 0 && int32_t(segEnd - sequence) > 0) {
             const size_t trim = size_t(uint32_t(segEnd - sequence));
-            if (trim >= n) return 0;
+            if (trim >= n) {
+                s->lastOooSequence = triggerSequence;
+                s->hasLastOoo = true;
+                return 0;
+            }
             sequence += uint32_t(trim);
             bytes += trim;
             n -= trim;
@@ -424,7 +435,11 @@ extern "C" size_t hajimi_tcp_reassembly_ingest(hajimi_tcp_reassembly *s, uint32_
         if (int32_t(segStart - sequence) > 0 && int32_t(updatedEnd - segStart) > 0 &&
             int32_t(segEnd - updatedEnd) >= 0) {
             const size_t keep = size_t(uint32_t(segStart - sequence));
-            if (keep == 0) return 0;
+            if (keep == 0) {
+                s->lastOooSequence = triggerSequence;
+                s->hasLastOoo = true;
+                return 0;
+            }
             n = keep;
         }
     }
@@ -462,6 +477,8 @@ extern "C" size_t hajimi_tcp_reassembly_ingest(hajimi_tcp_reassembly *s, uint32_
         });
     s->segments.insert(pos, {sequence, n, std::move(copy)});
     s->buffered += n;
+    s->lastOooSequence = triggerSequence;
+    s->hasLastOoo = true;
     return 0;
 }
 extern "C" void hajimi_tcp_reassembly_fin(hajimi_tcp_reassembly *s, uint32_t sequence) {
@@ -472,6 +489,80 @@ extern "C" void hajimi_tcp_reassembly_fin(hajimi_tcp_reassembly *s, uint32_t seq
 extern "C" uint32_t hajimi_tcp_reassembly_expected(const hajimi_tcp_reassembly *s) { return s ? s->expected : 0; }
 extern "C" size_t hajimi_tcp_reassembly_buffered(const hajimi_tcp_reassembly *s) { return s ? s->buffered : 0; }
 extern "C" int hajimi_tcp_reassembly_finished(const hajimi_tcp_reassembly *s) { return s && s->finished; }
+
+namespace {
+template <typename Callback>
+void visitContiguousOooIntervals(const hajimi_tcp_reassembly *s, Callback &&visit) {
+    bool active = false;
+    uint32_t curStart = 0;
+    uint32_t curEnd = 0;
+    for (auto it = s->segments.rbegin(); it != s->segments.rend(); ++it) {
+        const uint32_t start = it->sequence;
+        uint32_t end = it->sequence + uint32_t(it->length);
+        if (s->finPending) {
+            if (int32_t(start - s->fin) >= 0) continue;
+            if (int32_t(end - s->fin) > 0) end = s->fin;
+        }
+        if (int32_t(start - s->expected) <= 0 || int32_t(end - start) <= 0) {
+            continue;
+        }
+        if (!active) {
+            curStart = start;
+            curEnd = end;
+            active = true;
+        } else if (int32_t(start - curEnd) <= 0) {
+            if (int32_t(end - curEnd) > 0) {
+                curEnd = end;
+            }
+        } else {
+            if (!visit(hajimi_sack_range{curStart, curEnd})) return;
+            curStart = start;
+            curEnd = end;
+        }
+    }
+    if (active) {
+        visit(hajimi_sack_range{curStart, curEnd});
+    }
+}
+} // namespace
+
+extern "C" size_t hajimi_tcp_reassembly_sack_blocks(const hajimi_tcp_reassembly *s,
+                                                    hajimi_sack_range *out_ranges,
+                                                    size_t max_ranges) {
+    if (!s || !out_ranges || max_ranges == 0 || s->finished || s->segments.empty()) {
+        return 0;
+    }
+    const size_t limit = std::min<size_t>(max_ranges, 4);
+    size_t count = 0;
+    bool pinnedFirst = false;
+    hajimi_sack_range firstRange{0, 0};
+
+    // RFC 2018 §4: place the contiguous interval containing the most recently
+    // received out-of-order segment first, followed by remaining intervals.
+    if (s->hasLastOoo) {
+        visitContiguousOooIntervals(s, [&](hajimi_sack_range r) {
+            if (int32_t(s->lastOooSequence - r.start) >= 0 &&
+                int32_t(r.end - s->lastOooSequence) > 0) {
+                firstRange = r;
+                pinnedFirst = true;
+                return false;
+            }
+            return true;
+        });
+    }
+    if (pinnedFirst) {
+        out_ranges[count++] = firstRange;
+        if (count >= limit) return count;
+    }
+    visitContiguousOooIntervals(s, [&](hajimi_sack_range r) {
+        if (pinnedFirst && r.start == firstRange.start && r.end == firstRange.end) {
+            return true;
+        }
+        out_ranges[count++] = r;
+        return count < limit;
+    });
+    return count;
+}
 
 namespace {
 int consumeQueue(void *context, const uint8_t *p, size_t n) {
@@ -607,6 +698,48 @@ static int flowSelfTestBody(void) {
     hajimi_rto_update(&rto_tlp, 0.040);
     const double pto = hajimi_rack_tlp_pto(&rto_tlp, 1460, 1460);
     if (pto < 0.070 || pto > 0.090) return 37;
+
+    // RFC 2018 outbound SACK block extraction: contiguous coalescing, most-recent-first
+    // ordering, 4-block cap across >= 5 discontiguous holes, and wrap-around past 2^32.
+    {
+        auto *sackState = hajimi_tcp_reassembly_create(UINT32_MAX - 9, 1024, 16);
+        if (!sackState) return 40;
+        std::unique_ptr<hajimi_tcp_reassembly, decltype(&hajimi_tcp_reassembly_destroy)> sackOwner(
+            sackState, hajimi_tcp_reassembly_destroy);
+        hajimi_byte_queue_clear(q);
+        hajimi_sack_range out[8] = {};
+        if (hajimi_tcp_reassembly_sack_blocks(sackState, out, 8) != 0) return 41;
+
+        // Two adjacent segments wrapping across UINT32_MAX -> 0 coalesce into 1 interval:
+        // [UINT32_MAX - 3 .. UINT32_MAX + 1) + [0 .. 4) => [UINT32_MAX - 3 .. 4)
+        hajimi_tcp_reassembly_ingest(sackState, UINT32_MAX - 3, reinterpret_cast<const uint8_t *>("1234"), 4, q, consumeQueue);
+        hajimi_tcp_reassembly_ingest(sackState, 0, reinterpret_cast<const uint8_t *>("5678"), 4, q, consumeQueue);
+        if (hajimi_tcp_reassembly_sack_blocks(sackState, out, 8) != 1 ||
+            out[0].start != UINT32_MAX - 3 || out[0].end != 4) return 42;
+
+        // Add four more discontiguous blocks [10..12), [20..22), [30..32), [40..42) -> 5 total intervals.
+        // Most recent interval [40..42) must be first, and total emitted blocks capped at 4.
+        hajimi_tcp_reassembly_ingest(sackState, 10, a, 2, q, consumeQueue);
+        hajimi_tcp_reassembly_ingest(sackState, 20, a, 2, q, consumeQueue);
+        hajimi_tcp_reassembly_ingest(sackState, 30, a, 2, q, consumeQueue);
+        hajimi_tcp_reassembly_ingest(sackState, 40, a, 2, q, consumeQueue);
+        const size_t nBlocks = hajimi_tcp_reassembly_sack_blocks(sackState, out, 8);
+        if (nBlocks != 4 ||
+            out[0].start != 40 || out[0].end != 42 ||
+            out[1].start != UINT32_MAX - 3 || out[1].end != 4 ||
+            out[2].start != 10 || out[2].end != 12 ||
+            out[3].start != 20 || out[3].end != 22) return 43;
+
+        // Filling the leading hole [UINT32_MAX - 9 .. UINT32_MAX - 3) drains up to 4, leaving 4 intervals.
+        hajimi_tcp_reassembly_ingest(sackState, UINT32_MAX - 9, reinterpret_cast<const uint8_t *>("abcdef"), 6, q, consumeQueue);
+        if (hajimi_tcp_reassembly_expected(sackState) != 4 ||
+            hajimi_tcp_reassembly_sack_blocks(sackState, out, 4) != 4) return 44;
+        // Filling remaining holes drains everything back to 0 SACK blocks.
+        hajimi_tcp_reassembly_ingest(sackState, 4, input, 36, q, consumeQueue);
+        if (hajimi_tcp_reassembly_expected(sackState) != 42 ||
+            hajimi_tcp_reassembly_buffered(sackState) != 0 ||
+            hajimi_tcp_reassembly_sack_blocks(sackState, out, 4) != 0) return 45;
+    }
 
     return 0;
 }

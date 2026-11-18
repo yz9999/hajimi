@@ -143,6 +143,8 @@ int hajimi_parse_tcp(const uint8_t *bytes, size_t length, hajimi_tcp_segment *ou
 
 typedef struct { uint32_t start; uint32_t end; } hajimi_sack_block;
 typedef struct {
+    uint8_t has_mss;
+    uint16_t mss;
     uint8_t has_window_scale;
     uint8_t window_scale;
     uint8_t sack_permitted;

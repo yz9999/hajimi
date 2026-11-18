@@ -117,11 +117,10 @@ NSData *data(Buffer value) {
     auto owned=new Buffer(std::move(value));
     return [[NSData alloc]initWithBytesNoCopy:owned->data() length:owned->size() deallocator:^(void *,NSUInteger){delete owned;}];
 }
-NSData *mapped(dispatch_data_t content) {
-    if(!content)return [NSData data];
-    const void *bytes=nullptr;size_t count=0;auto mapping=dispatch_data_create_map(content,&bytes,&count);
-    if(!mapping)return nil;
-    return [[NSData alloc]initWithBytesNoCopy:const_cast<void *>(bytes) length:count deallocator:^(void *,NSUInteger){(void)mapping;}];
+dispatch_data_t dispatchData(Buffer &&value) {
+    if(value.empty())return dispatch_data_empty;
+    auto *owned=new Buffer(std::move(value));
+    return dispatch_data_create(owned->data(),owned->size(),nullptr,^{delete owned;});
 }
 bool loopback(const std::string &host) {
     if(host=="localhost" || host=="::1" || host=="[::1]")return true;
@@ -187,8 +186,8 @@ public:
     ~PlatformStream(){if(ownsCancellation_)[native_ cancel];}
     void write(Buffer value,WriteCallback completion)override{
         if(closed_){completion("Stream closed");return;}
-        NSData *payload=data(std::move(value));auto self=shared_from_this();
-        const auto dispatchBytes=dispatch_data_create(payload.bytes,payload.length,nullptr,^{(void)payload;});
+        auto self=shared_from_this();
+        const auto dispatchBytes=dispatchData(std::move(value));
         [native_ sendContent:dispatchBytes isComplete:NO completion:^(NSError *error){auto failure=cppError(error);post(self->queue_,[self,completion,failure]{completion(failure);});}];
     }
     void read(size_t maximum,ReadCallback completion)override{
@@ -280,8 +279,7 @@ class PreparedStreamDatagram final:public Datagram,public std::enable_shared_fro
                 Buffer().swap(writeQueue_[i].framed);
             }
         }
-        NSData *payload = data(std::move(coalesced));
-        const auto dispatchBytes = dispatch_data_create(payload.bytes, payload.length, nullptr, ^{ (void)payload; });
+        const auto dispatchBytes = dispatchData(std::move(coalesced));
         [native_ sendContent:dispatchBytes isComplete:NO completion:^(NSError *error) {
             auto failure = cppError(error);
             post(self->queue_, [self, batchCount, sentBytes, failure] {
@@ -596,7 +594,7 @@ std::shared_ptr<PlatformDatagram> dialPOSIXDatagram(const Node &node, dispatch_q
         for (int bufSize : {1024 * 1024, 512 * 1024, 256 * 1024}) {
             if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufSize, sizeof(bufSize)) == 0) break;
         }
-        for (int bufSize : {512 * 1024, 256 * 1024}) {
+        for (int bufSize : {2 * 1024 * 1024, 1024 * 1024, 512 * 1024}) {
             if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufSize, sizeof(bufSize)) == 0) break;
         }
         if (::connect(fd, addr->ai_addr, addr->ai_addrlen) != 0) {
@@ -924,24 +922,45 @@ void deliver(dispatch_queue_t queue,HJStreamWriteCompletion completion,Error err
 - (BOOL)supportsHalfClose{return _halfClose;}
 - (void)sendData:(NSData *)payload completion:(HJStreamWriteCompletion)completion{
     if(_cancelled.load()){deliver(_output,completion,"Stream closed",true);return;}
-    if(!reserve(_queuedBytes,_queuedRequests,payload.length)){deliver(_output,completion,"C++ stream write queue limit exceeded");return;}
-    NSData *snapshot=[payload copy];auto context=_context;auto stream=_stream;auto output=_output;size_t size=snapshot.length;
-    post(context->queue,[self,context,stream,output,snapshot,size,completion]{
+    const size_t size=payload.length;
+    if(!reserve(_queuedBytes,_queuedRequests,size)){deliver(_output,completion,"C++ stream write queue limit exceeded");return;}
+    Buffer copied=buffer(payload);auto context=_context;auto stream=_stream;auto output=_output;
+    post(context->queue,[self,context,stream,output,copied=std::move(copied),size,completion]()mutable{
         if(self->_cancelled.load() || context->closed){self->_queuedBytes.fetch_sub(size);self->_queuedRequests.fetch_sub(1);deliver(output,completion,"Stream closed",true);return;}
         auto done=[self,context,output,size,completion](Error error){self->_queuedBytes.fetch_sub(size);self->_queuedRequests.fetch_sub(1);deliver(output,completion,std::move(error),self->_cancelled.load() || context->closed);};
-        try{stream->write(buffer(snapshot),done);}catch(const std::exception &e){done(e.what());}
+        try{stream->write(std::move(copied),done);}catch(const std::exception &e){done(e.what());}
     });
 }
 - (void)sendContent:(dispatch_data_t)content isComplete:(BOOL)complete completion:(HJStreamWriteCompletion)completion{
-    if(complete && content && dispatch_data_get_size(content)){
-        [self sendData:mapped(content) completion:^(NSError *error){if(error)completion(error);else [self sendContent:nil isComplete:YES completion:completion];}];return;
-    }
-    if(!complete){[self sendData:mapped(content) completion:completion];return;}
+    if(_cancelled.load()){deliver(_output,completion,"Stream closed",true);return;}
+    const size_t size=content?dispatch_data_get_size(content):0;
     auto context=_context;auto stream=_stream;auto output=_output;
-    post(context->queue,[self,context,stream,output,completion]{
-        if(self->_cancelled.load() || context->closed){deliver(output,completion,"Stream closed",true);return;}
-        try{stream->shutdownWrite([self,context,output,completion](Error error){deliver(output,completion,std::move(error),self->_cancelled.load() || context->closed);});}
-        catch(const std::exception &e){deliver(output,completion,e.what(),self->_cancelled.load() || context->closed);}
+    if(!size && complete){
+        post(context->queue,[self,context,stream,output,completion]{
+            if(self->_cancelled.load() || context->closed){deliver(output,completion,"Stream closed",true);return;}
+            try{stream->shutdownWrite([self,context,output,completion](Error error){deliver(output,completion,std::move(error),self->_cancelled.load() || context->closed);});}
+            catch(const std::exception &e){deliver(output,completion,e.what(),self->_cancelled.load() || context->closed);}
+        });
+        return;
+    }
+    if(!reserve(_queuedBytes,_queuedRequests,size)){deliver(output,completion,"C++ stream write queue limit exceeded");return;}
+    Buffer payload;
+    try{payload=dispatchBuffer(content);}catch(const std::exception &e){
+        _queuedBytes.fetch_sub(size);_queuedRequests.fetch_sub(1);deliver(output,completion,e.what());return;
+    }
+    const bool shouldShutdown=bool(complete);
+    post(context->queue,[self,context,stream,output,payload=std::move(payload),size,shouldShutdown,completion]()mutable{
+        if(self->_cancelled.load() || context->closed){self->_queuedBytes.fetch_sub(size);self->_queuedRequests.fetch_sub(1);deliver(output,completion,"Stream closed",true);return;}
+        auto done=[self,context,stream,output,size,shouldShutdown,completion](Error error){
+            self->_queuedBytes.fetch_sub(size);self->_queuedRequests.fetch_sub(1);
+            if(!error.empty() || !shouldShutdown){deliver(output,completion,std::move(error),self->_cancelled.load() || context->closed);return;}
+            post(context->queue,[self,context,stream,output,completion]{
+                if(self->_cancelled.load() || context->closed){deliver(output,completion,"Stream closed",true);return;}
+                try{stream->shutdownWrite([self,context,output,completion](Error shutdownErr){deliver(output,completion,std::move(shutdownErr),self->_cancelled.load() || context->closed);});}
+                catch(const std::exception &e){deliver(output,completion,e.what(),self->_cancelled.load() || context->closed);}
+            });
+        };
+        try{stream->write(std::move(payload),done);}catch(const std::exception &e){done(e.what());}
     });
 }
 - (void)receiveDataWithMaximum:(NSUInteger)maximum completion:(HJDataReadCompletion)completion{
@@ -954,9 +973,17 @@ void deliver(dispatch_queue_t queue,HJStreamWriteCompletion completion,Error err
     });
 }
 - (void)receiveWithMaximum:(NSUInteger)maximum completion:(HJStreamReadCompletion)completion{
-    [self receiveDataWithMaximum:maximum completion:^(NSData *payload,BOOL eof,NSError *error){
-        dispatch_data_t content=nil;if(payload.length)content=dispatch_data_create(payload.bytes,payload.length,nullptr,^{(void)payload;});completion(content,eof,error);
-    }];
+    auto context=_context;auto stream=_stream;auto output=_output;
+    if(!maximum || maximum>maximumReadBytes){dispatch_async(output,^{completion(nil,NO,nativeError("Invalid maximum read size"));});return;}
+    post(context->queue,[self,context,stream,output,maximum,completion]{
+        if(self->_cancelled.load() || context->closed){dispatch_async(output,^{completion(nil,YES,cancelledError());});return;}
+        auto done=[self,context,output,completion](Buffer value,bool eof,Error error){
+            dispatch_data_t content=value.empty()?nil:dispatchData(std::move(value));
+            NSError *failure=nativeError(error,self->_cancelled.load() || context->closed);
+            dispatch_async(output,^{completion(content,eof,failure);});
+        };
+        try{stream->read(maximum,done);}catch(const std::exception &e){done({},true,e.what());}
+    });
 }
 - (void)cancel{if(_cancelled.exchange(true))return;auto context=_context;auto stream=_stream;post(context->queue,[context,stream]{stream->close();});}
 - (void)dealloc{auto context=_context;auto stream=_stream;if(context && stream)post(context->queue,[context,stream]{stream->close();});}

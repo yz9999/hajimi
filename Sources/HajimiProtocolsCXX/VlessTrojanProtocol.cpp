@@ -285,7 +285,7 @@ public:
           source_(std::move(source)),
           factory_(std::move(factory)),
           reader_(std::make_shared<Reader>(source_)),
-          writer_(std::make_shared<OrderedWriter>(source_)),
+          writer_(std::make_shared<OrderedWriter>(source_, maximumQueuedBytes, 128, proto_stream::kMaxCoalescedWriteBytes)),
           coalesceHeader_(!target_.udp && factory_ && static_cast<bool>(factory_->after)),
           responseReady_(kind_ == Kind::Trojan) {
         if (kind_ == Kind::VLESS) {

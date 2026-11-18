@@ -10,6 +10,9 @@
 #include <ngtcp2/ngtcp2_crypto_ossl.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/params.h>
+#include <openssl/core_names.h>
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 #include <netinet/in.h>
@@ -20,6 +23,7 @@
 #if defined(__APPLE__)
 #include <Security/Security.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <sys/event.h>
 #endif
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -31,7 +35,10 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <ctime>
 #include <deque>
+#include <fstream>
+#include <list>
 #include <mutex>
 #include <thread>
 #include <algorithm>
@@ -50,6 +57,114 @@ ngtcp2_tstamp now() {
 }
 // BLAKE2b with a 32-byte digest (not a truncation of BLAKE2b-512).
 Buffer blake2b256(const Buffer &input);
+bool computeObfsKey(bool salamander, const std::string &password,
+                    const uint8_t *salt, size_t saltLen, uint8_t outKey[32]);
+
+struct QuicSessionCache {
+    static constexpr size_t kMaxEntries = 64;
+    struct Entry {
+        SSL_SESSION *session = nullptr;
+        std::list<std::string>::iterator lruIt;
+    };
+    std::mutex mutex;
+    std::list<std::string> lru;
+    std::unordered_map<std::string, Entry> entries;
+};
+
+QuicSessionCache &sharedQuicSessionCache() {
+    static auto *cache = new QuicSessionCache();
+    return *cache;
+}
+
+bool isSessionFresh(const SSL_SESSION *session) {
+    if (!session || !SSL_SESSION_is_resumable(session)) return false;
+#if OPENSSL_VERSION_NUMBER >= 0x30400000L
+    time_t created = SSL_SESSION_get_time_ex(session);
+#else
+    time_t created = static_cast<time_t>(SSL_SESSION_get_time(session));
+#endif
+    long timeout = SSL_SESSION_get_timeout(session);
+    time_t current = std::time(nullptr);
+    if (created <= 0 || timeout <= 0 || current < created) return false;
+    return (current - created) < static_cast<time_t>(timeout);
+}
+
+SSL_SESSION *getCachedQuicSession(const std::string &key) {
+    if (key.empty()) return nullptr;
+    auto &cache = sharedQuicSessionCache();
+    std::lock_guard<std::mutex> guard(cache.mutex);
+    auto it = cache.entries.find(key);
+    if (it == cache.entries.end()) return nullptr;
+    if (!isSessionFresh(it->second.session)) {
+        SSL_SESSION_free(it->second.session);
+        cache.lru.erase(it->second.lruIt);
+        cache.entries.erase(it);
+        return nullptr;
+    }
+    cache.lru.splice(cache.lru.begin(), cache.lru, it->second.lruIt);
+    if (SSL_SESSION_up_ref(it->second.session) != 1) return nullptr;
+    return it->second.session;
+}
+
+bool storeCachedQuicSession(const std::string &key, SSL_SESSION *session) {
+    if (key.empty() || !isSessionFresh(session)) return false;
+    auto &cache = sharedQuicSessionCache();
+    std::lock_guard<std::mutex> guard(cache.mutex);
+    auto existing = cache.entries.find(key);
+    if (existing != cache.entries.end()) {
+        if (existing->second.session != session) {
+            SSL_SESSION_free(existing->second.session);
+            existing->second.session = session;
+        } else {
+            return false;
+        }
+        cache.lru.splice(cache.lru.begin(), cache.lru, existing->second.lruIt);
+        return true;
+    }
+    while (cache.entries.size() >= QuicSessionCache::kMaxEntries && !cache.lru.empty()) {
+        const std::string &oldest = cache.lru.back();
+        auto oldIt = cache.entries.find(oldest);
+        if (oldIt != cache.entries.end()) {
+            SSL_SESSION_free(oldIt->second.session);
+            cache.entries.erase(oldIt);
+        }
+        cache.lru.pop_back();
+    }
+    cache.lru.push_front(key);
+    cache.entries.emplace(key, QuicSessionCache::Entry{session, cache.lru.begin()});
+    return true;
+}
+
+void evictCachedQuicSession(const std::string &key) {
+    if (key.empty()) return;
+    auto &cache = sharedQuicSessionCache();
+    std::lock_guard<std::mutex> guard(cache.mutex);
+    auto it = cache.entries.find(key);
+    if (it == cache.entries.end()) return;
+    SSL_SESSION_free(it->second.session);
+    cache.lru.erase(it->second.lruIt);
+    cache.entries.erase(it);
+}
+
+std::string computeCaHash(const std::string &caPath) {
+    if (caPath.empty()) return {};
+    Buffer material(caPath.begin(), caPath.end());
+    material.push_back(0);
+    std::ifstream in(caPath, std::ios::binary);
+    if (in) {
+        char chunk[4096];
+        size_t total = 0;
+        while (in && total < 262144) {
+            in.read(chunk, static_cast<std::streamsize>(std::min<size_t>(sizeof(chunk), 262144 - total)));
+            auto got = static_cast<size_t>(in.gcount());
+            if (!got) break;
+            material.insert(material.end(), reinterpret_cast<const uint8_t *>(chunk),
+                            reinterpret_cast<const uint8_t *>(chunk) + got);
+            total += got;
+        }
+    }
+    return crypto::base64Encode(crypto::digest("SHA256", material));
+}
 uint64_t parseQuicBandwidthBytesPerSec(std::string value) {
     value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char c) { return std::isspace(c); }), value.end());
     if (value.empty()) return 0;
@@ -137,10 +252,23 @@ struct Connection::Impl {
     Node node; std::shared_ptr<TransportFactory> factory;
     std::weak_ptr<Connection> owner; std::thread worker;
     std::mutex mutex; std::deque<std::function<void()>> jobs;
-    std::atomic<bool> stopping{false}; std::atomic<size_t> datagramSize{0};
+    std::atomic<bool> stopping{false}; std::atomic<bool> wakePending{false};
+    std::atomic<size_t> datagramSize{0};
     std::atomic<size_t> stagedWrites{0}, stagedPackets{0}; bool jobsClosed = false;
     std::shared_ptr<ReceiveMailbox> received = std::make_shared<ReceiveMailbox>();
     int socket = -1, wake[2]{-1, -1};
+#if defined(__APPLE__)
+    int kq_ = -1;
+    int registeredSocket_ = -1;
+    bool writeFilterEnabled_ = false;
+#endif
+    int lastSocketEcn_ = -1;
+    uint8_t pendingWireEcn_ = 0;
+    uint8_t obfsSaltSize_ = 0;
+    bool salamanderObfs_ = false;
+    std::string obfsPassword_;
+    std::string sessionCacheKey_;
+    bool usedCachedSession_ = false;
     std::shared_ptr<Datagram> chainedDatagram;
     std::deque<Buffer> chainedInbound;
     uint16_t activePort = 0;
@@ -194,10 +322,13 @@ struct Connection::Impl {
     uint64_t brutalUpBps_ = 0;
     uint64_t brutalTokens_ = 0;
     ngtcp2_tstamp brutalLastRefill_ = 0;
-    size_t obfsOverhead() const {
-        if (node.type == "hysteria2" && node.option("obfs") == "salamander" && !node.option("obfs-password").empty()) return 8;
-        if (node.type == "hysteria" && !node.option("obfs").empty()) return 16;
-        return 0;
+    bool hasObfuscation() const { return obfsSaltSize_ != 0; }
+    size_t obfsOverhead() const { return obfsSaltSize_; }
+    void notifyWake() {
+        if (!wakePending.exchange(true, std::memory_order_acq_rel) && wake[1] >= 0) {
+            uint8_t value = 1;
+            (void)::write(wake[1], &value, 1);
+        }
     }
     bool migrateSocketOnPathChange() {
         int oldSocket = socket;
@@ -207,6 +338,10 @@ struct Connection::Impl {
             return false;
         }
         if (oldSocket >= 0) ::close(oldSocket);
+#if defined(__APPLE__)
+        registeredSocket_ = -1;
+        writeFilterEnabled_ = false;
+#endif
         if (conn) {
             ngtcp2_addr localAddr{reinterpret_cast<sockaddr *>(&local), localLength};
             ngtcp2_conn_set_local_addr(conn, &localAddr);
@@ -215,7 +350,21 @@ struct Connection::Impl {
     }
 
     Impl(Node value, std::shared_ptr<TransportFactory> io)
-        : node(std::move(value)), factory(std::move(io)) {}
+        : node(std::move(value)), factory(std::move(io)) {
+        if (node.type == "hysteria2" && node.option("obfs") == "salamander") {
+            obfsPassword_ = node.option("obfs-password");
+            if (!obfsPassword_.empty()) {
+                salamanderObfs_ = true;
+                obfsSaltSize_ = 8;
+            }
+        } else if (node.type == "hysteria") {
+            obfsPassword_ = node.option("obfs");
+            if (!obfsPassword_.empty()) {
+                salamanderObfs_ = false;
+                obfsSaltSize_ = 16;
+            }
+        }
+    }
     ~Impl();
     bool cancellationRequested() const {
         return factory && factory->cancelled && factory->cancelled();
@@ -259,6 +408,7 @@ struct Connection::Impl {
     static int streamClosed(ngtcp2_conn *, uint32_t, int64_t, uint64_t, void *, void *);
     static int streamReset(ngtcp2_conn *, int64_t, uint64_t, uint64_t, void *, void *);
     static int handshakeDone(ngtcp2_conn *, void *);
+    static int newSessionCallback(SSL *, SSL_SESSION *);
 #if defined(__APPLE__)
     static int certificateTrust(X509_STORE_CTX *, void *);
 #endif
@@ -276,6 +426,9 @@ Connection::Impl::~Impl() {
     if (conn) ngtcp2_conn_del(conn);
     if (tlsContext) SSL_CTX_free(tlsContext);
     if (chainedDatagram) { chainedDatagram->close(); chainedDatagram.reset(); }
+#if defined(__APPLE__)
+    if (kq_ >= 0) ::close(kq_);
+#endif
     if (socket >= 0) ::close(socket);
     for (auto fd : wake) if (fd >= 0) ::close(fd);
 }
@@ -332,11 +485,12 @@ void Connection::Impl::post(std::function<void()> callback) {
     { std::lock_guard<std::mutex> lock(mutex); finished = jobsClosed;
       if (!finished) jobs.push_back(std::move(callback)); }
     if (finished) { dispatch(std::move(callback)); return; }
-    if (wake[1] >= 0) { uint8_t value = 1; (void)::write(wake[1], &value, 1); }
+    notifyWake();
 }
 
 Error Connection::Impl::setupSocket() {
     if (cancelled()) return "QUIC connection cancelled";
+    lastSocketEcn_ = -1;
     activePort = selectTargetPort();
     if (!node.option("underlying-proxy", node.option("dialer-proxy")).empty() && factory && factory->udp) {
         sockaddr_in loc4{}, rem4{};
@@ -403,7 +557,7 @@ Error Connection::Impl::setupSocket() {
                     std::lock_guard<std::mutex> g(impl->mutex);
                     if (impl->chainedInbound.size() < 512) impl->chainedInbound.push_back(std::move(pkt));
                 }
-                if (impl->wake[1] >= 0) { uint8_t v = 1; (void)::write(impl->wake[1], &v, 1); }
+                impl->notifyWake();
             },
             [weakOwner](Error e) {
                 auto connOwner = weakOwner.lock();
@@ -478,6 +632,18 @@ Error Connection::Impl::setupSocket() {
             (void)setsockopt(candidate, IPPROTO_IPV6, IPV6_MTU_DISCOVER, &df, sizeof(df));
         }
 #endif
+        if (obfsOverhead() == 0) {
+            int ecnRecv = 1;
+            if (address->ai_family == AF_INET) {
+#if defined(IP_RECVTOS)
+                (void)setsockopt(candidate, IPPROTO_IP, IP_RECVTOS, &ecnRecv, sizeof(ecnRecv));
+#endif
+            } else if (address->ai_family == AF_INET6) {
+#if defined(IPV6_RECVTCLASS)
+                (void)setsockopt(candidate, IPPROTO_IPV6, IPV6_RECVTCLASS, &ecnRecv, sizeof(ecnRecv));
+#endif
+            }
+        }
         if (::connect(candidate, address->ai_addr, address->ai_addrlen)) {
             ::close(candidate); continue;
         }
@@ -516,10 +682,13 @@ Error Connection::Impl::setupTLS() {
     }
     auto options = tlsOptions(node, true);
     SSL_CTX_set_verify(tlsContext, options.skipVerify ? SSL_VERIFY_NONE : SSL_VERIFY_PEER, nullptr);
+    SSL_CTX_set_session_cache_mode(tlsContext, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+    SSL_CTX_sess_set_new_cb(tlsContext, newSessionCallback);
     verifyName = options.serverName.empty() ? node.host : options.serverName;
+    std::string caPath;
     if (!options.skipVerify) {
-        auto ca = node.option("ca");
-        if (ca.empty()) {
+        caPath = node.option("ca");
+        if (caPath.empty()) {
 #if defined(__APPLE__)
             // Static OpenSSL cannot assume Homebrew's cert.pem exists on the
             // recipient's Mac. Use the system trust store + hostname policy.
@@ -527,7 +696,7 @@ Error Connection::Impl::setupTLS() {
 #else
             if (!SSL_CTX_set_default_verify_paths(tlsContext)) return "QUIC trust store unavailable";
 #endif
-        } else if (!SSL_CTX_load_verify_locations(tlsContext, ca.c_str(), nullptr))
+        } else if (!SSL_CTX_load_verify_locations(tlsContext, caPath.c_str(), nullptr))
             return "QUIC CA file could not be loaded";
     }
     if (cancelled()) return "QUIC connection cancelled";
@@ -549,7 +718,8 @@ Error Connection::Impl::setupTLS() {
     uint8_t numeric[16];
     bool isIP = inet_pton(AF_INET, name.c_str(), numeric) == 1 ||
                 inet_pton(AF_INET6, name.c_str(), numeric) == 1;
-    if (!isIP && !node.flag("disable-sni") && !SSL_set_tlsext_host_name(tls, name.c_str()))
+    const bool disableSni = node.flag("disable-sni");
+    if (!isIP && !disableSni && !SSL_set_tlsext_host_name(tls, name.c_str()))
         return "QUIC SNI configuration failed";
     if (!options.skipVerify) {
         auto params = SSL_get0_param(tls);
@@ -573,7 +743,40 @@ Error Connection::Impl::setupTLS() {
     }
     if (SSL_set_alpn_protos(tls, alpn.data(), static_cast<unsigned>(alpn.size())))
         return "QUIC ALPN configuration failed";
+    {
+        uint16_t effPort = activePort ? activePort : node.port;
+        std::string caHash = options.skipVerify ? std::string{} : computeCaHash(caPath);
+        sessionCacheKey_.clear();
+        sessionCacheKey_.reserve(128 + caHash.size() + alpn.size() * 2);
+        sessionCacheKey_ += node.dialHost();
+        sessionCacheKey_.push_back('|');
+        sessionCacheKey_ += std::to_string(effPort);
+        sessionCacheKey_.push_back('|');
+        sessionCacheKey_ += verifyName;
+        sessionCacheKey_.push_back('|');
+        sessionCacheKey_ += disableSni ? "nosni|" : "sni|";
+        sessionCacheKey_ += crypto::base64Encode(alpn);
+        sessionCacheKey_.push_back('|');
+        sessionCacheKey_ += options.skipVerify ? "1|" : "0|";
+        sessionCacheKey_ += caHash;
+        if (SSL_SESSION *cached = getCachedQuicSession(sessionCacheKey_)) {
+            if (SSL_set_session(tls, cached) == 1) {
+                usedCachedSession_ = true;
+            }
+            SSL_SESSION_free(cached);
+        }
+    }
     return cancelled() ? "QUIC connection cancelled" : Error{};
+}
+
+int Connection::Impl::newSessionCallback(SSL *ssl, SSL_SESSION *session) {
+    if (!ssl || !session) return 0;
+    auto *ref = static_cast<ngtcp2_crypto_conn_ref *>(SSL_get_app_data(ssl));
+    if (!ref || !ref->user_data) return 0;
+    auto *self = static_cast<Impl *>(ref->user_data);
+    if (self->cancelled() || self->sessionCacheKey_.empty()) return 0;
+    if (SSL_get_verify_mode(ssl) != SSL_VERIFY_NONE && SSL_get_verify_result(ssl) != X509_V_OK) return 0;
+    return storeCachedQuicSession(self->sessionCacheKey_, session) ? 1 : 0;
 }
 
 #if defined(__APPLE__)
@@ -671,6 +874,9 @@ Error Connection::Impl::setupQUIC() {
     settings.initial_ts = now(); settings.handshake_timeout = 10 * NGTCP2_SECONDS;
     maxTxPayload_ = 1350 - obfsOverhead();
     settings.max_tx_udp_payload_size = maxTxPayload_; settings.no_pmtud = 1;
+    settings.max_stream_window = 16 * 1024 * 1024;
+    settings.max_window = 64 * 1024 * 1024;
+    settings.ack_thresh = 4;
     auto congestion = proto_common::lowerAscii(node.option("congestion-controller", node.option("congestion", "bbr")));
     settings.cc_algo = congestion == "cubic" ? NGTCP2_CC_ALGO_CUBIC :
                        congestion == "reno" ? NGTCP2_CC_ALGO_RENO : NGTCP2_CC_ALGO_BBR;
@@ -768,8 +974,12 @@ int Connection::Impl::receive(ngtcp2_conn *conn, uint32_t flags, int64_t id,
     }
     auto &state = found->second;
     if (state.closed) return 0;
-    if (count > 4 * 1024 * 1024 - state.input.size() ||
-        self->readBytes + count > 16 * 1024 * 1024) return NGTCP2_ERR_CALLBACK_FAILURE;
+    static constexpr size_t kMaxStreamWindow = 16 * 1024 * 1024;
+    static constexpr size_t kMaxConnWindow = 64 * 1024 * 1024;
+    if (state.input.size() > kMaxStreamWindow ||
+        count > kMaxStreamWindow - state.input.size() ||
+        self->readBytes > kMaxConnWindow ||
+        count > kMaxConnWindow - self->readBytes) return NGTCP2_ERR_CALLBACK_FAILURE;
     state.input.append(data, count); self->readBytes += count;
     state.eof = state.eof || (flags & NGTCP2_STREAM_DATA_FLAG_FIN);
     self->satisfy(id);
@@ -935,22 +1145,42 @@ void Connection::Impl::Channel::close() {
 }
 
 Buffer Connection::Impl::obfuscate(const uint8_t *data, size_t size, bool outbound) {
-    bool salamander = node.type == "hysteria2" && node.option("obfs") == "salamander";
-    std::string password = salamander ? node.option("obfs-password") :
-                           node.type == "hysteria" ? node.option("obfs") : "";
-    if (password.empty()) return Buffer(data, data + size);
-    size_t saltSize = salamander ? 8 : 16;
+    if (!hasObfuscation()) return Buffer(data, data + size);
+    const size_t saltSize = obfsSaltSize_;
     if (!outbound && size <= saltSize) return {};
-    Buffer salt = outbound ? crypto::randomBytes(saltSize) : Buffer(data, data + saltSize);
-    Buffer material(password.begin(), password.end()); material.insert(material.end(), salt.begin(), salt.end());
-    Buffer key = salamander ? blake2b256(material) : crypto::digest("SHA256", material);
-    Buffer result = outbound ? salt : Buffer{};
-    size_t offset = outbound ? 0 : saltSize;
-    result.reserve(result.size() + size - offset);
-    for (size_t index = offset; index < size; ++index)
-        result.push_back(data[index] ^ key[(index - offset) % key.size()]);
-    if (!material.empty()) OPENSSL_cleanse(material.data(), material.size());
-    if (!key.empty()) OPENSSL_cleanse(key.data(), key.size());
+    uint8_t salt[16]{};
+    if (outbound) {
+        if (RAND_bytes(salt, static_cast<int>(saltSize)) != 1)
+            throw std::runtime_error("QUIC obfuscation RNG failed");
+    } else {
+        std::memcpy(salt, data, saltSize);
+    }
+    uint8_t key[32]{};
+    if (!computeObfsKey(salamanderObfs_, obfsPassword_, salt, saltSize, key)) {
+        OPENSSL_cleanse(salt, sizeof(salt));
+        OPENSSL_cleanse(key, sizeof(key));
+        throw std::runtime_error("QUIC obfuscation key derivation failed");
+    }
+    const size_t inOffset = outbound ? 0 : saltSize;
+    const size_t payloadLen = size - inOffset;
+    const size_t outOffset = outbound ? saltSize : 0;
+    Buffer result(outOffset + payloadLen);
+    if (outbound) std::memcpy(result.data(), salt, saltSize);
+    const uint8_t *src = data + inOffset;
+    uint8_t *dst = result.data() + outOffset;
+    size_t i = 0;
+    for (; i + 8 <= payloadLen; i += 8) {
+        uint64_t dw = 0, kw = 0;
+        std::memcpy(&dw, src + i, 8);
+        std::memcpy(&kw, key + (i & 24), 8);
+        dw ^= kw;
+        std::memcpy(dst + i, &dw, 8);
+    }
+    for (; i < payloadLen; ++i) {
+        dst[i] = src[i] ^ key[i & 31];
+    }
+    OPENSSL_cleanse(salt, sizeof(salt));
+    OPENSSL_cleanse(key, sizeof(key));
     return result;
 }
 
@@ -965,12 +1195,21 @@ Error Connection::Impl::readPackets() {
                 raw = std::move(chainedInbound.front());
                 chainedInbound.pop_front();
             }
-            auto data = obfuscate(raw.data(), raw.size(), false);
-            if (data.empty()) continue;
+            const uint8_t *pktPtr = raw.data();
+            size_t pktLen = raw.size();
+            Buffer decoded;
+            if (hasObfuscation()) {
+                decoded = obfuscate(raw.data(), raw.size(), false);
+                if (decoded.empty()) continue;
+                pktPtr = decoded.data();
+                pktLen = decoded.size();
+            } else if (pktLen == 0) {
+                continue;
+            }
             ngtcp2_path path{{reinterpret_cast<sockaddr *>(&local), localLength},
                              {reinterpret_cast<sockaddr *>(&remote), remoteLength}, nullptr};
             ngtcp2_pkt_info info{};
-            int code = ngtcp2_conn_read_pkt(conn, &path, &info, data.data(), data.size(), now());
+            int code = ngtcp2_conn_read_pkt(conn, &path, &info, pktPtr, pktLen, now());
             if (code == NGTCP2_ERR_DISCARD_PKT) continue;
             if (code) {
                 if (!terminal.empty()) return terminal;
@@ -983,19 +1222,54 @@ Error Connection::Impl::readPackets() {
     uint8_t input[65536];
     for (size_t iteration = 0; iteration < 64; ++iteration) {
         if (cancelled()) return "QUIC connection cancelled";
-        auto length = ::recv(socket, input, sizeof(input), 0);
+        iovec iov{input, sizeof(input)};
+        alignas(cmsghdr) uint8_t control[64]{};
+        msghdr msg{};
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        if (!hasObfuscation()) {
+            msg.msg_control = control;
+            msg.msg_controllen = sizeof(control);
+        }
+        auto length = ::recvmsg(socket, &msg, 0);
         if (length < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return {};
             if (errno == EINTR || errno == ECONNREFUSED) continue;
             return "QUIC UDP receive failed";
         }
-        auto data = obfuscate(input, static_cast<size_t>(length), false);
-        if (data.empty()) continue;
+        if (length == 0 || (msg.msg_flags & MSG_TRUNC)) continue;
         if (cancelled()) return "QUIC connection cancelled";
+        ngtcp2_pkt_info info{};
+        if (!hasObfuscation() && !(msg.msg_flags & MSG_CTRUNC)) {
+            for (cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+                size_t dataLen = cmsg->cmsg_len >= CMSG_LEN(0) ? static_cast<size_t>(cmsg->cmsg_len - CMSG_LEN(0)) : 0;
+                if ((cmsg->cmsg_level == IPPROTO_IP && (cmsg->cmsg_type == IP_TOS
+#if defined(IP_RECVTOS)
+                    || cmsg->cmsg_type == IP_RECVTOS
+#endif
+                    )) || (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_TCLASS)) {
+                    if (dataLen >= sizeof(int)) {
+                        int tos = 0;
+                        std::memcpy(&tos, CMSG_DATA(cmsg), sizeof(tos));
+                        info.ecn = static_cast<uint8_t>(tos) & NGTCP2_ECN_MASK;
+                    } else if (dataLen >= 1) {
+                        info.ecn = (*reinterpret_cast<const uint8_t *>(CMSG_DATA(cmsg))) & NGTCP2_ECN_MASK;
+                    }
+                }
+            }
+        }
+        const uint8_t *pktPtr = input;
+        size_t pktLen = static_cast<size_t>(length);
+        Buffer decoded;
+        if (hasObfuscation()) {
+            decoded = obfuscate(input, pktLen, false);
+            if (decoded.empty()) continue;
+            pktPtr = decoded.data();
+            pktLen = decoded.size();
+        }
         ngtcp2_path path{{reinterpret_cast<sockaddr *>(&local), localLength},
                          {reinterpret_cast<sockaddr *>(&remote), remoteLength}, nullptr};
-        ngtcp2_pkt_info info{};
-        int code = ngtcp2_conn_read_pkt(conn, &path, &info, data.data(), data.size(), now());
+        int code = ngtcp2_conn_read_pkt(conn, &path, &info, pktPtr, pktLen, now());
         if (code == NGTCP2_ERR_DISCARD_PKT) continue;
         if (code) {
             if (!terminal.empty()) return terminal;
@@ -1008,20 +1282,26 @@ Error Connection::Impl::readPackets() {
 
 Error Connection::Impl::writePackets() {
     if (cancelled()) return "QUIC connection cancelled";
-    auto sendWire = [&]() -> int {
-        if (cancelled()) return -1;
-        if (pendingWire.empty()) return 1;
-        if (chainedDatagram) {
-            Target dst{node.dialHost(), activePort ? activePort : node.port, true, false};
-            Buffer pkt = std::move(pendingWire);
-            pendingWire.clear();
-            chainedDatagram->send(std::move(dst), std::move(pkt), [](Error) {});
-            return 1;
+    auto applySocketEcn = [&](uint8_t pktEcn) {
+        if (!hasObfuscation() && socket >= 0) {
+            int desiredEcn = static_cast<int>(pktEcn & NGTCP2_ECN_MASK);
+            if (desiredEcn != lastSocketEcn_) {
+                int level = remote.ss_family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
+                int opt = remote.ss_family == AF_INET6 ? IPV6_TCLASS : IP_TOS;
+                if (setsockopt(socket, level, opt, &desiredEcn, sizeof(desiredEcn)) == 0) {
+                    lastSocketEcn_ = desiredEcn;
+                }
+            }
         }
-        auto length = ::send(socket, pendingWire.data(), pendingWire.size(), 0);
-        if (length == static_cast<ssize_t>(pendingWire.size())) {
+    };
+    auto transmitSocketBuffer = [&](const uint8_t *wireData, size_t wireSize, uint8_t pktEcn) -> int {
+        if (cancelled()) return -1;
+        if (!wireSize) return 1;
+        applySocketEcn(pktEcn);
+        auto length = ::send(socket, wireData, wireSize, 0);
+        if (length == static_cast<ssize_t>(wireSize)) {
             consecutiveSendLosses_ = 0;
-            if (pendingWire.size() >= 1280 && pmtudState_ == DPLPMTUDState::Searching) {
+            if (wireSize >= 1280 && pmtudState_ == DPLPMTUDState::Searching) {
                 if (++pmtudProbesSucceeded_ >= 3) pmtudState_ = DPLPMTUDState::SearchComplete;
             } else if (pmtudState_ == DPLPMTUDState::BlackholeRecovery && ++pmtudProbesSucceeded_ >= 16) {
                 // RFC 8899 §5.2: probe upward again after sustained recovery at base PMTU
@@ -1032,7 +1312,6 @@ Error Connection::Impl::writePackets() {
                     pmtudProbesSucceeded_ = 0;
                 }
             }
-            pendingWire.clear();
             return 1;
         }
         if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == ENOBUFS || errno == ECONNREFUSED)) return 0;
@@ -1042,22 +1321,34 @@ Error Connection::Impl::writePackets() {
             pmtudProbesSucceeded_ = 0;
             size_t currentLimit = datagramSize.load();
             if (currentLimit > maxTxPayload_ - 200) datagramSize.store(maxTxPayload_ - 200);
-            pendingWire.clear();
             return 1;
         }
         if (length < 0 && (errno == EADDRNOTAVAIL || errno == ENETDOWN || errno == ENETUNREACH || errno == EHOSTUNREACH || errno == ENOTCONN)
             && migrateSocketOnPathChange()) {
-            auto retried = ::send(socket, pendingWire.data(), pendingWire.size(), 0);
-            if (retried == static_cast<ssize_t>(pendingWire.size())) { pendingWire.clear(); return 1; }
+            applySocketEcn(pktEcn);
+            auto retried = ::send(socket, wireData, wireSize, 0);
+            if (retried == static_cast<ssize_t>(wireSize)) return 1;
             if (retried < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == ENOBUFS || errno == ECONNREFUSED)) return 0;
         }
         return -1;
     };
-    int sent = sendWire();
-    if (sent <= 0) return sent == 0 ? Error{} : cancelled() ? "QUIC connection cancelled" : "QUIC UDP send failed";
+    if (!pendingWire.empty()) {
+        if (chainedDatagram) {
+            Target dst{node.dialHost(), activePort ? activePort : node.port, true, false};
+            Buffer pkt = std::move(pendingWire);
+            pendingWire.clear();
+            chainedDatagram->send(std::move(dst), std::move(pkt), [](Error) {});
+        } else {
+            int sent = transmitSocketBuffer(pendingWire.data(), pendingWire.size(), pendingWireEcn_);
+            if (sent == 1) pendingWire.clear();
+            else return sent == 0 ? Error{} : cancelled() ? "QUIC connection cancelled" : "QUIC UDP send failed";
+        }
+    }
     std::vector<int64_t> ids;
+    ids.reserve(streams.size());
     for (auto &entry : streams) if (!entry.second.closed) ids.push_back(entry.first);
-    size_t cursor = 0; ngtcp2_tstamp timestamp = now();
+    size_t cursor = 0;
+    ngtcp2_tstamp timestamp = now();
     if (brutalUpBps_ > 0) {
         if (timestamp > brutalLastRefill_) {
             uint64_t elapsedNs = timestamp - brutalLastRefill_;
@@ -1067,8 +1358,20 @@ Error Connection::Impl::writePackets() {
             brutalLastRefill_ = timestamp;
         }
     }
-    for (size_t iteration = 0; iteration < 64; ++iteration) {
+    const size_t sendQuantum = brutalUpBps_ == 0
+        ? std::max<size_t>(maxTxPayload_, ngtcp2_conn_get_send_quantum(conn))
+        : SIZE_MAX;
+    size_t burstSentBytes = 0;
+    auto streamHasPendingWork = [](const State &st) {
+        if (st.fin && !st.finSent) return true;
+        for (const auto &chunk : st.writes) {
+            if (chunk.sent < chunk.bytes.size()) return true;
+        }
+        return false;
+    };
+    for (size_t iteration = 0; iteration < 256; ++iteration) {
         if (brutalUpBps_ > 0 && brutalTokens_ < maxTxPayload_ && iteration > 0) break;
+        if (brutalUpBps_ == 0 && burstSentBytes >= sendQuantum && iteration > 0) break;
         if (cancelled()) return "QUIC connection cancelled";
         ngtcp2_path_storage path; ngtcp2_path_storage_zero(&path);
         ngtcp2_pkt_info info{}; uint8_t output[1350]; ngtcp2_ssize written = 0;
@@ -1085,48 +1388,131 @@ Error Connection::Impl::writePackets() {
                 if (!accepted) continue;
             }
         } else {
-            int64_t id = -1; State *state = nullptr; Write *write = nullptr;
-            for (size_t attempt = 0; attempt < ids.size(); ++attempt) {
-                auto candidate = ids[cursor++ % ids.size()]; auto &value = streams.at(candidate);
-                for (auto &chunk : value.writes) if (chunk.sent < chunk.bytes.size()) { write = &chunk; break; }
-                if (write || (value.fin && !value.finSent)) { id = candidate; state = &value; break; }
-            }
-            ngtcp2_vec vector{}; size_t count = 0;
-            if (write) { vector = {write->bytes.data() + write->sent, write->bytes.size() - write->sent}; count = 1; }
-            bool fin = state && state->fin && (!write || write->offset + write->bytes.size() == state->end);
-            ngtcp2_ssize consumed = -1;
-            written = ngtcp2_conn_writev_stream(conn, &path.path, &info, output, wireBudget,
-                &consumed, fin ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0, id, &vector, count, timestamp);
-            if (written == NGTCP2_ERR_STREAM_DATA_BLOCKED) continue;
-            if (written == NGTCP2_ERR_STREAM_SHUT_WR) { if (state) closeStream(id); continue; }
-            if (consumed >= 0 && write) {
-                write->sent += static_cast<size_t>(consumed);
-                if (write->sent == write->bytes.size() && write->completion) {
-                    auto callback = std::exchange(write->completion, {}); dispatch([callback] { callback({}); });
+            size_t scannedInRound = 0;
+            for (size_t inner = 0; inner < 32; ++inner) {
+                int64_t id = -1;
+                State *state = nullptr;
+                ngtcp2_vec vectors[16];
+                size_t vecCount = 0;
+                size_t totalAvailInStream = 0;
+                size_t gatheredBytes = 0;
+                if (inner < 31) {
+                    while (scannedInRound < ids.size()) {
+                        auto candidate = ids[cursor++ % ids.size()];
+                        ++scannedInRound;
+                        auto foundIt = streams.find(candidate);
+                        if (foundIt == streams.end() || foundIt->second.closed) continue;
+                        auto &value = foundIt->second;
+                        vecCount = 0;
+                        totalAvailInStream = 0;
+                        gatheredBytes = 0;
+                        for (auto &chunk : value.writes) {
+                            if (chunk.sent >= chunk.bytes.size()) continue;
+                            size_t rem = chunk.bytes.size() - chunk.sent;
+                            totalAvailInStream += rem;
+                            if (vecCount < 16) {
+                                vectors[vecCount++] = {chunk.bytes.data() + chunk.sent, rem};
+                                gatheredBytes += rem;
+                            }
+                        }
+                        if (vecCount > 0 || (value.fin && !value.finSent)) {
+                            id = candidate;
+                            state = &value;
+                            break;
+                        }
+                    }
                 }
-            }
-            if (consumed >= 0 && fin && (!write || write->sent == write->bytes.size())) {
-                traceStream(node, "send-fin", id, static_cast<size_t>(consumed), true, false);
-                state->finSent = true; auto callback = std::exchange(state->shutdown, {});
-                if (callback) dispatch([callback] { callback({}); });
+                if (id == -1) {
+                    written = ngtcp2_conn_writev_stream(
+                        conn, &path.path, &info, output, wireBudget,
+                        nullptr, 0, -1, nullptr, 0, timestamp);
+                    break;
+                }
+                const bool fin = state->fin && !state->finSent && (totalAvailInStream == gatheredBytes);
+                bool moreDataRemains = (totalAvailInStream > gatheredBytes);
+                if (!moreDataRemains && ids.size() > 1) {
+                    for (int64_t otherId : ids) {
+                        if (otherId == id) continue;
+                        auto otherIt = streams.find(otherId);
+                        if (otherIt != streams.end() && !otherIt->second.closed && streamHasPendingWork(otherIt->second)) {
+                            moreDataRemains = true;
+                            break;
+                        }
+                    }
+                }
+                uint32_t flags = fin ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0;
+                if (moreDataRemains && inner + 1 < 31) flags |= NGTCP2_WRITE_STREAM_FLAG_MORE;
+                ngtcp2_ssize consumed = -1;
+                written = ngtcp2_conn_writev_stream(
+                    conn, &path.path, &info, output, wireBudget,
+                    &consumed, flags, id,
+                    vecCount ? vectors : nullptr, vecCount, timestamp);
+                if (consumed >= 0 && state) {
+                    size_t remConsumed = static_cast<size_t>(consumed);
+                    for (auto &chunk : state->writes) {
+                        if (remConsumed == 0) break;
+                        if (chunk.sent >= chunk.bytes.size()) continue;
+                        size_t avail = chunk.bytes.size() - chunk.sent;
+                        size_t take = std::min(avail, remConsumed);
+                        chunk.sent += take;
+                        remConsumed -= take;
+                        if (chunk.sent == chunk.bytes.size() && chunk.completion) {
+                            auto callback = std::exchange(chunk.completion, {});
+                            dispatch([callback] { callback({}); });
+                        }
+                    }
+                    if (fin && static_cast<size_t>(consumed) == gatheredBytes) {
+                        traceStream(node, "send-fin", id, static_cast<size_t>(consumed), true, false);
+                        state->finSent = true;
+                        auto callback = std::exchange(state->shutdown, {});
+                        if (callback) dispatch([callback] { callback({}); });
+                    }
+                }
+                if (written == NGTCP2_ERR_WRITE_MORE) {
+                    if (consumed > 0 || (fin && gatheredBytes == 0)) scannedInRound = 0;
+                    continue;
+                }
+                if (written == NGTCP2_ERR_STREAM_DATA_BLOCKED || written == NGTCP2_ERR_STREAM_NOT_FOUND) {
+                    continue;
+                }
+                if (written == NGTCP2_ERR_STREAM_SHUT_WR) {
+                    if (state) closeStream(id);
+                    continue;
+                }
+                break;
             }
         }
         if (written < 0) return "QUIC packet write failed";
         if (!written) break;
+        const size_t ulen = static_cast<size_t>(written);
+        burstSentBytes += ulen;
         if (brutalUpBps_ > 0) {
-            size_t ulen = static_cast<size_t>(written);
             brutalTokens_ = (brutalTokens_ > ulen) ? (brutalTokens_ - ulen) : 0;
         }
-        pendingWire = obfuscate(output, static_cast<size_t>(written), true);
-        sent = sendWire();
-        if (sent < 0) return cancelled() ? "QUIC connection cancelled" : "QUIC UDP send failed";
-        if (!sent) break;
+        if (chainedDatagram) {
+            Target dst{node.dialHost(), activePort ? activePort : node.port, true, false};
+            Buffer pkt = hasObfuscation() ? obfuscate(output, ulen, true) : Buffer(output, output + ulen);
+            chainedDatagram->send(std::move(dst), std::move(pkt), [](Error) {});
+        } else if (hasObfuscation()) {
+            Buffer obfsPkt = obfuscate(output, ulen, true);
+            int sent = transmitSocketBuffer(obfsPkt.data(), obfsPkt.size(), 0);
+            if (sent < 0) return cancelled() ? "QUIC connection cancelled" : "QUIC UDP send failed";
+            if (!sent) { pendingWire = std::move(obfsPkt); pendingWireEcn_ = 0; break; }
+        } else {
+            int sent = transmitSocketBuffer(output, ulen, info.ecn);
+            if (sent < 0) return cancelled() ? "QUIC connection cancelled" : "QUIC UDP send failed";
+            if (!sent) { pendingWire.assign(output, output + ulen); pendingWireEcn_ = info.ecn; break; }
+        }
     }
     ngtcp2_conn_update_pkt_tx_time(conn, timestamp);
     return {};
 }
 
 void Connection::Impl::fail(Error error) {
+    if (usedCachedSession_ && !handshake && !cancellationRequested() && !sessionCacheKey_.empty()) {
+        evictCachedQuicSession(sessionCacheKey_);
+        usedCachedSession_ = false;
+    }
     if (terminal.empty()) terminal = std::move(error);
     stopping = true;
     received->close();
@@ -1164,6 +1550,17 @@ void Connection::Impl::run() {
         if (error.empty()) error = cancelled() ? "QUIC connection cancelled" : setupTLS();
         if (error.empty()) error = cancelled() ? "QUIC connection cancelled" : setupQUIC();
         if (error.empty() && cancelled()) error = "QUIC connection cancelled";
+#if defined(__APPLE__)
+        if (error.empty()) {
+            kq_ = ::kqueue();
+            if (kq_ >= 0) {
+                (void)fcntl(kq_, F_SETFD, FD_CLOEXEC);
+                struct kevent wakeEv{};
+                EV_SET(&wakeEv, static_cast<uintptr_t>(wake[0]), EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, nullptr);
+                (void)::kevent(kq_, &wakeEv, 1, nullptr, 0, nullptr);
+            }
+        }
+#endif
         if (!error.empty()) fail(error);
         while (!stopping) {
             if (cancelled()) { fail("QUIC connection cancelled"); break; }
@@ -1181,14 +1578,68 @@ void Connection::Impl::run() {
             }
             error = writePackets(); if (!error.empty()) { fail(error); break; }
             auto expiry = ngtcp2_conn_get_expiry(conn);
-            auto wait = expiry > now() ? (expiry - now()) / NGTCP2_MILLISECONDS : 0;
-            pollfd descriptors[2]{{socket, static_cast<short>(socket >= 0 ? (POLLIN | (pendingWire.empty() ? 0 : POLLOUT)) : 0), 0},
-                                  {wake[0], POLLIN, 0}};
-            int result = ::poll(descriptors, 2, static_cast<int>(std::min<uint64_t>(wait + 1, 100)));
-            if (result < 0 && errno != EINTR) { fail("QUIC event polling failed"); break; }
+            auto current = now();
+            static constexpr uint64_t kMaxWaitNs = 100ULL * NGTCP2_MILLISECONDS;
+            uint64_t waitNs = expiry > current ? (expiry - current) : 0;
+            if (!pendingWire.empty() && waitNs == 0) waitNs = NGTCP2_MILLISECONDS;
+            if (waitNs > kMaxWaitNs) waitNs = kMaxWaitNs;
+            if (chainedDatagram) {
+                std::lock_guard<std::mutex> g(mutex);
+                if (!chainedInbound.empty()) waitNs = 0;
+            }
+            bool wakeReadable = false;
+            bool socketReadable = false;
+#if defined(__APPLE__)
+            if (kq_ >= 0) {
+                struct kevent changes[2];
+                int nchanges = 0;
+                if (socket >= 0 && socket != registeredSocket_) {
+                    EV_SET(&changes[nchanges++], static_cast<uintptr_t>(socket), EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, nullptr);
+                    registeredSocket_ = socket;
+                    writeFilterEnabled_ = false;
+                }
+                const bool wantWrite = (socket >= 0 && !pendingWire.empty());
+                if (socket >= 0 && wantWrite != writeFilterEnabled_) {
+                    EV_SET(&changes[nchanges++], static_cast<uintptr_t>(socket), EVFILT_WRITE,
+                           wantWrite ? (EV_ADD | EV_ENABLE) : (EV_ADD | EV_DISABLE), 0, 0, nullptr);
+                    writeFilterEnabled_ = wantWrite;
+                }
+                struct timespec ts{
+                    static_cast<time_t>(waitNs / NGTCP2_SECONDS),
+                    static_cast<long>(waitNs % NGTCP2_SECONDS)
+                };
+                struct kevent events[4];
+                int nev = ::kevent(kq_, nchanges ? changes : nullptr, nchanges, events, 4, &ts);
+                if (nev < 0 && errno != EINTR) { fail("QUIC event polling failed"); break; }
+                for (int i = 0; i < nev; ++i) {
+                    if (events[i].ident == static_cast<uintptr_t>(wake[0])) {
+                        wakeReadable = true;
+                    } else if (socket >= 0 && events[i].ident == static_cast<uintptr_t>(socket)) {
+                        if (events[i].filter == EVFILT_READ || (events[i].flags & EV_ERROR)) {
+                            socketReadable = true;
+                        }
+                    }
+                }
+            } else
+#endif
+            {
+                uint64_t waitMs = waitNs > 0 ? (waitNs + NGTCP2_MILLISECONDS - 1) / NGTCP2_MILLISECONDS : 0;
+                pollfd descriptors[2]{
+                    {socket, static_cast<short>(socket >= 0 ? (POLLIN | (pendingWire.empty() ? 0 : POLLOUT)) : 0), 0},
+                    {wake[0], POLLIN, 0}
+                };
+                int result = ::poll(descriptors, 2, static_cast<int>(std::min<uint64_t>(waitMs, 100)));
+                if (result < 0 && errno != EINTR) { fail("QUIC event polling failed"); break; }
+                wakeReadable = (descriptors[1].revents & POLLIN) != 0;
+                socketReadable = socket >= 0 && (descriptors[0].revents & (POLLIN | POLLERR)) != 0;
+            }
             if (cancelled()) { fail("QUIC connection cancelled"); break; }
-            if (descriptors[1].revents & POLLIN) { uint8_t values[256]; while (::read(wake[0], values, sizeof(values)) > 0) {} }
-            if (chainedDatagram || (socket >= 0 && (descriptors[0].revents & (POLLIN | POLLERR)))) {
+            if (wakeReadable) {
+                uint8_t values[256];
+                while (::read(wake[0], values, sizeof(values)) > 0) {}
+                wakePending.store(false, std::memory_order_seq_cst);
+            }
+            if (chainedDatagram || socketReadable) {
                 error = readPackets(); if (!error.empty()) { fail(error); break; }
             }
         }
@@ -1207,14 +1658,21 @@ void Connection::Impl::run() {
             ngtcp2_pkt_info info{}; uint8_t output[1350];
             auto length = ngtcp2_conn_write_connection_close(conn, &path.path, &info,
                 output, sizeof(output), &close, now());
-            if (length > 0) {
-                auto bytes = obfuscate(output, static_cast<size_t>(length), true);
-                if (!cancellationRequested()) (void)::send(socket, bytes.data(), bytes.size(), 0);
+            if (length > 0 && !cancellationRequested()) {
+                if (hasObfuscation()) {
+                    auto bytes = obfuscate(output, static_cast<size_t>(length), true);
+                    (void)::send(socket, bytes.data(), bytes.size(), 0);
+                } else {
+                    (void)::send(socket, output, static_cast<size_t>(length), 0);
+                }
             }
         } catch (...) { /* Transport cleanup must not depend on close-frame crypto. */ }
     }
     // Do not wait for application wrappers or queued callbacks to release
     // their Connection references before returning the physical UDP socket.
+#if defined(__APPLE__)
+    if (kq_ >= 0) { ::close(kq_); kq_ = -1; }
+#endif
     if (socket >= 0) { ::close(socket); socket = -1; }
     std::deque<std::function<void()>> finalJobs;
     { std::lock_guard<std::mutex> lock(mutex); jobsClosed = true; finalJobs.swap(jobs); }
@@ -1251,7 +1709,7 @@ void Connection::close() {
     if (!impl_) return;
     impl_->stopping = true;
     impl_->received->close();
-    if (impl_->wake[1] >= 0) { uint8_t value = 1; (void)::write(impl_->wake[1], &value, 1); }
+    impl_->notifyWake();
 }
 size_t Connection::datagramLimit() const { return impl_->datagramSize.load(); }
 bool Connection::isClosed() const { return impl_->cancelled(); }
@@ -1359,50 +1817,88 @@ void SharedStream::close() {
 }
 
 namespace {
-Buffer blake2b256(const Buffer &input) {
-    static constexpr uint64_t iv[8]{0x6a09e667f3bcc908,0xbb67ae8584caa73b,
-        0x3c6ef372fe94f82b,0xa54ff53a5f1d36f1,0x510e527fade682d1,
-        0x9b05688c2b3e6c1f,0x1f83d9abfb41bd6b,0x5be0cd19137e2179};
-    static constexpr uint8_t permutation[12][16]{
-        {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},
-        {14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3},
-        {11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4},
-        {7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8},
-        {9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13},
-        {2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9},
-        {12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11},
-        {13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10},
-        {6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5},
-        {10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0},
-        {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},
-        {14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3}};
-    uint64_t hash[8]; std::copy(std::begin(iv), std::end(iv), hash); hash[0] ^= 0x01010020;
-    size_t offset = 0;
-    do {
-        uint8_t block[128]{}; size_t count = std::min<size_t>(128, input.size() - offset);
-        if (count) std::memcpy(block, input.data() + offset, count);
-        offset += count; bool final = offset == input.size(); uint64_t message[16]{}, v[16];
-        for (size_t word = 0; word < 16; ++word)
-            for (size_t byte = 0; byte < 8; ++byte) message[word] |= uint64_t(block[word * 8 + byte]) << (byte * 8);
-        std::copy(hash, hash + 8, v); std::copy(std::begin(iv), std::end(iv), v + 8);
-        v[12] ^= offset; if (final) v[14] = ~v[14];
-        auto rotate = [](uint64_t x, unsigned r) { return (x >> r) | (x << (64 - r)); };
-        auto mix = [&](int a,int b,int c,int d,uint64_t x,uint64_t y) {
-            v[a] += v[b] + x; v[d] = rotate(v[d] ^ v[a],32); v[c] += v[d]; v[b] = rotate(v[b] ^ v[c],24);
-            v[a] += v[b] + y; v[d] = rotate(v[d] ^ v[a],16); v[c] += v[d]; v[b] = rotate(v[b] ^ v[c],63);
+const EVP_MD *cachedBlake2bMd() {
+    static const EVP_MD *md = []() -> const EVP_MD * {
+        EVP_MD *fetched = EVP_MD_fetch(nullptr, "BLAKE2B-512", nullptr);
+        if (!fetched) std::abort();
+        // Verify BLAKE2b-256("") == 0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8
+        static constexpr uint8_t kExpectedEmpty[32]{
+            0x0e, 0x57, 0x51, 0xc0, 0x26, 0xe5, 0x43, 0xb2,
+            0xe8, 0xab, 0x2e, 0xb0, 0x60, 0x99, 0xda, 0xa1,
+            0xd1, 0xe5, 0xdf, 0x47, 0x77, 0x8f, 0x77, 0x87,
+            0xfa, 0xab, 0x45, 0xcd, 0xf1, 0x2f, 0xe3, 0xa8
         };
-        for (auto &p : permutation) {
-            mix(0,4,8,12,message[p[0]],message[p[1]]); mix(1,5,9,13,message[p[2]],message[p[3]]);
-            mix(2,6,10,14,message[p[4]],message[p[5]]); mix(3,7,11,15,message[p[6]],message[p[7]]);
-            mix(0,5,10,15,message[p[8]],message[p[9]]); mix(1,6,11,12,message[p[10]],message[p[11]]);
-            mix(2,7,8,13,message[p[12]],message[p[13]]); mix(3,4,9,14,message[p[14]],message[p[15]]);
-        }
-        for (size_t word = 0; word < 8; ++word) hash[word] ^= v[word] ^ v[word + 8];
-        if (final) break;
-    } while (true);
+        EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+        if (!ctx) std::abort();
+        size_t outLen = 32;
+        OSSL_PARAM params[2] = {
+            OSSL_PARAM_construct_size_t(OSSL_DIGEST_PARAM_SIZE, &outLen),
+            OSSL_PARAM_construct_end()
+        };
+        uint8_t digest[32]{};
+        unsigned int written = 0;
+        bool ok = EVP_DigestInit_ex2(ctx, fetched, params) == 1 &&
+                  EVP_DigestUpdate(ctx, "", 0) == 1 &&
+                  EVP_DigestFinal_ex(ctx, digest, &written) == 1 &&
+                  written == 32 &&
+                  std::memcmp(digest, kExpectedEmpty, 32) == 0;
+        EVP_MD_CTX_free(ctx);
+        if (!ok) std::abort();
+        return fetched;
+    }();
+    return md;
+}
+
+Buffer blake2b256(const Buffer &input) {
     Buffer output(32);
-    for (size_t index = 0; index < output.size(); ++index) output[index] = hash[index / 8] >> ((index % 8) * 8);
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) throw std::runtime_error("EVP_MD_CTX allocation failed");
+    size_t outLen = 32;
+    OSSL_PARAM params[2] = {
+        OSSL_PARAM_construct_size_t(OSSL_DIGEST_PARAM_SIZE, &outLen),
+        OSSL_PARAM_construct_end()
+    };
+    unsigned int written = 0;
+    bool ok = EVP_DigestInit_ex2(ctx, cachedBlake2bMd(), params) == 1 &&
+              EVP_DigestUpdate(ctx, input.empty() ? "" : reinterpret_cast<const char *>(input.data()), input.size()) == 1 &&
+              EVP_DigestFinal_ex(ctx, output.data(), &written) == 1 &&
+              written == 32;
+    EVP_MD_CTX_free(ctx);
+    if (!ok) throw std::runtime_error("BLAKE2b-256 digest failed");
     return output;
+}
+
+bool computeObfsKey(bool salamander, const std::string &password,
+                    const uint8_t *salt, size_t saltLen, uint8_t outKey[32]) {
+    if (salamander && password.empty() && saltLen == 0) {
+        auto empty = blake2b256({});
+        std::memcpy(outKey, empty.data(), 32);
+        return true;
+    }
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) return false;
+    bool ok = false;
+    unsigned int written = 0;
+    if (salamander) {
+        size_t outLen = 32;
+        OSSL_PARAM params[2] = {
+            OSSL_PARAM_construct_size_t(OSSL_DIGEST_PARAM_SIZE, &outLen),
+            OSSL_PARAM_construct_end()
+        };
+        ok = EVP_DigestInit_ex2(ctx, cachedBlake2bMd(), params) == 1 &&
+             EVP_DigestUpdate(ctx, password.data(), password.size()) == 1 &&
+             EVP_DigestUpdate(ctx, salt, saltLen) == 1 &&
+             EVP_DigestFinal_ex(ctx, outKey, &written) == 1 &&
+             written == 32;
+    } else {
+        ok = EVP_DigestInit_ex2(ctx, EVP_sha256(), nullptr) == 1 &&
+             EVP_DigestUpdate(ctx, password.data(), password.size()) == 1 &&
+             EVP_DigestUpdate(ctx, salt, saltLen) == 1 &&
+             EVP_DigestFinal_ex(ctx, outKey, &written) == 1 &&
+             written == 32;
+    }
+    EVP_MD_CTX_free(ctx);
+    return ok;
 }
 } // namespace
 } // namespace hajimi::quic

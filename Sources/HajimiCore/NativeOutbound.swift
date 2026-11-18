@@ -1702,9 +1702,12 @@ private final class NestedNetworkTLSByteTransport: ByteTransport, NativeOutbound
     // Ordinary proxy TLS allocates no progress recorder and takes no progress
     // locks. DNS tracing retains only fixed counters, never record payloads.
     private let dnsProgress: DNSStreamProgressRecorder?
+    private static let queueSpecificKey = DispatchSpecificKey<ObjectIdentifier>()
+    private static let maximumInlineRecursionDepth = 8
     private let queue = DispatchQueue(label: "app.hajimi.nested-network-tls",
                                       qos: .userInitiated,
                                       autoreleaseFrequency: .workItem)
+    private var inlineRecursionDepth = 0
     private var listener: NWListener?
     private var localCipherConnection: NWConnection?
     private var tlsConnection: NWConnection?
@@ -1757,6 +1760,19 @@ private final class NestedNetworkTLSByteTransport: ByteTransport, NativeOutbound
         failures = NativeOutboundFailureRelay(dialObserver: failureObserver)
         self.attemptTrace = attemptTrace
         dnsProgress = attemptTrace == nil ? nil : DNSStreamProgressRecorder()
+        queue.setSpecific(key: Self.queueSpecificKey, value: ObjectIdentifier(self))
+    }
+
+    @inline(__always)
+    private func runOnQueue(_ work: @escaping () -> Void) {
+        if DispatchQueue.getSpecific(key: Self.queueSpecificKey) == ObjectIdentifier(self),
+           inlineRecursionDepth < Self.maximumInlineRecursionDepth {
+            inlineRecursionDepth += 1
+            defer { inlineRecursionDepth -= 1 }
+            work()
+        } else {
+            queue.async(execute: work)
+        }
     }
 
     func dnsStreamProgressSnapshot() -> DNSStreamProgressSnapshot? {
@@ -1768,7 +1784,7 @@ private final class NestedNetworkTLSByteTransport: ByteTransport, NativeOutbound
     }
 
     func send(_ data: Data, completion: @escaping (Error?) -> Void) {
-        queue.async {
+        runOnQueue {
             if let error = self.carrierIngress.snapshot.rejectionError(originalError: self.failures.terminalError) {
                 // Reject a new request even when the caller's delivery queue
                 // was delayed after TLS ready. Do not poison the failure relay
@@ -1800,7 +1816,7 @@ private final class NestedNetworkTLSByteTransport: ByteTransport, NativeOutbound
     }
 
     func receive(maximum: Int, completion: @escaping (Data?, Bool, Error?) -> Void) {
-        queue.async {
+        runOnQueue {
             if let error = self.failures.terminalError { completion(nil, true, error); return }
             guard maximum > 0, let connection = self.tlsConnection, !self.cancelled else {
                 completion(nil, true, self.failures.terminalError
@@ -1857,6 +1873,7 @@ private final class NestedNetworkTLSByteTransport: ByteTransport, NativeOutbound
             nativeDebug("nested Network TLS creating listener parameters")
             let tcp = NWProtocolTCP.Options()
             tcp.noDelay = true // Short records on the synthetic loopback bridge only.
+            tcp.disableAckStretching = true
             let parameters = NWParameters(tls: nil, tcp: tcp)
             parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
             nativeDebug("nested Network TLS creating listener")
@@ -1907,7 +1924,9 @@ private final class NestedNetworkTLSByteTransport: ByteTransport, NativeOutbound
         let tlsOptions = NWProtocolTLS.Options()
         let options = tlsOptions.securityProtocolOptions
         if !serverName.isEmpty {
-            var cleanSNI = DoHEndpoint.unbracketed(serverName)
+            var cleanSNI = (serverName.hasPrefix("[") && serverName.hasSuffix("]"))
+                ? String(serverName.dropFirst().dropLast())
+                : serverName
             if cleanSNI.contains(":"), let pct = cleanSNI.firstIndex(of: "%") { cleanSNI = String(cleanSNI[..<pct]) }
             sec_protocol_options_set_tls_server_name(options, cleanSNI)
         }
@@ -1977,6 +1996,7 @@ private final class NestedNetworkTLSByteTransport: ByteTransport, NativeOutbound
         }
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
+        tcp.disableAckStretching = true
         let parameters = NWParameters(tls: tlsOptions, tcp: tcp)
         let connection = NWConnection(host: "127.0.0.1", port: port, using: parameters)
         tlsConnection = connection
@@ -2073,7 +2093,7 @@ private final class NestedNetworkTLSByteTransport: ByteTransport, NativeOutbound
                 attemptTrace?.record(.bridgeEOF)
             }
             guard let self, let local else { return }
-            self.queue.async {
+            self.runOnQueue {
                 guard !self.cancelled, self.localCipherConnection === local else { return }
                 if let error { self.fail(error); return }
                 guard let data, !data.isEmpty else {
@@ -2090,7 +2110,7 @@ private final class NestedNetworkTLSByteTransport: ByteTransport, NativeOutbound
                         nativeOutboundTLSObserveFailure(.rawWriteFailure, error: sendError,
                             attemptTrace: attemptTrace, admitting: { failures.observe(sendError) })
                     }
-                    self?.queue.async {
+                    self?.runOnQueue {
                         guard let self, let local, !self.cancelled else { return }
                         if let sendError { self.fail(sendError); return }
                         nativeDebug("nested Network TLS forwarded local ciphertext")
@@ -2123,7 +2143,7 @@ private final class NestedNetworkTLSByteTransport: ByteTransport, NativeOutbound
                 // it before forwarding EOF can produce closed-no-notify.
                 attemptTrace?.recordRawEOF(peerCiphertextBytes: ingress.peerCiphertextBytes)
             }
-            self?.queue.async {
+            self?.runOnQueue {
                 guard let self, let local, !self.cancelled else { return }
                 if let error { self.fail(error); return }
                 if self.completion != nil, ingress.endedWithoutPeerCiphertext {
@@ -2145,7 +2165,7 @@ private final class NestedNetworkTLSByteTransport: ByteTransport, NativeOutbound
                         nativeOutboundTLSObserveFailure(.bridgeFailure, error: sendError,
                             attemptTrace: attemptTrace, admitting: { failures.observe(sendError) })
                     }
-                    self?.queue.async {
+                    self?.runOnQueue {
                         guard let self, let local, !self.cancelled else { return }
                         if let sendError { self.fail(sendError); return }
                         if !complete { self.pumpRemoteCiphertext(local) }
@@ -2537,7 +2557,7 @@ private final class WebSocketByteTransport: ByteTransport {
     }
 
     func send(_ data: Data, completion: @escaping (Error?) -> Void) {
-        let frame = WebSocketFraming.encode(data, mask: secureRandom(count: 4))
+        let frame = WebSocketFraming.encode(data)
         enqueue(frame, completion: completion)
     }
 
@@ -2680,9 +2700,10 @@ private final class WebSocketByteTransport: ByteTransport {
         }
     }
 
+    private static let maximumCoalescedSendBytes = 32_768
+
     private func sendControl(opcode: UInt8, payload: Data, completion: @escaping (Error?) -> Void) {
-        let frame = WebSocketFraming.encode(Data(payload.prefix(125)), opcode: opcode,
-                                           mask: secureRandom(count: 4))
+        let frame = WebSocketFraming.encode(Data(payload.prefix(125)), opcode: opcode)
         enqueue(frame, completion: completion)
     }
 
@@ -2701,16 +2722,37 @@ private final class WebSocketByteTransport: ByteTransport {
     private func flushWrites() {
         guard !cancelled, !writeInFlight,
               pendingWriteHead < pendingWrites.count else { return }
-        let item = pendingWrites[pendingWriteHead]
+        let startIndex = pendingWriteHead
+        var batchCount = 1
+        var totalBytes = pendingWrites[startIndex].0.count
+        while startIndex + batchCount < pendingWrites.count {
+            let nextLen = pendingWrites[startIndex + batchCount].0.count
+            guard totalBytes + nextLen <= Self.maximumCoalescedSendBytes else { break }
+            totalBytes += nextLen
+            batchCount += 1
+        }
+        let wireData: Data
+        if batchCount == 1 {
+            wireData = pendingWrites[startIndex].0
+        } else {
+            var combined = Data(capacity: totalBytes)
+            for idx in startIndex..<(startIndex + batchCount) {
+                combined.append(pendingWrites[idx].0)
+            }
+            wireData = combined
+        }
         writeInFlight = true
-        nativeDebug("WebSocket sending frame bytes=\(item.0.count)")
-        raw.send(item.0) { [weak self] error in
+        nativeDebug("WebSocket sending frame batch count=\(batchCount) bytes=\(wireData.count)")
+        raw.send(wireData) { [weak self] error in
             self?.sendQueue.async {
                 guard let self, !self.cancelled else { return }
                 self.writeInFlight = false
                 nativeDebug("WebSocket frame completion error=\(error?.localizedDescription ?? "none")")
-                item.1(error)
-                self.pendingWriteHead += 1
+                let endIndex = min(self.pendingWrites.count, self.pendingWriteHead + batchCount)
+                for idx in self.pendingWriteHead..<endIndex {
+                    self.pendingWrites[idx].1(error)
+                }
+                self.pendingWriteHead = endIndex
                 if let error {
                     self.terminateLocked(receiveError: error, cancelRaw: true)
                     return
@@ -2807,8 +2849,11 @@ private final class WebSocketSelfTestRawTransport: ByteTransport {
                 return
             }
             do {
-                let frame = try self.decodeClientFrame(data)
-                self.onClientFrame(frame.0, frame.1)
+                var cursor = data.startIndex
+                while cursor < data.endIndex {
+                    let frame = try self.decodeClientFrame(Data(data[cursor...]), consumed: &cursor, base: cursor)
+                    self.onClientFrame(frame.0, frame.1)
+                }
                 completion(nil)
             } catch { completion(error) }
         }
@@ -2860,7 +2905,7 @@ private final class WebSocketSelfTestRawTransport: ByteTransport {
         }
     }
 
-    private func decodeClientFrame(_ data: Data) throws -> (UInt8, Data) {
+    private func decodeClientFrame(_ data: Data, consumed: inout Data.Index, base: Data.Index) throws -> (UInt8, Data) {
         guard data.count >= 6 else {
             throw NativeOutboundError.protocolError("WebSocket 自检帧被截断")
         }
@@ -2899,6 +2944,7 @@ private final class WebSocketSelfTestRawTransport: ByteTransport {
         offset += 4
         var payload = [UInt8](data[offset..<(offset + length)])
         for index in payload.indices { payload[index] ^= mask[index & 3] }
+        consumed = base + offset + length
         return (opcode, Data(payload))
     }
 }

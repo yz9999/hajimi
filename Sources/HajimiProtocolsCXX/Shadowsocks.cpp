@@ -329,6 +329,22 @@ struct Cipher {
         for (auto &byte:nonce) if (++byte!=0) return;
         exhausted=true;
     }
+    void sealIntoSlice(const uint8_t *plain,size_t plainLen,uint8_t *dstCipherAndTag) {
+        if (exhausted) throw std::runtime_error("Shadowsocks nonce exhausted");
+        if (!crypto::sealInto(method,key.data(),key.size(),nonce.data(),nonce.size(),
+                              plain,plainLen,dstCipherAndTag)) {
+            throw std::runtime_error("AEAD processing failed");
+        }
+        advance();
+    }
+    void openIntoSlice(const uint8_t *sealed,size_t sealedLen,uint8_t *dstPlain) {
+        if (exhausted) throw std::runtime_error("Shadowsocks nonce exhausted");
+        if (!crypto::openInto(method,key.data(),key.size(),nonce.data(),nonce.size(),
+                              sealed,sealedLen,dstPlain)) {
+            throw std::runtime_error("AEAD authentication failed");
+        }
+        advance();
+    }
     Buffer cryptSlice(const uint8_t *data,size_t len,bool encrypt) {
         if (exhausted) throw std::runtime_error("Shadowsocks nonce exhausted");
         Buffer out=encrypt?crypto::sealSlice(method,key,nonce,data,len):crypto::openSlice(method,key,nonce,data,len);
@@ -986,24 +1002,25 @@ public:
 
 class SSStream final : public Stream, public std::enable_shared_from_this<SSStream> {
     struct Write {
-        Buffer data; WriteCallback callback; bool halfClose=false,finished=false;
+        Buffer data; WriteCallback callback; bool halfClose=false,flushHeaderOnly=false,finished=false;
         size_t cost=0;
     };
-    Config config_; Target target_; std::shared_ptr<Stream> raw_; std::shared_ptr<Reader> reader_;
-    std::shared_ptr<Strand> strand_; Admission admission_;
-    Buffer requestSalt_,responseSalt_,received_; size_t receiveOffset_=0;
+    Config config_; Target target_; std::shared_ptr<Stream> raw_; std::shared_ptr<TransportFactory> factory_;
+    std::shared_ptr<Reader> reader_; std::shared_ptr<Strand> strand_; Admission admission_;
+    Buffer requestSalt_,responseSalt_,targetAddress_,received_; size_t receiveOffset_=0;
     std::unique_ptr<Cipher> sendCipher_,receiveCipher_;
     std::unique_ptr<crypto::CipherStream> sendCFB_,receiveCFB_;
     std::unique_ptr<SSRProtocolCodec> ssrProto_;
     std::deque<std::shared_ptr<Write>> writes_;
     std::atomic<bool> readAdmitted_{false}; ReadCallback readCallback_;
     size_t readMaximum_=0; unsigned emptyChunks_=0;
+    bool coalesceHeader_=false,headerSent_=false;
     bool closed_=false,sending_=false,writeEnded_=false,receiveHeader_=false,readEOF_=false,classicResponseCommitted_=false;
     Error terminal_;
     void finishWrite(const std::shared_ptr<Write> &write,Error error) {
         if (write->finished) return;
         write->finished=true;admission_.release(write->cost);
-        auto callback=std::exchange(write->callback,{});callback(std::move(error));
+        auto callback=std::exchange(write->callback,{});if (callback) callback(std::move(error));
     }
     void finishRead(Buffer data,bool eof,Error error) {
         if (!readCallback_) return;
@@ -1017,11 +1034,116 @@ class SSStream final : public Stream, public std::enable_shared_from_this<SSStre
         for (auto &write:pending) finishWrite(write,terminal_);
         finishRead({},true,terminal_);
     }
-    Buffer frame(const Buffer &plain) { return frameSlice(plain.data(),plain.size()); }
-    Buffer frameSlice(const uint8_t *plain,size_t plainLen) {
-        uint8_t length[2]{uint8_t(plainLen>>8),uint8_t(plainLen)};
-        Buffer out=sendCipher_->cryptSlice(length,2,true);
-        append(out,sendCipher_->cryptSlice(plain,plainLen,true));
+    void appendAEADChunksInto(Buffer &out,const uint8_t *plain,size_t plainLen) {
+        if (!plainLen) return;
+        const size_t limit=config_.modern?65535:16383;
+        const size_t numChunks=(plainLen+limit-1)/limit;
+        size_t pos=out.size();
+        out.resize(pos+plainLen+numChunks*34);
+        for (size_t offset=0;offset<plainLen;) {
+            size_t take=std::min(limit,plainLen-offset);
+            uint8_t length[2]{uint8_t(take>>8),uint8_t(take)};
+            sendCipher_->sealIntoSlice(length,2,out.data()+pos);
+            sendCipher_->sealIntoSlice(plain+offset,take,out.data()+pos+18);
+            pos+=take+34;
+            offset+=take;
+        }
+    }
+    Buffer encode2022RequestHeader(const Buffer &address,const uint8_t *initialPayload,size_t initialLen,size_t remPlainLen) {
+        Buffer eih=config_.tcpIdentity(requestSalt_);
+        size_t paddingLen=0;
+        if (initialLen==0) {
+            Buffer random=crypto::randomBytes(2);
+            paddingLen=1+get16(random,0)%900;
+        }
+        const size_t varLen=address.size()+2+paddingLen+initialLen;
+        Buffer varPlain(varLen);
+        std::memcpy(varPlain.data(),address.data(),address.size());
+        varPlain[address.size()]=uint8_t(paddingLen>>8);
+        varPlain[address.size()+1]=uint8_t(paddingLen);
+        if (paddingLen>0) {
+            Buffer pad=crypto::randomBytes(paddingLen);
+            std::memcpy(varPlain.data()+address.size()+2,pad.data(),paddingLen);
+        }
+        if (initialLen>0) {
+            std::memcpy(varPlain.data()+address.size()+2+paddingLen,initialPayload,initialLen);
+        }
+        uint8_t fixed[11];
+        fixed[0]=0;
+        uint64_t ts=unixSeconds();
+        for (int i=7;i>=0;--i) fixed[1+(7-i)]=uint8_t(ts>>(i*8));
+        fixed[9]=uint8_t(varLen>>8);
+        fixed[10]=uint8_t(varLen);
+
+        const size_t remChunks=remPlainLen?((remPlainLen+65534)/65535):0;
+        const size_t headerWireLen=requestSalt_.size()+eih.size()+27+(varLen+16);
+        Buffer out;
+        out.reserve(headerWireLen+remPlainLen+remChunks*34);
+        out.resize(headerWireLen);
+        size_t pos=0;
+        std::memcpy(out.data()+pos,requestSalt_.data(),requestSalt_.size());
+        pos+=requestSalt_.size();
+        if (!eih.empty()) {
+            std::memcpy(out.data()+pos,eih.data(),eih.size());
+            pos+=eih.size();
+        }
+        sendCipher_->sealIntoSlice(fixed,11,out.data()+pos);
+        pos+=27;
+        sendCipher_->sealIntoSlice(varPlain.data(),varLen,out.data()+pos);
+        return out;
+    }
+    Buffer encodeFirstFlightWithPrologue(const uint8_t *payload,size_t payloadLen) {
+        if (config_.cfb) {
+            Buffer output=requestSalt_;
+            if (payloadLen==0) {
+                Buffer framed=ssrProto_?ssrProto_->encodeFirst(targetAddress_):targetAddress_;
+                append(output,sendCFB_->update(framed));
+            } else if (!ssrProto_) {
+                Buffer combined;
+                combined.reserve(targetAddress_.size()+payloadLen);
+                combined.insert(combined.end(),targetAddress_.begin(),targetAddress_.end());
+                combined.insert(combined.end(),payload,payload+payloadLen);
+                append(output,sendCFB_->update(combined));
+            } else {
+                Buffer framed=ssrProto_->encodeFirst(targetAddress_);
+                Buffer tail=ssrProto_->encodeChunk(Buffer(payload,payload+payloadLen));
+                append(framed,tail);
+                append(output,sendCFB_->update(framed));
+            }
+            return output;
+        }
+        if (!config_.modern) {
+            const size_t maxInitial=16383>targetAddress_.size()?(16383-targetAddress_.size()):0;
+            const size_t slice0=std::min(payloadLen,maxInitial);
+            const size_t chunk0Len=targetAddress_.size()+slice0;
+            const size_t remLen=payloadLen-slice0;
+            const size_t remChunks=remLen?((remLen+16382)/16383):0;
+            Buffer out;
+            out.reserve(requestSalt_.size()+chunk0Len+34+remLen+remChunks*34);
+            out.resize(requestSalt_.size()+chunk0Len+34);
+            std::memcpy(out.data(),requestSalt_.data(),requestSalt_.size());
+            uint8_t length[2]{uint8_t(chunk0Len>>8),uint8_t(chunk0Len)};
+            sendCipher_->sealIntoSlice(length,2,out.data()+requestSalt_.size());
+            if (slice0==0) {
+                sendCipher_->sealIntoSlice(targetAddress_.data(),targetAddress_.size(),out.data()+requestSalt_.size()+18);
+            } else {
+                Buffer chunk0Plain(chunk0Len);
+                std::memcpy(chunk0Plain.data(),targetAddress_.data(),targetAddress_.size());
+                std::memcpy(chunk0Plain.data()+targetAddress_.size(),payload,slice0);
+                sendCipher_->sealIntoSlice(chunk0Plain.data(),chunk0Len,out.data()+requestSalt_.size()+18);
+            }
+            if (remLen>0) {
+                appendAEADChunksInto(out,payload+slice0,remLen);
+            }
+            return out;
+        }
+        const size_t maxInitial=65535>(targetAddress_.size()+2)?(65535-targetAddress_.size()-2):0;
+        const size_t slice0=std::min(payloadLen,maxInitial);
+        const size_t remLen=payloadLen-slice0;
+        Buffer out=encode2022RequestHeader(targetAddress_,payload,slice0,remLen);
+        if (remLen>0) {
+            appendAEADChunksInto(out,payload+slice0,remLen);
+        }
         return out;
     }
     Buffer encode(const Buffer &data) {
@@ -1029,15 +1151,17 @@ class SSStream final : public Stream, public std::enable_shared_from_this<SSStre
             Buffer framed = ssrProto_ ? ssrProto_->encodeChunk(data) : data;
             return sendCFB_->update(framed);
         }
-        size_t limit=config_.modern?65535:16383;
-        if (data.size()<=limit) return frameSlice(data.data(),data.size());
         Buffer out;
-        out.reserve(data.size()+((data.size()+limit-1)/limit)*34);
-        for (size_t offset=0;offset<data.size();) {
-            size_t take=std::min(limit,data.size()-offset);
-            append(out,frameSlice(data.data()+offset,take));offset+=take;
-        }
+        appendAEADChunksInto(out,data.data(),data.size());
         return out;
+    }
+    void flushPendingHeaderIfIdle() {
+        if (closed_ || writeEnded_ || headerSent_ || !writes_.empty()) return;
+        auto write=std::make_shared<Write>();
+        write->flushHeaderOnly=true;
+        write->callback=[](Error){};
+        writes_.push_back(std::move(write));
+        pumpWrites();
     }
     void pumpWrites() {
         if (closed_ || sending_ || writes_.empty()) return;
@@ -1051,9 +1175,36 @@ class SSStream final : public Stream, public std::enable_shared_from_this<SSStre
             });
         };
         try {
-            if (write->halfClose) raw_->shutdownWrite(std::move(done));
-            else if (write->data.empty()) done({});
-            else raw_->write(encode(write->data),std::move(done));
+            if (write->halfClose) {
+                if (!headerSent_) {
+                    headerSent_=true;
+                    Buffer prologue=encodeFirstFlightWithPrologue(nullptr,0);
+                    raw_->write(std::move(prologue),[self,done=std::move(done)](Error err) mutable {
+                        if (!err.empty()) done(std::move(err));
+                        else self->raw_->shutdownWrite(std::move(done));
+                    });
+                } else {
+                    raw_->shutdownWrite(std::move(done));
+                }
+            } else if (write->flushHeaderOnly) {
+                if (headerSent_) done({});
+                else {
+                    headerSent_=true;
+                    raw_->write(encodeFirstFlightWithPrologue(nullptr,0),std::move(done));
+                }
+            } else if (write->data.empty()) {
+                if (!headerSent_) {
+                    headerSent_=true;
+                    raw_->write(encodeFirstFlightWithPrologue(nullptr,0),std::move(done));
+                } else {
+                    done({});
+                }
+            } else if (!headerSent_) {
+                headerSent_=true;
+                raw_->write(encodeFirstFlightWithPrologue(write->data.data(),write->data.size()),std::move(done));
+            } else {
+                raw_->write(encode(write->data),std::move(done));
+            }
         } catch (const std::exception &e) {fail(e.what());}
     }
     void enqueue(Buffer data,WriteCallback completion,bool halfClose) {
@@ -1176,9 +1327,9 @@ class SSStream final : public Stream, public std::enable_shared_from_this<SSStre
             });return;
         }
         exact(18,true,[self](Buffer data) {
-            Buffer length=self->receiveCipher_->crypt(data,false);
-            if (length.size()!=2) throw std::runtime_error("Shadowsocks length chunk invalid");
-            size_t count=get16(length,0);
+            uint8_t length[2]{};
+            self->receiveCipher_->openIntoSlice(data.data(),18,length);
+            size_t count=(size_t(length[0])<<8)|length[1];
             if (count>(self->config_.modern?65535:16383)) throw std::runtime_error("Shadowsocks chunk exceeds limit");
             self->body(count);
         });
@@ -1187,8 +1338,10 @@ public:
     SSStream(Config config,Target target,std::shared_ptr<Stream> raw,std::shared_ptr<TransportFactory> factory)
         :config_(std::move(config)),target_(std::move(target)),
          raw_(config_.ssrObfs!="plain"?std::static_pointer_cast<Stream>(std::make_shared<SSRObfsStream>(std::move(raw),config_)):std::move(raw)),
+         factory_(std::move(factory)),
          reader_(std::make_shared<Reader>(raw_)),
-         strand_(std::make_shared<Strand>(std::move(factory))) {
+         strand_(std::make_shared<Strand>(factory_)),
+         coalesceHeader_(factory_ && static_cast<bool>(factory_->after)) {
         requestSalt_=!config_.modern && !config_.cfb?freshClassicSalt(config_,false):
             crypto::randomBytes(config_.cfb?config_.streamIvLength:config_.keyLength);
         if (config_.cfb) {
@@ -1208,20 +1361,20 @@ public:
         };
         strand_->post([self,finish]() mutable {
             try {
-                Buffer address=socksAddress(self->target_);
-                if (address.empty()) throw std::runtime_error("Shadowsocks target invalid");
-                Buffer output=self->requestSalt_;
-                if (self->config_.cfb) {
-                    Buffer framed = self->ssrProto_ ? self->ssrProto_->encodeFirst(address) : address;
-                    append(output,self->sendCFB_->update(framed));
-                } else if (!self->config_.modern) append(output,self->frame(address));
-                else {
-                    Buffer random=crypto::randomBytes(2);size_t padding=1+get16(random,0)%900;
-                    put16(address,padding);append(address,crypto::randomBytes(padding));
-                    Buffer fixed{0};put64(fixed,unixSeconds());put16(fixed,address.size());
-                    append(output,self->config_.tcpIdentity(self->requestSalt_));
-                    append(output,self->sendCipher_->crypt(fixed,true));append(output,self->sendCipher_->crypt(address,true));
+                self->targetAddress_=socksAddress(self->target_);
+                if (self->targetAddress_.empty()) throw std::runtime_error("Shadowsocks target invalid");
+                if (self->coalesceHeader_) {
+                    std::weak_ptr<SSStream> weak=self;
+                    self->factory_->after(0.1,[weak] {
+                        if (auto strong=weak.lock()) {
+                            strong->strand_->post([strong] { strong->flushPendingHeaderIfIdle(); });
+                        }
+                    });
+                    finish(self,{});
+                    return;
                 }
+                self->headerSent_=true;
+                Buffer output=self->encodeFirstFlightWithPrologue(nullptr,0);
                 self->raw_->write(std::move(output),[self,finish](Error error) mutable {
                     self->strand_->post([self,finish,error=std::move(error)]() mutable {
                         if (!error.empty()) {self->fail(error);finish(nullptr,std::move(error));}

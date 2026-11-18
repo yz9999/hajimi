@@ -2,6 +2,7 @@
 // protocol and sing-box UoT v2. Reference protocol: anytls/anytls-go docs.
 #include "AnyTLS.hpp"
 #include "Crypto.hpp"
+#include "ProtocolCommon.hpp"
 #include <algorithm>
 #include <arpa/inet.h>
 #include <atomic>
@@ -163,24 +164,25 @@ Buffer encodeUoTPacket(const Target &target, const Buffer &payload) {
     address.insert(address.end(), payload.begin(), payload.end());
     return address;
 }
-bool decodeUoTPacket(const Buffer &bytes, size_t &consumed, Target &target, Buffer &payload) {
+namespace {
+bool decodeUoTPacketSlice(const uint8_t *bytes, size_t avail, size_t &consumed, Target &target, Buffer &payload) {
     consumed = 0;
-    if (bytes.empty()) return false;
+    if (!avail || !bytes) return false;
     size_t addressLength;
     uint8_t socksType;
     switch (bytes[0]) {
         case 0: addressLength = 7; socksType = 1; break;
         case 1: addressLength = 19; socksType = 4; break;
         case 2:
-            if (bytes.size() < 2) return false;
+            if (avail < 2) return false;
             if (!bytes[1]) throw std::runtime_error("Empty AnyTLS UoT domain");
             addressLength = 4 + bytes[1]; socksType = 3; break;
         default: throw std::runtime_error("Invalid AnyTLS UoT address family");
     }
-    if (bytes.size() < addressLength + 2) return false;
-    size_t length = get16(bytes.data() + addressLength);
-    if (bytes.size() < addressLength + 2 + length) return false;
-    Buffer address(bytes.begin(), bytes.begin() + addressLength);
+    if (avail < addressLength + 2) return false;
+    size_t length = get16(bytes + addressLength);
+    if (avail < addressLength + 2 + length) return false;
+    Buffer address(bytes, bytes + addressLength);
     address[0] = socksType;
     size_t parsed = 0;
     target = parseSocksAddress(address, parsed);
@@ -188,8 +190,13 @@ bool decodeUoTPacket(const Buffer &bytes, size_t &consumed, Target &target, Buff
         throw std::runtime_error("Invalid AnyTLS UoT destination");
     target.udp = true;
     consumed = addressLength + 2 + length;
-    payload.assign(bytes.begin() + addressLength + 2, bytes.begin() + consumed);
+    payload.assign(bytes + addressLength + 2, bytes + consumed);
     return true;
+}
+} // namespace
+
+bool decodeUoTPacket(const Buffer &bytes, size_t &consumed, Target &target, Buffer &payload) {
+    return decodeUoTPacketSlice(bytes.data(), bytes.size(), consumed, target, payload);
 }
 } // namespace anytls
 
@@ -694,7 +701,7 @@ public:
 private:
     std::shared_ptr<Stream> stream_;
     std::shared_ptr<TransportFactory> factory_;
-    Buffer input_;
+    proto_common::CursorBuffer input_;
     bool closed_ = false, started_ = false;
     PacketCallback receive_;
     WriteCallback failure_;
@@ -713,14 +720,15 @@ private:
             if (data.size() > maximumQueuedBytes - self->input_.size()) {
                 self->fail("AnyTLS UoT input reached its bound"); return;
             }
-            self->input_.insert(self->input_.end(), data.begin(), data.end());
+            self->input_.append(data.data(), data.size());
             try {
                 for (;;) {
                     size_t consumed = 0;
                     Target target;
                     Buffer payload;
-                    if (!anytls::decodeUoTPacket(self->input_, consumed, target, payload)) break;
-                    self->input_.erase(self->input_.begin(), self->input_.begin() + consumed);
+                    if (!anytls::decodeUoTPacketSlice(self->input_.data(), self->input_.size(),
+                                                      consumed, target, payload)) break;
+                    self->input_.advance(consumed);
                     self->receive_(std::move(target), std::move(payload));
                     if (self->closed_) return;
                 }

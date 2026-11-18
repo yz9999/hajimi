@@ -74,14 +74,16 @@ public enum NativeCoreSelfTest {
                                     sackPermitted: true, identifier: 8)
         guard let parsedSYN = ParsedIPPacket([UInt8](syn)),
               let synSegment = ParsedTCPSegment(parsedSYN),
+              synSegment.maximumSegmentSize == 1_460,
               synSegment.windowScale == 6, synSegment.sackPermitted,
               internetChecksum(syn.prefix(20)) == 0 else {
-            return "TCP window-scale option self-test failed"
+            return "TCP MSS / window-scale option self-test failed"
         }
         if let failure = sackOptionSelfTest(source: source, destination: destination) {
             return failure
         }
         if let failure = retransmissionTimerSelfTest() { return failure }
+        if let failure = bdpAndShrinkSelfTest() { return failure }
         if let failure = sackScoreboardSelfTest() { return failure }
         if let failure = sackApplicationCacheSelfTest() { return failure }
         if let failure = tcpCoalesceSelfTest() { return failure }
@@ -89,6 +91,7 @@ public enum NativeCoreSelfTest {
         if let failure = flowAdmissionSelfTest() { return failure }
         if let failure = packetDrainBudgetSelfTest() { return failure }
         if let failure = nonblockingDescriptorSelfTest() { return failure }
+        if let failure = batchAckSackAndMSSSelfTest() { return failure }
         if let failure = icmpEchoReplySelfTest(source: source, destination: destination) {
             return failure
         }
@@ -632,6 +635,371 @@ public enum NativeCoreSelfTest {
         for _ in 0..<50 { slow.update(sample: 30) }
         guard slow.timeout == RetransmissionTimer.maximum else {
             return "RTO exceeded its ceiling on a slow link: \(slow.timeout)"
+        }
+
+        // RFC 8985 RACK-TLP probe timeout (PTO) bounds.
+        var tlpTimer = RetransmissionTimer()
+        tlpTimer.update(sample: 0.040)
+        let singlePTO = tlpTimer.probeTimeout(flightSize: 1_460, mss: 1_460)
+        let multiPTO = tlpTimer.probeTimeout(flightSize: 8 * 1_460, mss: 1_460)
+        guard singlePTO >= 0.010, singlePTO <= tlpTimer.timeout,
+              multiPTO >= 0.010, multiPTO <= tlpTimer.timeout else {
+            return "RFC 8985 PTO fell outside [10ms, RTO]: single=\(singlePTO), multi=\(multiPTO)"
+        }
+        return nil
+    }
+
+    private static func bdpAndShrinkSelfTest() -> String? {
+        let beforeBudget = hajimi_flow_buffer_budget_used()
+        do {
+            let queue = NativeByteQueue(limit: 512 * 1_024)
+            guard queue.isValid, queue.isEmpty else { return "NativeByteQueue failed to initialize" }
+            let chunk = Data(repeating: 0x42, count: 300 * 1_024)
+            guard queue.append(chunk), queue.residentCapacity >= 256 * 1_024 else {
+                return "NativeByteQueue failed to grow for 300 KiB burst"
+            }
+            queue.consume(chunk.count)
+            guard queue.isEmpty, queue.residentCapacity >= 256 * 1_024 else {
+                return "NativeByteQueue lost empty state before shrinkToFit"
+            }
+            queue.shrinkToFit()
+            guard queue.residentCapacity == 0 else {
+                return "NativeByteQueue.shrinkToFit did not release empty backing buffer"
+            }
+        }
+        guard hajimi_flow_buffer_budget_used() == beforeBudget else {
+            return "NativeByteQueue.shrinkToFit leaked shared flow buffer budget"
+        }
+
+        var bdp = NativeBDPEstimator(windowSeconds: 10.0)
+        guard !bdp.isInitialized else { return "fresh BDP estimator reported initialized" }
+        bdp.observe(deliveredBytes: 131_072, rtt: 0.010, timestamp: 1.0)
+        guard bdp.isInitialized, bdp.maxBandwidth >= 13_000_000 else {
+            return "BDP estimator failed to record delivery bandwidth"
+        }
+        let steady = bdp.recommendedWindow(mss: 1_460, minWindow: TCPFlow.minimumBDPWindowBytes, maxWindow: 8 * 1_024 * 1_024)
+        guard steady >= TCPFlow.minimumBDPWindowBytes else {
+            return "BDP recommended window violated minimum floor: \(steady)"
+        }
+        bdp.observe(deliveredBytes: 1_048_576, rtt: 0.005, timestamp: 1.5)
+        let highBDP = bdp.recommendedWindow(mss: 1_460, minWindow: TCPFlow.minimumBDPWindowBytes, maxWindow: 8 * 1_024 * 1_024)
+        bdp.observe(deliveredBytes: 65_536, rtt: 0.030, timestamp: 1.7)
+        bdp.observe(deliveredBytes: 65_536, rtt: 0.032, timestamp: 1.9)
+        bdp.observe(deliveredBytes: 65_536, rtt: 0.035, timestamp: 2.1)
+        let drained = bdp.recommendedWindow(mss: 1_460, minWindow: TCPFlow.minimumBDPWindowBytes, maxWindow: 8 * 1_024 * 1_024)
+        guard bdp.standingQueueRounds >= 3, drained < highBDP else {
+            return "CoDel standing-queue inflation did not drain BDP window"
+        }
+        bdp.observeLoss(inflightBytes: 600_000, lostBytes: 30_000, deliveredBytes: 100_000)
+        let lossClamped = bdp.recommendedWindow(mss: 1_460, minWindow: 256 * 1_024, maxWindow: 8 * 1_024 * 1_024)
+        guard bdp.lossEvents >= 1, lossClamped <= 600_000 else {
+            return "BBRv3 loss headroom failed to clamp window"
+        }
+        return nil
+    }
+
+    private final class SelfTestCaptureStream: NativeOutboundByteStream {
+        private let lock = NSLock()
+        private(set) var sendCallCount = 0
+        private(set) var receivedUpload = Data()
+        private var pendingReceive: ((Int, (Data?, Bool, Error?) -> Void))?
+        private var queuedDownload = Data()
+        private var eofQueued = false
+        private var cancelled = false
+
+        func enqueueDownload(_ data: Data, eof: Bool = false) {
+            var callback: ((Data?, Bool, Error?) -> Void)?
+            var slice: Data?
+            var doneEOF = false
+            lock.lock()
+            queuedDownload.append(data)
+            if eof { eofQueued = true }
+            if let (maximum, completion) = pendingReceive, (!queuedDownload.isEmpty || eofQueued) {
+                pendingReceive = nil
+                let count = min(maximum, queuedDownload.count)
+                if count > 0 {
+                    slice = Data(queuedDownload.prefix(count))
+                    queuedDownload.removeFirst(count)
+                }
+                doneEOF = queuedDownload.isEmpty && eofQueued
+                callback = completion
+            }
+            lock.unlock()
+            callback?(slice, doneEOF, nil)
+        }
+
+        var snapshot: (sends: Int, uploaded: Data) {
+            lock.lock(); defer { lock.unlock() }
+            return (sendCallCount, receivedUpload)
+        }
+
+        func send(_ data: Data, completion: @escaping (Error?) -> Void) {
+            lock.lock()
+            let isCancelled = cancelled
+            if !isCancelled {
+                sendCallCount += 1
+                receivedUpload.append(data)
+            }
+            lock.unlock()
+            completion(isCancelled ? NativeTunnelError.utun("cancelled") : nil)
+        }
+
+        func receive(maximum: Int, completion: @escaping (Data?, Bool, Error?) -> Void) {
+            var immediate: (Data?, Bool)?
+            lock.lock()
+            if !queuedDownload.isEmpty || eofQueued {
+                let count = min(maximum, queuedDownload.count)
+                let chunk = count > 0 ? Data(queuedDownload.prefix(count)) : nil
+                if count > 0 { queuedDownload.removeFirst(count) }
+                let doneEOF = queuedDownload.isEmpty && eofQueued
+                immediate = (chunk, doneEOF)
+            } else if !cancelled {
+                pendingReceive = (maximum, completion)
+            }
+            lock.unlock()
+            if let (chunk, doneEOF) = immediate {
+                completion(chunk, doneEOF, nil)
+            }
+        }
+
+        func cancel() {
+            var pending: ((Data?, Bool, Error?) -> Void)?
+            lock.lock()
+            cancelled = true
+            pending = pendingReceive?.1
+            pendingReceive = nil
+            lock.unlock()
+            pending?(nil, true, NativeTunnelError.utun("cancelled"))
+        }
+    }
+
+    private static func readAvailableFrames(from descriptor: Int32) -> [Data] {
+        var frames: [Data] = []
+        var buffer = [UInt8](repeating: 0, count: 65_540)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { Darwin.recv(descriptor, $0.baseAddress!, $0.count, 0) }
+            guard count > 4 else { break }
+            frames.append(Data(buffer[4..<count]))
+        }
+        return frames
+    }
+
+    /// Verifies batch ACK + upload coalescing, symmetric RFC 2018 outbound SACK,
+    /// RFC 9293 client MSS negotiation / IPv6 8172 clamping, and on-demand 20ms
+    /// active retransmit timer suspend/resume safety.
+    private static func batchAckSackAndMSSSelfTest() -> String? {
+        do {
+            // 1. IPv4 flow: MSS=1380 negotiation, active timer suspend/resume, batch coalescing, and outbound SACK.
+            let stream = SelfTestCaptureStream()
+            let tunnel = try NativeTunnel.makeIsolatedSelfTestTunnel(stream: stream, initialSequence: 50_000)
+            var fds = [Int32](repeating: -1, count: 2)
+            guard fds.withUnsafeMutableBufferPointer({ socketpair(AF_UNIX, SOCK_DGRAM, 0, $0.baseAddress!) }) == 0 else {
+                return "batch self-test socketpair failed"
+            }
+            let peer = fds[1]
+            _ = fcntl(peer, F_SETFL, fcntl(peer, F_GETFL, 0) | O_NONBLOCK)
+            var sockBuf: Int32 = 1_024 * 1_024
+            _ = setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sockBuf, socklen_t(MemoryLayout<Int32>.size))
+            _ = setsockopt(peer, SOL_SOCKET, SO_RCVBUF, &sockBuf, socklen_t(MemoryLayout<Int32>.size))
+            defer { tunnel.stop(); Darwin.close(peer) }
+
+            _ = try tunnel.start(fileDescriptor: fds[0], interfaceName: "batch-selftest0")
+            guard !tunnel.isActiveRetransmitTimerRunningForSelfTest else {
+                return "activeRetransmitTimer was running with zero outstanding TCP flows"
+            }
+
+            let client = IPAddress.v4([198, 18, 0, 9])
+            let remote = IPAddress.v4([203, 0, 113, 7])
+            var clientSeq: UInt32 = 10_000
+            let synPacket = PacketBuilder.tcp(version: .v4, source: client, sourcePort: 54_321,
+                                              destination: remote, destinationPort: 9443,
+                                              sequence: clientSeq, acknowledgment: 0, flags: [.syn],
+                                              window: 65_535, payload: Data(),
+                                              maximumSegmentSize: 1_380, windowScale: 6,
+                                              sackPermitted: true, identifier: 1)
+            tunnel.processIPPacketForSelfTest(synPacket)
+            clientSeq &+= 1
+
+            // While SYN+ACK is unacknowledged, the 20 ms timer must be resumed.
+            guard tunnel.isActiveRetransmitTimerRunningForSelfTest else {
+                return "activeRetransmitTimer did not resume for unacknowledged SYN+ACK"
+            }
+            let synAckFrames = readAvailableFrames(from: peer)
+            guard synAckFrames.count == 1,
+                  let parsedSynAckIP = ParsedIPPacket([UInt8](synAckFrames[0])),
+                  let synAck = ParsedTCPSegment(parsedSynAckIP),
+                  synAck.flags.contains([.syn, .ack]) else {
+                return "SYN+ACK was not emitted"
+            }
+            var serverSeq = synAck.sequence &+ 1
+            let handshakeAck = PacketBuilder.tcp(version: .v4, source: client, sourcePort: 54_321,
+                                                 destination: remote, destinationPort: 9443,
+                                                 sequence: clientSeq, acknowledgment: serverSeq,
+                                                 flags: [.ack], window: 65_535, payload: Data(),
+                                                 maximumSegmentSize: nil, windowScale: nil,
+                                                 sackPermitted: false, identifier: 2)
+            tunnel.processIPPacketForSelfTest(handshakeAck)
+            // Once SYN+ACK is acknowledged and zero segments remain in flight, timer must suspend immediately.
+            guard !tunnel.isActiveRetransmitTimerRunningForSelfTest else {
+                return "activeRetransmitTimer remained active after flight drained to zero"
+            }
+
+            // Coalesce 16 in-order 1,000-byte upload segments in a single batch -> 1 cumulative ACK & 1 stream.send!
+            var expectedUpload = Data()
+            var uploadBatch: [Data] = []
+            for idx in 0..<16 {
+                let chunk = Data((0..<1_000).map { UInt8(($0 + idx * 13) & 0xff) })
+                expectedUpload.append(chunk)
+                let seg = PacketBuilder.tcp(version: .v4, source: client, sourcePort: 54_321,
+                                            destination: remote, destinationPort: 9443,
+                                            sequence: clientSeq, acknowledgment: serverSeq,
+                                            flags: [.ack, .psh], window: 65_535, payload: chunk,
+                                            maximumSegmentSize: nil, windowScale: nil,
+                                            sackPermitted: false, identifier: UInt16(10 + idx))
+                uploadBatch.append(seg)
+                clientSeq &+= UInt32(chunk.count)
+            }
+            tunnel.processIPPacketBatchForSelfTest(uploadBatch)
+            let batchAckFrames = readAvailableFrames(from: peer)
+            guard batchAckFrames.count == 1,
+                  let batchAckIP = ParsedIPPacket([UInt8](batchAckFrames[0])),
+                  let batchAck = ParsedTCPSegment(batchAckIP),
+                  batchAck.acknowledgment == clientSeq,
+                  batchAck.sackBlocks.isEmpty else {
+                return "batch upload did not coalesce into 1 cumulative ACK (got \(batchAckFrames.count))"
+            }
+            let snap1 = stream.snapshot
+            guard snap1.sends == 1, snap1.uploaded == expectedUpload else {
+                return "batch upload did not coalesce into 1 exact stream.send (sends=\(snap1.sends), bytes=\(snap1.uploaded.count))"
+            }
+
+            // Out-of-order upload segment during batch must emit immediate RFC 2018 outbound SACK!
+            let missingChunk = Data(repeating: 0xaa, count: 500)
+            let oooChunk1 = Data(repeating: 0xbb, count: 600)
+            let oooChunk2 = Data(repeating: 0xcc, count: 400)
+            let oooSeg1 = PacketBuilder.tcp(version: .v4, source: client, sourcePort: 54_321,
+                                            destination: remote, destinationPort: 9443,
+                                            sequence: clientSeq &+ 500, acknowledgment: serverSeq,
+                                            flags: [.ack, .psh], window: 65_535, payload: oooChunk1,
+                                            maximumSegmentSize: nil, windowScale: nil,
+                                            sackPermitted: false, identifier: 40)
+            let oooSeg2 = PacketBuilder.tcp(version: .v4, source: client, sourcePort: 54_321,
+                                            destination: remote, destinationPort: 9443,
+                                            sequence: clientSeq &+ 1_100, acknowledgment: serverSeq,
+                                            flags: [.ack, .psh], window: 65_535, payload: oooChunk2,
+                                            maximumSegmentSize: nil, windowScale: nil,
+                                            sackPermitted: false, identifier: 41)
+            tunnel.processIPPacketBatchForSelfTest([oooSeg1, oooSeg2])
+            let sackFrames = readAvailableFrames(from: peer)
+            guard sackFrames.count == 2,
+                  let lastSackIP = ParsedIPPacket([UInt8](sackFrames[1])),
+                  let lastSack = ParsedTCPSegment(lastSackIP),
+                  lastSack.acknowledgment == clientSeq,
+                  lastSack.sackBlocks == [SACKBlock(start: clientSeq &+ 500, end: clientSeq &+ 1_500)] else {
+                return "outbound RFC 2018 SACK option was not attached or coalesced for OOO upload"
+            }
+
+            // Filling the OOO gap clears SACK blocks and delivers contiguous upload bytes.
+            let fillSeg = PacketBuilder.tcp(version: .v4, source: client, sourcePort: 54_321,
+                                            destination: remote, destinationPort: 9443,
+                                            sequence: clientSeq, acknowledgment: serverSeq,
+                                            flags: [.ack, .psh], window: 65_535, payload: missingChunk,
+                                            maximumSegmentSize: nil, windowScale: nil,
+                                            sackPermitted: false, identifier: 42)
+            tunnel.processIPPacketBatchForSelfTest([fillSeg])
+            clientSeq &+= 1_500
+            let fillFrames = readAvailableFrames(from: peer)
+            guard !fillFrames.isEmpty,
+                  let fillIP = ParsedIPPacket([UInt8](fillFrames.last!)),
+                  let fillAck = ParsedTCPSegment(fillIP),
+                  fillAck.acknowledgment == clientSeq,
+                  fillAck.sackBlocks.isEmpty else {
+                return "gap-filling segment did not advance cumulative ACK and clear SACK"
+            }
+            expectedUpload.append(missingChunk)
+            expectedUpload.append(oooChunk1)
+            expectedUpload.append(oooChunk2)
+            guard stream.snapshot.uploaded == expectedUpload else {
+                return "reordered upload bytes differed after gap fill"
+            }
+
+            // Verify peerEffectiveMSS = 1380 caps outbound download segments to <= 1380 bytes!
+            stream.enqueueDownload(Data(repeating: 0x7e, count: 3_000))
+            // Serialize with tunnel queue so async receive callback has flushed onto peer.
+            _ = tunnel.statistics()
+            let dlFrames = readAvailableFrames(from: peer)
+            guard dlFrames.count == 3 else {
+                return "MSS=1380 3000B download expected 3 segments (1380+1380+240), got \(dlFrames.count)"
+            }
+            var dlSizes: [Int] = []
+            for frame in dlFrames {
+                guard let ip = ParsedIPPacket([UInt8](frame)),
+                      let seg = ParsedTCPSegment(ip),
+                      tcpTransportChecksumValid(packet: frame, version: .v4, source: remote, destination: client) else {
+                    return "invalid IPv4 download segment checksum"
+                }
+                dlSizes.append(seg.payload.count)
+                serverSeq &+= UInt32(seg.payload.count)
+            }
+            guard dlSizes == [1_380, 1_380, 240] else {
+                return "unexpected MSS=1380 segment sizes: \(dlSizes)"
+            }
+            // Note: leave these 3 segments unacknowledged when `tunnel.stop()` runs via defer/explicit call
+            // so we ALSO test cancelling `activeRetransmitTimer` while actively running!
+            guard tunnel.isActiveRetransmitTimerRunningForSelfTest else {
+                return "activeRetransmitTimer was not running for unacknowledged download flight"
+            }
+            tunnel.stop()
+
+            // 2. IPv6 flow: verify oversized client MSS=8940 is clamped to 8172 (IPv6 utun max payload)!
+            let stream6 = SelfTestCaptureStream()
+            let tunnel6 = try NativeTunnel.makeIsolatedSelfTestTunnel(stream: stream6, initialSequence: 90_000)
+            var fds6 = [Int32](repeating: -1, count: 2)
+            guard fds6.withUnsafeMutableBufferPointer({ socketpair(AF_UNIX, SOCK_DGRAM, 0, $0.baseAddress!) }) == 0 else {
+                return "IPv6 MSS self-test socketpair failed"
+            }
+            let peer6 = fds6[1]
+            _ = fcntl(peer6, F_SETFL, fcntl(peer6, F_GETFL, 0) | O_NONBLOCK)
+            _ = setsockopt(fds6[0], SOL_SOCKET, SO_SNDBUF, &sockBuf, socklen_t(MemoryLayout<Int32>.size))
+            _ = setsockopt(peer6, SOL_SOCKET, SO_RCVBUF, &sockBuf, socklen_t(MemoryLayout<Int32>.size))
+            defer { tunnel6.stop(); Darwin.close(peer6) }
+            _ = try tunnel6.start(fileDescriptor: fds6[0], interfaceName: "ipv6-mss-selftest0")
+
+            let client6 = IPAddress.v6([0x20, 0x01, 0x0d, 0xb8] + Array(repeating: 0, count: 11) + [1])
+            let remote6 = IPAddress.v6([0x20, 0x01, 0x0d, 0xb8] + Array(repeating: 0, count: 11) + [7])
+            let syn6 = PacketBuilder.tcp(version: .v6, source: client6, sourcePort: 55_000,
+                                         destination: remote6, destinationPort: 9443,
+                                         sequence: 1_000, acknowledgment: 0, flags: [.syn],
+                                         window: 65_535, payload: Data(),
+                                         maximumSegmentSize: 8_940, windowScale: 6,
+                                         sackPermitted: true, identifier: 0)
+            tunnel6.processIPPacketForSelfTest(syn6)
+            let synAck6Frames = readAvailableFrames(from: peer6)
+            guard synAck6Frames.count == 1,
+                  let ip6 = ParsedIPPacket([UInt8](synAck6Frames[0])),
+                  let synAck6 = ParsedTCPSegment(ip6),
+                  synAck6.maximumSegmentSize == 8_172 else {
+                return "IPv6 SYN+ACK did not advertise 8172 MSS"
+            }
+            let ack6 = PacketBuilder.tcp(version: .v6, source: client6, sourcePort: 55_000,
+                                         destination: remote6, destinationPort: 9443,
+                                         sequence: 1_001, acknowledgment: synAck6.sequence &+ 1,
+                                         flags: [.ack], window: 65_535, payload: Data(),
+                                         maximumSegmentSize: nil, windowScale: nil,
+                                         sackPermitted: false, identifier: 0)
+            tunnel6.processIPPacketForSelfTest(ack6)
+            stream6.enqueueDownload(Data(repeating: 0x33, count: 9_000))
+            _ = tunnel6.statistics()
+            let dl6Frames = readAvailableFrames(from: peer6)
+            guard dl6Frames.count == 2,
+                  let firstIP6 = ParsedIPPacket([UInt8](dl6Frames[0])),
+                  let firstSeg6 = ParsedTCPSegment(firstIP6),
+                  firstSeg6.payload.count == 8_172,
+                  tcpTransportChecksumValid(packet: dl6Frames[0], version: .v6, source: remote6, destination: client6) else {
+                return "IPv6 download segment was not clamped to 8172 bytes"
+            }
+        } catch {
+            return "batchAckSackAndMSSSelfTest threw: \(error.localizedDescription)"
         }
         return nil
     }

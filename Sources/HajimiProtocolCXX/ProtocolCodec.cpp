@@ -537,12 +537,51 @@ void rewriteHTTP(Writer &w, const uint8_t *p, size_t n, const ParsedHTTP &parsed
     }
     w.byte(' '); w.bytes(p + r.version_offset, r.version_length); w.literal("\r\nHost: ");
     w.bytes(host, hostLength); w.literal("\r\n");
+
+    struct ConnToken { uint32_t offset; uint32_t length; };
+    ConnToken connTokens[128];
+    size_t connTokenCount = 0;
+    bool connTokenOverflow = false;
+    for (size_t i = 0; i < parsed.count; ++i) {
+        const HTTPField &field = parsed.fields[i];
+        if (field.nameLength != 10 || !equal(p + field.offset, 10, "connection")) { continue; }
+        size_t offset = field.valueOffset, end = offset + field.valueLength;
+        while (offset < end) {
+            while (offset < end && (p[offset] == ' ' || p[offset] == '\t' || p[offset] == ',')) { ++offset; }
+            const size_t start = offset;
+            while (offset < end && token(p[offset])) { ++offset; }
+            const size_t tlen = offset - start;
+            if (tlen == 0) { continue; }
+            if (equal(p + start, tlen, "close") || equal(p + start, tlen, "keep-alive") ||
+                equal(p + start, tlen, "upgrade")) { continue; }
+            if (connTokenCount < 128) {
+                connTokens[connTokenCount++] = {static_cast<uint32_t>(start), static_cast<uint32_t>(tlen)};
+            } else {
+                connTokenOverflow = true;
+                break;
+            }
+        }
+        if (connTokenOverflow) { break; }
+    }
+
     for (size_t i = 0; i < parsed.count; ++i) {
         const auto &f = parsed.fields[i]; const auto *name = p + f.offset;
         if (equal(name, f.nameLength, "host") || equal(name, f.nameLength, "proxy-authorization") ||
             equal(name, f.nameLength, "proxy-connection") || equal(name, f.nameLength, "connection") ||
             equal(name, f.nameLength, "keep-alive") || equal(name, f.nameLength, "te") ||
-            equal(name, f.nameLength, "upgrade") || connectionNominates(p, parsed, f)) { continue; }
+            equal(name, f.nameLength, "upgrade")) { continue; }
+        bool nominated = false;
+        for (size_t k = 0; k < connTokenCount; ++k) {
+            if (connTokens[k].length == f.nameLength) {
+                bool same = true;
+                const uint8_t *tp = p + connTokens[k].offset;
+                for (size_t j = 0; j < f.nameLength; ++j) {
+                    if (lower(tp[j]) != lower(name[j])) { same = false; break; }
+                }
+                if (same) { nominated = true; break; }
+            }
+        }
+        if (nominated || (connTokenOverflow && connectionNominates(p, parsed, f))) { continue; }
         w.bytes(p + f.offset, f.length);
     }
     if (absolute && authLength != 0) { w.literal("Proxy-Authorization: "); w.bytes(auth, authLength); w.literal("\r\n"); }
@@ -1340,6 +1379,9 @@ extern "C" hajimi_codec_result hajimi_mkcp_open_simple(
     if (declared_len != plain_capacity) {
         return error(HAJIMI_CODEC_INVALID);
     }
+    uint32_t hash = 0x811c9dc5u;
+    hash = (hash ^ len_hi) * 0x01000193u;
+    hash = (hash ^ len_lo) * 0x01000193u;
     size_t i = 0;
     while (i + 8 <= plain_capacity) {
         uint64_t c_cur, c_prev;
@@ -1347,18 +1389,22 @@ extern "C" hajimi_codec_result hajimi_mkcp_open_simple(
         std::memcpy(&c_prev, cipher + 2 + i, 8);
         const uint64_t p = c_cur ^ c_prev;
         std::memcpy(output + i, &p, 8);
+        uint8_t blk[8];
+        std::memcpy(blk, &p, 8);
+        for (size_t b = 0; b < 8; ++b) {
+            hash = (hash ^ blk[b]) * 0x01000193u;
+        }
         i += 8;
     }
     for (; i < plain_capacity; ++i) {
-        output[i] = cipher[6 + i] ^ cipher[2 + i];
-    }
-    uint32_t hash = 0x811c9dc5u;
-    hash = (hash ^ len_hi) * 0x01000193u;
-    hash = (hash ^ len_lo) * 0x01000193u;
-    for (size_t j = 0; j < plain_capacity; ++j) {
-        hash = (hash ^ output[j]) * 0x01000193u;
+        const uint8_t pb = cipher[6 + i] ^ cipher[2 + i];
+        output[i] = pb;
+        hash = (hash ^ pb) * 0x01000193u;
     }
     if (hash != expected_fnv) {
+        if (plain_capacity > 0 && output != nullptr) {
+            std::memset(output, 0, plain_capacity);
+        }
         return error(HAJIMI_CODEC_INVALID);
     }
     return ok(cipher_length, declared_len);

@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include <net/if.h>
 
 #if !__has_feature(objc_arc)
@@ -16,7 +17,7 @@
 #endif
 
 NSErrorDomain const HJProxyRuntimeErrorDomain = @"app.hajimi.native-stream";
-NSUInteger const HJStreamPumpDefaultChunkSize = 65'536;
+NSUInteger const HJStreamPumpDefaultChunkSize = 131'072;
 NSUInteger const HJStreamPumpMaximumChunkSize = 262'144;
 NSUInteger const HJStreamPumpMaximumInitialBytes = 1'048'576;
 NSUInteger const HJNetworkStreamMaximumQueuedBytes = 2'097'152;
@@ -60,11 +61,17 @@ bool IsLoopbackHost(NSString *host) {
     }
     return [lower hasPrefix:@"127."];
 }
+Class DispatchDataClass() {
+    static Class cls = NSClassFromString(@"OS_dispatch_data");
+    return cls;
+}
 dispatch_data_t DispatchData(NSData *data) {
-    if (!data.length) return dispatch_data_empty;
+    if (!data || !data.length) return dispatch_data_empty;
+    if (Class cls = DispatchDataClass(); cls && [data isKindOfClass:cls]) {
+        return reinterpret_cast<dispatch_data_t>(data);
+    }
     NSData *owner = [data copy];
-    return dispatch_data_create(owner.bytes, owner.length,
-        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ (void)owner.length; });
+    return dispatch_data_create(owner.bytes, owner.length, nullptr, ^{ (void)owner.length; });
 }
 NSData *FoundationData(dispatch_data_t content) {
     if (!content || !dispatch_data_get_size(content)) return [NSData data];
@@ -79,6 +86,11 @@ struct Direction {
     uint64_t writeGeneration = 0;
     size_t initialOffset = 0;
     unsigned emptyReads = 0;
+    dispatch_data_t __strong pendingContent = nil;
+    bool hasPending = false;
+    bool pendingEOF = false;
+    bool sourceEOF = false;
+    bool readBackoff = false;
     bool reading = false;
     bool writing = false;
     bool done = false;
@@ -416,21 +428,59 @@ void FlushCachedRuntimeInterfaces() {
 }
 - (void)flushDataWrites {
     if (_terminalError || _dataWriteInFlight || _dataWrites.empty()) return;
+    static constexpr NSUInteger kMaxCoalescedWriteBytes = 131'072;
+    size_t batchCount = 0;
+    NSUInteger batchBytes = 0;
+    dispatch_data_t combined = dispatch_data_empty;
+    while (batchCount < _dataWrites.size()) {
+        NSData *part = _dataWrites[batchCount].data;
+        NSUInteger partLen = part.length;
+        if (batchCount > 0 && partLen > kMaxCoalescedWriteBytes - batchBytes) break;
+        if (partLen > 0) {
+            dispatch_data_t chunk = DispatchData(part);
+            combined = (dispatch_data_get_size(combined) == 0)
+                ? chunk
+                : dispatch_data_create_concat(combined, chunk);
+            batchBytes += partLen;
+        }
+        ++batchCount;
+        if (batchBytes >= kMaxCoalescedWriteBytes) break;
+    }
     _dataWriteInFlight = YES;
     uint64_t generation = ++_dataWriteGeneration;
     __weak HJNetworkStream *weakSelf = self;
-    [self beginWrite:DispatchData(_dataWrites.front().data) isComplete:NO completion:^(NSError *error) {
-        HJNetworkStream *strongSelf = weakSelf;
-        if (!strongSelf || !strongSelf->_dataWriteInFlight ||
-            strongSelf->_dataWriteGeneration != generation) return;
-        DataWrite request = std::move(strongSelf->_dataWrites.front());
-        strongSelf->_dataWrites.pop_front();
-        strongSelf->_dataWriteBytes -= request.data.length;
-        strongSelf->_dataWriteInFlight = NO;
-        [strongSelf releaseDataReservation:request.data.length];
-        request.completion(error);
-        if (error) [strongSelf fail:error]; else [strongSelf flushDataWrites];
-    }];
+    dispatch_block_t sendBlock = ^{
+        [self beginWrite:combined isComplete:NO completion:^(NSError *error) {
+            HJNetworkStream *strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf->_dataWriteInFlight ||
+                strongSelf->_dataWriteGeneration != generation) return;
+            size_t count = std::min(batchCount, strongSelf->_dataWrites.size());
+            std::vector<HJStreamWriteCompletion> callbacks;
+            callbacks.reserve(count);
+            NSUInteger releasedBytes = 0;
+            for (size_t i = 0; i < count; ++i) {
+                DataWrite request = std::move(strongSelf->_dataWrites.front());
+                strongSelf->_dataWrites.pop_front();
+                NSUInteger len = request.data.length;
+                strongSelf->_dataWriteBytes -= len;
+                releasedBytes += len;
+                callbacks.push_back(request.completion);
+            }
+            strongSelf->_dataWriteInFlight = NO;
+            if (count > 0) {
+                std::lock_guard<std::mutex> lock(strongSelf->_dataAdmissionLock);
+                strongSelf->_reservedDataWriteCount -= count;
+                strongSelf->_reservedDataWriteBytes -= releasedBytes;
+            }
+            for (const HJStreamWriteCompletion &cb : callbacks) {
+                if (cb) cb(error);
+            }
+            if (error) [strongSelf fail:error];
+            else [strongSelf flushDataWrites];
+        }];
+    };
+    if (_connection) nw_connection_batch(_connection, sendBlock);
+    else sendBlock();
 }
 - (void)fail:(NSError *)error {
     if (_terminalError) return;
@@ -544,6 +594,8 @@ void FlushCachedRuntimeInterfaces() {
     }
     _parameters = nw_parameters_create_secure_tcp(tlsConfiguration, ^(nw_protocol_options_t tcp) {
         nw_tcp_options_set_no_delay(tcp, true);
+        nw_tcp_options_set_disable_ack_stretching(tcp, true);
+        nw_tcp_options_set_retransmit_fin_drop(tcp, true);
         nw_tcp_options_set_enable_keepalive(tcp, true);
         nw_tcp_options_set_keepalive_idle_time(tcp, 30);
         nw_tcp_options_set_keepalive_interval(tcp, 10);
@@ -754,19 +806,32 @@ void FlushCachedRuntimeInterfaces() {
 - (id<HJByteStream>)destination:(NSUInteger)direction { return direction == 0 ? _remote : _client; }
 - (void)advance:(NSUInteger)index {
     Direction &direction = _directions[index];
-    if (_finished || direction.done || direction.reading || direction.writing) return;
-    dispatch_data_t initial = index == 0 ? _uploadInitial : _downloadInitial;
-    if (initial) {
-        size_t size = dispatch_data_get_size(initial);
-        size_t count = std::min<size_t>(_chunkSize, size - direction.initialOffset);
-        dispatch_data_t content = dispatch_data_create_subrange(initial, direction.initialOffset, count);
-        direction.initialOffset += count;
-        if (direction.initialOffset == size) {
-            if (index == 0) _uploadInitial = nil; else _downloadInitial = nil;
+    if (_finished || direction.done) return;
+    if (!direction.writing) {
+        if (direction.hasPending) {
+            dispatch_data_t content = direction.pendingContent;
+            BOOL eof = direction.pendingEOF;
+            direction.pendingContent = nil;
+            direction.hasPending = false;
+            direction.pendingEOF = false;
+            [self write:content direction:index atEOF:eof];
+        } else {
+            dispatch_data_t initial = index == 0 ? _uploadInitial : _downloadInitial;
+            if (initial) {
+                size_t size = dispatch_data_get_size(initial);
+                size_t count = std::min<size_t>(_chunkSize, size - direction.initialOffset);
+                dispatch_data_t content = dispatch_data_create_subrange(initial, direction.initialOffset, count);
+                direction.initialOffset += count;
+                if (direction.initialOffset == size) {
+                    if (index == 0) _uploadInitial = nil; else _downloadInitial = nil;
+                }
+                [self write:content direction:index atEOF:NO];
+            }
         }
-        [self write:content direction:index atEOF:NO];
-        return;
     }
+    if (_finished || direction.done || direction.sourceEOF || direction.reading ||
+        direction.hasPending || direction.readBackoff) return;
+    if ((index == 0 ? _uploadInitial : _downloadInitial) != nil) return;
     direction.reading = true;
     uint64_t generation = ++direction.readGeneration;
     __weak HJStreamPump *weakSelf = self;
@@ -792,8 +857,10 @@ void FlushCachedRuntimeInterfaces() {
         [self finish:RuntimeError(HJProxyRuntimeErrorContractViolation,
                                  @"Byte stream exceeded the pump's requested buffer limit")]; return;
     }
+    Direction &direction = _directions[index];
     if (count || atEOF) {
-        _directions[index].emptyReads = 0;
+        direction.emptyReads = 0;
+        if (atEOF) direction.sourceEOF = true;
         _lastActivity = Now();
         if (index == 1 && count && _firstPayloadSent && !_firstByteReported) {
             _firstByteReported = YES;
@@ -801,19 +868,30 @@ void FlushCachedRuntimeInterfaces() {
             if (_firstByteHandler && now >= _firstPayloadSendTime)
                 _firstByteHandler(double(now - _firstPayloadSendTime) / double(NSEC_PER_MSEC), YES);
         }
-        [self write:content direction:index atEOF:atEOF];
+        if (direction.writing) {
+            direction.pendingContent = count ? content : nil;
+            direction.pendingEOF = atEOF;
+            direction.hasPending = true;
+        } else {
+            [self write:content direction:index atEOF:atEOF];
+            [self advance:index];
+        }
         return;
     }
     // Empty non-EOF callbacks do not count as activity. Bound their CPU cost
     // even for a buggy/malicious adapter; the idle timer still expires normally.
-    unsigned empty = _directions[index].emptyReads = std::min(_directions[index].emptyReads + 1, 6u);
+    unsigned empty = direction.emptyReads = std::min(direction.emptyReads + 1, 6u);
     uint64_t delay = (uint64_t(1) << (empty - 1)) * NSEC_PER_MSEC;
-    uint64_t generation = _directions[index].readGeneration;
+    uint64_t generation = direction.readGeneration;
+    direction.readBackoff = true;
     __weak HJStreamPump *weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(delay)), _queue, ^{
         HJStreamPump *strongSelf = weakSelf;
         if (strongSelf && !strongSelf->_finished &&
-            strongSelf->_directions[index].readGeneration == generation) [strongSelf advance:index];
+            strongSelf->_directions[index].readGeneration == generation) {
+            strongSelf->_directions[index].readBackoff = false;
+            [strongSelf advance:index];
+        }
     });
 }
 - (void)write:(dispatch_data_t)content direction:(NSUInteger)index atEOF:(BOOL)atEOF {
@@ -872,6 +950,8 @@ void FlushCachedRuntimeInterfaces() {
     }
     if (_timer) { dispatch_source_cancel(_timer); _timer = nil; }
     _uploadInitial = nil; _downloadInitial = nil;
+    _directions[0].pendingContent = nil; _directions[0].hasPending = false;
+    _directions[1].pendingContent = nil; _directions[1].hasPending = false;
     [self flushTraffic];
     HJStreamWriteCompletion completion = _completion;
     _completion = nil; _trafficHandler = nil; _firstByteHandler = nil;

@@ -2215,8 +2215,9 @@ final class DNSAdaptiveQueryDatagram: NativeRoutedDatagram, DNSQueryDeadlineAckn
         preferAvailableCandidate()
         let attemptsLeft = ordered.count - next + 1
         let canHedge = next < ordered.count && active.count < 2
-        let budget = canHedge ? DNSAdaptiveHedgeBudget.delay(remaining: remaining, attemptsLeft: attemptsLeft,
+        let budget = canHedge ? DNSAdaptiveHedgeBudget.delayWithJitter(remaining: remaining, attemptsLeft: attemptsLeft,
             primaryMilliseconds: planningLatencyMilliseconds(candidate),
+            primaryJitterMilliseconds: selector.jitterMilliseconds(scopeKey: scopeKey, candidateID: candidate.id),
             alternateMilliseconds: planningLatencyMilliseconds(ordered[next])) : remaining
         if canHedge {
             let timer = DispatchWorkItem { [weak self] in self?.startHedge(after: token) }
@@ -3779,6 +3780,7 @@ public final class ProxyEngine {
         let parameters = NWParameters.tcp
         if let tcp = parameters.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
             tcp.noDelay = true
+            tcp.disableAckStretching = true
         }
         // Allow the stack to rebind quickly after a previous engine stop.
         parameters.allowLocalEndpointReuse = true

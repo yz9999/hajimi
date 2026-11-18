@@ -68,18 +68,23 @@ enum HTTP2 {
     static func encode(_ frame: Frame) -> Data {
         let length = frame.payload.count
         var out = Data(capacity: 9 + length)
+        appendFrameHeader(length: length, type: frame.type, flags: frame.flags, streamID: frame.streamID, to: &out)
+        out.append(frame.payload)
+        return out
+    }
+
+    @inline(__always)
+    static func appendFrameHeader(length: Int, type: UInt8, flags: Flags, streamID: UInt32, to out: inout Data) {
         out.append(UInt8(truncatingIfNeeded: length >> 16))
         out.append(UInt8(truncatingIfNeeded: length >> 8))
         out.append(UInt8(truncatingIfNeeded: length))
-        out.append(frame.type)
-        out.append(frame.flags.rawValue)
+        out.append(type)
+        out.append(flags.rawValue)
         // RFC 9113 §4.1: Reserved high bit MUST remain unset when sending.
-        out.append(UInt8(truncatingIfNeeded: (frame.streamID >> 24) & 0x7F))
-        out.append(UInt8(truncatingIfNeeded: frame.streamID >> 16))
-        out.append(UInt8(truncatingIfNeeded: frame.streamID >> 8))
-        out.append(UInt8(truncatingIfNeeded: frame.streamID))
-        out.append(frame.payload)
-        return out
+        out.append(UInt8(truncatingIfNeeded: (streamID >> 24) & 0x7F))
+        out.append(UInt8(truncatingIfNeeded: streamID >> 16))
+        out.append(UInt8(truncatingIfNeeded: streamID >> 8))
+        out.append(UInt8(truncatingIfNeeded: streamID))
     }
 
     /// Zero-shift cursor decoder: advances `offset` without mutating `buffer`.
@@ -178,18 +183,31 @@ enum HTTP2 {
 enum GRPCFraming {
     /// `[1 byte compressed flag][4 byte big-endian length][protobuf Hunk]`
     static func encode(_ payload: Data) -> Data {
-        var hunk = Data(capacity: 1 + 5 + payload.count)
-        hunk.append(0x0A)                // field 1, wire type 2
-        appendVarint(payload.count, to: &hunk)
-        hunk.append(payload)
-
-        var out = Data(capacity: 5 + hunk.count)
-        out.append(0x00)                 // not compressed
-        out.append(UInt8(truncatingIfNeeded: hunk.count >> 24))
-        out.append(UInt8(truncatingIfNeeded: hunk.count >> 16))
-        out.append(UInt8(truncatingIfNeeded: hunk.count >> 8))
-        out.append(UInt8(truncatingIfNeeded: hunk.count))
-        out.append(hunk)
+        let payloadLen = payload.count
+        var varintBytes: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        var varintLen = 0
+        withUnsafeMutableBytes(of: &varintBytes) { buf in
+            var remaining = UInt64(payloadLen)
+            while remaining >= 0x80 {
+                buf[varintLen] = UInt8(truncatingIfNeeded: remaining) | 0x80
+                varintLen += 1
+                remaining >>= 7
+            }
+            buf[varintLen] = UInt8(truncatingIfNeeded: remaining)
+            varintLen += 1
+        }
+        let hunkCount = 1 + varintLen + payloadLen
+        var out = Data(capacity: 5 + hunkCount)
+        out.append(0x00) // not compressed
+        out.append(UInt8(truncatingIfNeeded: hunkCount >> 24))
+        out.append(UInt8(truncatingIfNeeded: hunkCount >> 16))
+        out.append(UInt8(truncatingIfNeeded: hunkCount >> 8))
+        out.append(UInt8(truncatingIfNeeded: hunkCount))
+        out.append(0x0A) // field 1, wire type 2
+        withUnsafeBytes(of: &varintBytes) { buf in
+            out.append(buf.bindMemory(to: UInt8.self).baseAddress!, count: varintLen)
+        }
+        out.append(payload)
         return out
     }
 
@@ -269,6 +287,13 @@ enum GRPCFraming {
 /// A gRPC bidirectional stream presented as a plain byte transport with full
 /// RFC 9113 inbound & outbound flow-control window accounting and control-frame flood bounds.
 final class GRPCByteTransport: ByteTransport {
+    private static let initialTargetWindow = 4_194_304       // 4 MiB (SETTINGS_INITIAL_WINDOW_SIZE)
+    private static let maxTargetWindow = 16 * 1_024 * 1_024  // 16 MiB max auto-tuned BDP window
+    private static let advertisedMaxFrameSize = 65_536       // 64 KiB (SETTINGS_MAX_FRAME_SIZE)
+    private static let maxCoalescedWriteBytes = 65_536       // 64 KiB outbound coalescing cap
+    private static let streamID: UInt32 = 1
+    private static let maxPendingOutboundBytes = 8 * 1_024 * 1_024
+
     private let raw: any ByteTransport
     private let queue: DispatchQueue
     private let lock = NSLock()
@@ -278,11 +303,13 @@ final class GRPCByteTransport: ByteTransport {
     private var pendingReceive: ((Data?, Bool, Error?) -> Void)?
     private var cancelled = false
     private var failure: Error?
-    private var localWindow = HTTP2.defaultWindowSize
-    private var localConnectionWindow = HTTP2.defaultWindowSize
-    private var peerInitialWindowSize = HTTP2.defaultWindowSize
-    private var peerStreamWindow = HTTP2.defaultWindowSize
-    private var peerConnectionWindow = HTTP2.defaultWindowSize
+    private var currentTargetWindow = GRPCByteTransport.initialTargetWindow
+    private var localWindow = GRPCByteTransport.initialTargetWindow
+    private var localConnectionWindow = GRPCByteTransport.initialTargetWindow
+    private var peerSettingsReceived = false
+    private var peerInitialWindowSize = GRPCByteTransport.initialTargetWindow
+    private var peerStreamWindow = GRPCByteTransport.initialTargetWindow
+    private var peerConnectionWindow = GRPCByteTransport.initialTargetWindow
     private var peerMaxFrameSize = HTTP2.defaultMaxFrameSize
     private var consecutiveControlFrames = 0
     private var awaitingContinuationStream: UInt32?
@@ -291,8 +318,15 @@ final class GRPCByteTransport: ByteTransport {
     private var writeInFlight = false
     private var writeBacklog: [(Data, (Error?) -> Void)] = []
 
-    private static let streamID: UInt32 = 1
-    private static let maxPendingOutboundBytes = 8 * 1_024 * 1_024
+    // RFC 9113 §6.7 PING-based BDP estimator state
+    private var bdpBytesSinceSample = 0
+    private var bdpBytesDuringRTT = 0
+    private var bdpSampleStartNs: UInt64 = DispatchTime.now().uptimeNanoseconds
+    private var bdpLastDataNs: UInt64 = 0
+    private var bdpPingInFlight = false
+    private var bdpPingSentNs: UInt64 = 0
+    private var bdpPingSeq: UInt32 = 0
+    private var bdpPingPayload = Data()
 
     private init(raw: any ByteTransport, queue: DispatchQueue) {
         self.raw = raw
@@ -304,8 +338,13 @@ final class GRPCByteTransport: ByteTransport {
                         completion: @escaping (Result<GRPCByteTransport, Error>) -> Void) {
         let transport = GRPCByteTransport(raw: raw, queue: queue)
         var opening = HTTP2.preface
-        opening.append(HTTP2.settingsFrame(values: [(0x4, 1 << 21), (0x3, 128)]))
-        opening.append(HTTP2.windowUpdate(streamID: 0, increment: UInt32((1 << 21) - HTTP2.defaultWindowSize)))
+        opening.append(HTTP2.settingsFrame(values: [
+            (0x4, UInt32(initialTargetWindow)),
+            (0x5, UInt32(advertisedMaxFrameSize)),
+            (0x3, 128),
+        ]))
+        opening.append(HTTP2.windowUpdate(streamID: 0,
+                                          increment: UInt32(initialTargetWindow - HTTP2.defaultWindowSize)))
 
         let path = "/" + serviceName.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/Tun"
         let headers: [HPACK.HeaderField] = [
@@ -322,8 +361,9 @@ final class GRPCByteTransport: ByteTransport {
             type: HTTP2.FrameType.headers.rawValue,
             flags: [.endHeaders], streamID: streamID,
             payload: HPACK.encode(headers))))
-        transport.localWindow = 1 << 21
-        transport.localConnectionWindow = 1 << 21
+        transport.currentTargetWindow = initialTargetWindow
+        transport.localWindow = initialTargetWindow
+        transport.localConnectionWindow = initialTargetWindow
 
         raw.send(opening) { error in
             if let error { raw.cancel(); completion(.failure(error)); return }
@@ -345,41 +385,90 @@ final class GRPCByteTransport: ByteTransport {
         pendingDataPayloads.append((framed, 0, completion))
         pendingDataBytes += framed.count
         let batch = buildFlowControlledBatchLocked()
+        if !batch.isEmpty {
+            writeBacklog.append(contentsOf: batch)
+        }
         lock.unlock()
-        for (wire, cb) in batch {
-            enqueue(wire, completion: cb)
+        if !batch.isEmpty {
+            drain()
         }
     }
 
+    /// Coalesces adjacent small `pendingDataPayloads` into larger `DATA` frames
+    /// (up to `min(peerMaxFrameSize, 65_536)`) and batches frames up to 64 KiB.
     private func buildFlowControlledBatchLocked() -> [(Data, (Error?) -> Void)] {
         var ready: [(Data, (Error?) -> Void)] = []
+        let maxFramePayloadCap = min(peerMaxFrameSize, Self.maxCoalescedWriteBytes)
+        guard maxFramePayloadCap > 0 else { return ready }
+
         while !pendingDataPayloads.isEmpty {
             let budget = min(peerStreamWindow, peerConnectionWindow)
             guard budget > 0 else { break }
-            var wire = Data()
-            var (msg, offset, cb) = pendingDataPayloads[0]
-            while offset < msg.count {
+
+            var wire = Data(capacity: min(Self.maxCoalescedWriteBytes + 36, 9 + min(pendingDataBytes, budget)))
+            var callbacks: [(Error?) -> Void] = []
+
+            while !pendingDataPayloads.isEmpty, wire.count < Self.maxCoalescedWriteBytes {
                 let avail = min(peerStreamWindow, peerConnectionWindow)
                 guard avail > 0 else { break }
-                let take = min(msg.count - offset, min(peerMaxFrameSize, avail))
-                let slice = Data(msg[(msg.startIndex + offset)..<(msg.startIndex + offset + take)])
-                wire.append(HTTP2.encode(HTTP2.Frame(
-                    type: HTTP2.FrameType.data.rawValue,
-                    flags: [], streamID: Self.streamID, payload: slice
-                )))
-                offset += take
-                peerStreamWindow -= take
-                peerConnectionWindow -= take
-                pendingDataBytes -= take
-            }
-            if offset >= msg.count {
-                pendingDataPayloads.removeFirst()
-                ready.append((wire, cb))
-            } else {
-                pendingDataPayloads[0].1 = offset
-                if !wire.isEmpty {
-                    ready.append((wire, { _ in }))
+                let maxFrameLen = min(maxFramePayloadCap, avail)
+
+                // Compute total payload length we will pack into this single DATA frame.
+                var frameLen = 0
+                var probeIdx = 0
+                while probeIdx < pendingDataPayloads.count, frameLen < maxFrameLen {
+                    let (msg, off, _) = pendingDataPayloads[probeIdx]
+                    let rem = msg.count - off
+                    let take = min(rem, maxFrameLen - frameLen)
+                    frameLen += take
+                    if take < rem { break }
+                    probeIdx += 1
                 }
+                guard frameLen > 0 else { break }
+
+                HTTP2.appendFrameHeader(
+                    length: frameLen,
+                    type: HTTP2.FrameType.data.rawValue,
+                    flags: [],
+                    streamID: Self.streamID,
+                    to: &wire
+                )
+
+                var remainingInFrame = frameLen
+                while remainingInFrame > 0, !pendingDataPayloads.isEmpty {
+                    let (msg, off, cb) = pendingDataPayloads[0]
+                    let rem = msg.count - off
+                    if rem <= remainingInFrame {
+                        wire.append(msg[(msg.startIndex + off)..<msg.endIndex])
+                        remainingInFrame -= rem
+                        peerStreamWindow -= rem
+                        peerConnectionWindow -= rem
+                        pendingDataBytes -= rem
+                        callbacks.append(cb)
+                        pendingDataPayloads.removeFirst()
+                    } else {
+                        wire.append(msg[(msg.startIndex + off)..<(msg.startIndex + off + remainingInFrame)])
+                        pendingDataPayloads[0].1 = off + remainingInFrame
+                        peerStreamWindow -= remainingInFrame
+                        peerConnectionWindow -= remainingInFrame
+                        pendingDataBytes -= remainingInFrame
+                        remainingInFrame = 0
+                    }
+                }
+            }
+
+            if !wire.isEmpty {
+                if callbacks.isEmpty {
+                    ready.append((wire, { _ in }))
+                } else if callbacks.count == 1 {
+                    ready.append((wire, callbacks[0]))
+                } else {
+                    let batchedCallbacks = callbacks
+                    ready.append((wire, { err in
+                        for cb in batchedCallbacks { cb(err) }
+                    }))
+                }
+            } else {
                 break
             }
         }
@@ -410,26 +499,68 @@ final class GRPCByteTransport: ByteTransport {
         let stalled = pendingDataPayloads
         pendingDataPayloads.removeAll()
         pendingDataBytes = 0
+        let queuedWrites = writeBacklog
+        writeBacklog.removeAll()
         lock.unlock()
         waiter?(nil, true, nil)
-        for (_, _, cb) in stalled { cb(NativeOutboundError.connection("gRPC 流已取消")) }
+        let cancelErr = NativeOutboundError.connection("gRPC 流已取消")
+        for (_, _, cb) in stalled { cb(cancelErr) }
+        for (_, cb) in queuedWrites { cb(cancelErr) }
         raw.cancel()
     }
 
     private func enqueue(_ data: Data, completion: @escaping (Error?) -> Void) {
         lock.lock()
+        if cancelled {
+            let err = failure ?? NativeOutboundError.connection("gRPC 流已取消")
+            lock.unlock()
+            completion(err)
+            return
+        }
         writeBacklog.append((data, completion))
         lock.unlock()
         drain()
     }
 
+    /// Coalesces consecutive `writeBacklog` wire buffers up to `65_536` bytes
+    /// into a single `raw.send`, completing all batched callbacks together.
     private func drain() {
         lock.lock()
         guard !writeInFlight, !writeBacklog.isEmpty, !cancelled else { lock.unlock(); return }
         writeInFlight = true
-        let (data, completion) = writeBacklog.removeFirst()
+
+        var takeCount = 1
+        var totalBytes = writeBacklog[0].0.count
+        while takeCount < writeBacklog.count {
+            let nextCount = writeBacklog[takeCount].0.count
+            guard totalBytes + nextCount <= Self.maxCoalescedWriteBytes else { break }
+            totalBytes += nextCount
+            takeCount += 1
+        }
+
+        let wireData: Data
+        let completion: (Error?) -> Void
+        if takeCount == 1 {
+            let item = writeBacklog.removeFirst()
+            wireData = item.0
+            completion = item.1
+        } else {
+            var combined = Data(capacity: totalBytes)
+            var callbacks: [(Error?) -> Void] = []
+            callbacks.reserveCapacity(takeCount)
+            for idx in 0..<takeCount {
+                combined.append(writeBacklog[idx].0)
+                callbacks.append(writeBacklog[idx].1)
+            }
+            writeBacklog.removeFirst(takeCount)
+            wireData = combined
+            completion = { err in
+                for cb in callbacks { cb(err) }
+            }
+        }
         lock.unlock()
-        raw.send(data) { [weak self] error in
+
+        raw.send(wireData) { [weak self] error in
             guard let self else { completion(error); return }
             self.lock.lock(); self.writeInFlight = false; self.lock.unlock()
             completion(error)
@@ -486,15 +617,17 @@ final class GRPCByteTransport: ByteTransport {
                             deliver.append(payload)
                         }
                     }
-                    if localWindow < (1 << 20) {
-                        let increment = UInt32((1 << 21) - localWindow)
+                    recordBDPDataSampleLocked(bytes: frame.rawLength, control: &control)
+                    let replenishThreshold = currentTargetWindow / 2
+                    if localWindow < replenishThreshold {
+                        let increment = UInt32(currentTargetWindow - localWindow)
                         control.append(HTTP2.windowUpdate(streamID: Self.streamID, increment: increment))
-                        localWindow = 1 << 21
+                        localWindow = currentTargetWindow
                     }
-                    if localConnectionWindow < (1 << 20) {
-                        let increment = UInt32((1 << 21) - localConnectionWindow)
+                    if localConnectionWindow < replenishThreshold {
+                        let increment = UInt32(currentTargetWindow - localConnectionWindow)
                         control.append(HTTP2.windowUpdate(streamID: 0, increment: increment))
-                        localConnectionWindow = 1 << 21
+                        localConnectionWindow = currentTargetWindow
                     }
                 case HTTP2.FrameType.headers.rawValue:
                     consecutiveControlFrames += 1
@@ -538,7 +671,9 @@ final class GRPCByteTransport: ByteTransport {
                     guard frame.streamID == 0, frame.payload.count == 8 else {
                         throw HTTP2.FrameError.protocolViolation("RFC 9113 §6.7 PING 帧必须位于流 0 且长度为 8 字节")
                     }
-                    if !frame.flags.contains(.ack) {
+                    if frame.flags.contains(.ack) {
+                        handleBDPPingAckLocked(payload: frame.payload, control: &control)
+                    } else {
                         control.append(HTTP2.encode(HTTP2.Frame(
                             type: HTTP2.FrameType.ping.rawValue, flags: .ack,
                             streamID: 0, payload: frame.payload)))
@@ -573,10 +708,12 @@ final class GRPCByteTransport: ByteTransport {
                    frame.flags.contains(.endStream),
                    frame.type == HTTP2.FrameType.data.rawValue || frame.type == HTTP2.FrameType.headers.rawValue {
                     compactFrameBufferLocked(consumed: offset)
+                    if !control.isEmpty { writeBacklog.append((control, { _ in })) }
+                    if !unblockedWrites.isEmpty { writeBacklog.append(contentsOf: unblockedWrites) }
+                    let needDrain = !control.isEmpty || !unblockedWrites.isEmpty
                     lock.unlock()
                     if !deliver.isEmpty { publish(deliver) }
-                    if !control.isEmpty { sendControl(control) }
-                    for (wire, cb) in unblockedWrites { enqueue(wire, completion: cb) }
+                    if needDrain { drain() }
                     finish()
                     return
                 }
@@ -586,10 +723,75 @@ final class GRPCByteTransport: ByteTransport {
             lock.unlock()
             throw error
         }
+        if !control.isEmpty { writeBacklog.append((control, { _ in })) }
+        if !unblockedWrites.isEmpty { writeBacklog.append(contentsOf: unblockedWrites) }
+        let needDrain = !control.isEmpty || !unblockedWrites.isEmpty
         lock.unlock()
-        if !control.isEmpty { sendControl(control) }
-        for (wire, cb) in unblockedWrites { enqueue(wire, completion: cb) }
+        if needDrain { drain() }
         if !deliver.isEmpty { publish(deliver) }
+    }
+
+    /// RFC 9113 PING-based BDP estimator: emits an 8-byte PING probe once
+    /// downlink bytes since the last sample reach `>= currentTargetWindow / 2`.
+    private func recordBDPDataSampleLocked(bytes: Int, control: inout Data) {
+        guard bytes > 0, currentTargetWindow < Self.maxTargetWindow else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        if !bdpPingInFlight {
+            if bdpBytesSinceSample == 0 || (bdpLastDataNs > 0 && now &- bdpLastDataNs > 1_000_000_000) {
+                bdpBytesSinceSample = 0
+                bdpSampleStartNs = now
+            }
+            bdpLastDataNs = now
+            bdpBytesSinceSample += bytes
+            if bdpBytesSinceSample >= currentTargetWindow / 2 {
+                bdpPingInFlight = true
+                bdpBytesDuringRTT = bytes
+                bdpPingSeq &+= 1
+                bdpPingSentNs = now
+                var payload = Data(capacity: 8)
+                payload.append(contentsOf: [0x48, 0x4A, 0x42, 0x44]) // "HJBD"
+                payload.append(UInt8(truncatingIfNeeded: bdpPingSeq >> 24))
+                payload.append(UInt8(truncatingIfNeeded: bdpPingSeq >> 16))
+                payload.append(UInt8(truncatingIfNeeded: bdpPingSeq >> 8))
+                payload.append(UInt8(truncatingIfNeeded: bdpPingSeq))
+                bdpPingPayload = payload
+                control.append(HTTP2.encode(HTTP2.Frame(
+                    type: HTTP2.FrameType.ping.rawValue,
+                    flags: [], streamID: 0, payload: payload)))
+            }
+        } else {
+            bdpLastDataNs = now
+            bdpBytesSinceSample += bytes
+            bdpBytesDuringRTT += bytes
+        }
+    }
+
+    private func handleBDPPingAckLocked(payload: Data, control: inout Data) {
+        guard bdpPingInFlight, payload == bdpPingPayload else { return }
+        bdpPingInFlight = false
+        let now = DispatchTime.now().uptimeNanoseconds
+        let rttNs = max(1, now &- bdpPingSentNs)
+        let sampleNs = max(rttNs, now &- bdpSampleStartNs)
+        let sampledBytes = bdpBytesSinceSample
+        let rttBytes = bdpBytesDuringRTT
+        bdpBytesSinceSample = 0
+        bdpBytesDuringRTT = 0
+        bdpSampleStartNs = now
+
+        let rateEstimate = Int((Double(sampledBytes) * Double(rttNs)) / Double(sampleNs))
+        let bdpEstimate = max(rttBytes, rateEstimate)
+        if bdpEstimate * 2 > currentTargetWindow, currentTargetWindow < Self.maxTargetWindow {
+            let newTarget = min(Self.maxTargetWindow, max(currentTargetWindow * 2, bdpEstimate * 2))
+            let growDelta = newTarget - currentTargetWindow
+            if growDelta > 0 {
+                currentTargetWindow = newTarget
+                let inc = UInt32(growDelta)
+                control.append(HTTP2.windowUpdate(streamID: Self.streamID, increment: inc))
+                localWindow += growDelta
+                control.append(HTTP2.windowUpdate(streamID: 0, increment: inc))
+                localConnectionWindow += growDelta
+            }
+        }
     }
 
     private func compactFrameBufferLocked(consumed: Int) {
@@ -602,6 +804,13 @@ final class GRPCByteTransport: ByteTransport {
     }
 
     private func applySettingsLocked(_ payload: Data) throws {
+        if !peerSettingsReceived {
+            peerSettingsReceived = true
+            let baseDelta = HTTP2.defaultWindowSize - peerInitialWindowSize
+            peerInitialWindowSize = HTTP2.defaultWindowSize
+            peerStreamWindow += baseDelta
+            peerConnectionWindow += baseDelta
+        }
         var index = payload.startIndex
         while payload.distance(from: index, to: payload.endIndex) >= 6 {
             let identifier = UInt16(payload[index]) << 8 | UInt16(payload[index + 1])
@@ -651,9 +860,12 @@ final class GRPCByteTransport: ByteTransport {
         let stalled = pendingDataPayloads
         pendingDataPayloads.removeAll()
         pendingDataBytes = 0
+        let queuedWrites = writeBacklog
+        writeBacklog.removeAll()
         lock.unlock()
         waiter?(nil, true, error)
         for (_, _, cb) in stalled { cb(error) }
+        for (_, cb) in queuedWrites { cb(error) }
         raw.cancel()
     }
 
@@ -665,9 +877,13 @@ final class GRPCByteTransport: ByteTransport {
         let stalled = pendingDataPayloads
         pendingDataPayloads.removeAll()
         pendingDataBytes = 0
+        let queuedWrites = writeBacklog
+        writeBacklog.removeAll()
         lock.unlock()
         waiter?(nil, true, nil)
-        for (_, _, cb) in stalled { cb(NativeOutboundError.connection("gRPC 流已结束")) }
+        let endErr = NativeOutboundError.connection("gRPC 流已结束")
+        for (_, _, cb) in stalled { cb(endErr) }
+        for (_, cb) in queuedWrites { cb(endErr) }
         raw.cancel()
     }
 }
@@ -697,14 +913,20 @@ public struct HTTPExtensiblePriority: Equatable, Sendable {
 }
 
 enum HTTP2ConnectHeaders {
+    private static func containsForbiddenHeaderOctet(_ text: String) -> Bool {
+        for b in text.utf8 where b == 0x0D || b == 0x0A || b == 0x00 {
+            return true
+        }
+        return false
+    }
+
     static func buildRequestHeaders(authority: String,
                                     extendedProtocol: String? = nil,
                                     scheme: String = "https",
                                     path: String? = nil,
                                     proxyAuthorization: String? = nil,
                                     priority: HTTPExtensiblePriority? = nil) throws -> [HPACK.HeaderField] {
-        guard !authority.isEmpty,
-              !authority.contains("\r"), !authority.contains("\n"), !authority.contains("\0") else {
+        guard !authority.isEmpty, !containsForbiddenHeaderOctet(authority) else {
             throw HTTP2.FrameError.protocolViolation("HTTP/2 CONNECT :authority 非法")
         }
         var fields: [HPACK.HeaderField] = [.init(name: ":method", value: "CONNECT")]
@@ -723,7 +945,7 @@ enum HTTP2ConnectHeaders {
             fields.append(.init(name: ":authority", value: authority))
         }
         if let auth = proxyAuthorization, !auth.isEmpty,
-           !auth.contains("\r"), !auth.contains("\n"), !auth.contains("\0") {
+           !containsForbiddenHeaderOctet(auth) {
             fields.append(.init(name: "proxy-authorization", value: auth))
         }
         if let priority {
@@ -746,11 +968,13 @@ public enum HTTP2SelfTest {
     }
 
     public static func run() throws {
+        try HPACKSelfTest.run()
         try frameRoundTrip()
         try framePadding()
         try grpcFraming()
         try rejectsMalformedInput()
         try extendedConnectAndWindowValidation()
+        try bdpAutoTuningAndCoalescing()
     }
 
     private static func frameRoundTrip() throws {
@@ -884,5 +1108,135 @@ public enum HTTP2SelfTest {
                    "RFC 8441 / RFC 9298 Extended CONNECT 伪首部或 Capsule-Protocol 缺失")
         try expect((try? HTTP2ConnectHeaders.buildRequestHeaders(authority: "bad.example\r\nx:1")) == nil,
                    "含 CRLF 的 HTTP/2 CONNECT :authority 必须被拒绝")
+    }
+
+    private static func bdpAutoTuningAndCoalescing() throws {
+        final class LoopbackPeer: ByteTransport {
+            private let lock = NSLock()
+            var sentChunks: [Data] = []
+            var receiver: ((Data?, Bool, Error?) -> Void)?
+            var holdWrites = false
+            var heldCompletions: [(Error?) -> Void] = []
+
+            func send(_ data: Data, completion: @escaping (Error?) -> Void) {
+                lock.lock()
+                sentChunks.append(data)
+                if holdWrites {
+                    heldCompletions.append(completion)
+                    lock.unlock()
+                    return
+                }
+                lock.unlock()
+                completion(nil)
+            }
+
+            func receive(completion: @escaping (Data?, Bool, Error?) -> Void) {
+                lock.lock()
+                receiver = completion
+                lock.unlock()
+            }
+
+            func cancel() {}
+
+            func releaseHeld() {
+                while true {
+                    lock.lock()
+                    guard !heldCompletions.isEmpty else {
+                        holdWrites = false
+                        lock.unlock()
+                        return
+                    }
+                    let next = heldCompletions.removeFirst()
+                    lock.unlock()
+                    next(nil)
+                }
+            }
+        }
+
+        let peer = LoopbackPeer()
+        let queue = DispatchQueue(label: "app.hajimi.http2.bdp-selftest")
+        var opened: Result<GRPCByteTransport, Error>?
+        GRPCByteTransport.connect(raw: peer, serviceName: "GunService", authority: "example.com",
+                                  scheme: "https", queue: queue) { opened = $0 }
+        guard let transport = try opened?.get() else {
+            throw Failure(text: "GRPCByteTransport 连接未完成")
+        }
+
+        // 1. Verify 4 MiB SETTINGS_INITIAL_WINDOW_SIZE (0x4) and 64 KiB SETTINGS_MAX_FRAME_SIZE (0x5)
+        try expect(!peer.sentChunks.isEmpty, "未发送 HTTP/2 握手前导")
+        var opening = peer.sentChunks[0]
+        try expect(opening.starts(with: HTTP2.preface), "缺少 HTTP/2 连接前导")
+        opening.removeFirst(HTTP2.preface.count)
+        guard let settings = try HTTP2.decode(from: &opening, maxFrameSize: 16_384),
+              settings.type == HTTP2.FrameType.settings.rawValue else {
+            throw Failure(text: "首帧不是客户端 SETTINGS")
+        }
+        var saw4MiB = false
+        var saw64KiB = false
+        var sIdx = settings.payload.startIndex
+        while settings.payload.distance(from: sIdx, to: settings.payload.endIndex) >= 6 {
+            let id = UInt16(settings.payload[sIdx]) << 8 | UInt16(settings.payload[sIdx + 1])
+            let val = UInt32(settings.payload[sIdx + 2]) << 24 | UInt32(settings.payload[sIdx + 3]) << 16
+                | UInt32(settings.payload[sIdx + 4]) << 8 | UInt32(settings.payload[sIdx + 5])
+            if id == 0x4 && val == 4_194_304 { saw4MiB = true }
+            if id == 0x5 && val == 65_536 { saw64KiB = true }
+            sIdx = settings.payload.index(sIdx, offsetBy: 6)
+        }
+        try expect(saw4MiB && saw64KiB, "客户端 SETTINGS 未通告 4 MiB 窗口与 64 KiB 最大帧长")
+
+        // 2. Verify BDP PING probe after >= 2 MiB downlink DATA and auto-tuned WINDOW_UPDATE upon PING ACK
+        peer.sentChunks.removeAll()
+        let chunkPayload = GRPCFraming.encode(Data(repeating: 0x42, count: 65_531))
+        var downlinkBurst = Data()
+        for _ in 0..<40 { // 40 * 64 KiB = 2.5 MiB (> 4 MiB / 2)
+            downlinkBurst.append(HTTP2.encode(HTTP2.Frame(
+                type: HTTP2.FrameType.data.rawValue, flags: [], streamID: 1, payload: chunkPayload)))
+        }
+        guard let deliverIn = peer.receiver else { throw Failure(text: "gRPC 未注册下行读取回调") }
+        deliverIn(downlinkBurst, false, nil)
+
+        var controlWire = peer.sentChunks.reduce(Data(), +)
+        var bdpPingToken: Data?
+        while let ctlFrame = try HTTP2.decode(from: &controlWire, maxFrameSize: 65_536) {
+            if ctlFrame.type == HTTP2.FrameType.ping.rawValue && !ctlFrame.flags.contains(.ack) {
+                bdpPingToken = ctlFrame.payload
+            }
+        }
+        guard let pingToken = bdpPingToken else {
+            throw Failure(text: "接收超过半窗流量后未发出 BDP PING 探测帧")
+        }
+
+        // Feed 2.5 MiB during the PING RTT + PING ACK so bdp * 2 > 4 MiB triggers window auto-tuning
+        peer.sentChunks.removeAll()
+        var ackBurst = Data()
+        for _ in 0..<40 {
+            ackBurst.append(HTTP2.encode(HTTP2.Frame(
+                type: HTTP2.FrameType.data.rawValue, flags: [], streamID: 1, payload: chunkPayload)))
+        }
+        ackBurst.append(HTTP2.encode(HTTP2.Frame(
+            type: HTTP2.FrameType.ping.rawValue, flags: .ack, streamID: 0, payload: pingToken)))
+        peer.receiver?(ackBurst, false, nil)
+
+        var postAckWire = peer.sentChunks.reduce(Data(), +)
+        var grewWindow = false
+        while let ctlFrame = try HTTP2.decode(from: &postAckWire, maxFrameSize: 65_536) {
+            if ctlFrame.type == HTTP2.FrameType.windowUpdate.rawValue {
+                let inc = try HTTP2.parseWindowUpdate(ctlFrame)
+                if inc >= 4_194_304 { grewWindow = true }
+            }
+        }
+        try expect(grewWindow, "收到 BDP PING ACK 后未自动调大接收流控窗口")
+
+        // 3. Verify multi-frame outbound DATA & writeBacklog coalescing
+        peer.sentChunks.removeAll()
+        peer.holdWrites = true
+        var doneCount = 0
+        for _ in 0..<16 {
+            transport.send(Data(repeating: 0x33, count: 512)) { if $0 == nil { doneCount += 1 } }
+        }
+        peer.releaseHeld()
+        try expect(doneCount == 16, "合并发送回调未全部完成：\(doneCount)")
+        try expect(peer.sentChunks.count < 16, "多笔小负载写入未触发合并发送：\(peer.sentChunks.count)")
+        transport.cancel()
     }
 }

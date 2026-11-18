@@ -66,11 +66,22 @@ final class RealityTLSByteTransport: VisionDirectByteTransport {
     }
 
     private enum Phase { case handshaking, ready, closed }
+    private struct QueuedSend {
+        let data: Data
+        let directWrite: Bool
+        let completion: (Error?) -> Void
+    }
+
+    private static let receiveMaximum = 65_536
+    private static let maximumCoalescedSendBytes = 65_536
+
     private let raw: any ByteTransport
     private let configuration: Configuration
+    private let usesVisionFlow: Bool
     private let queue: DispatchQueue
     private let queueKey = DispatchSpecificKey<UInt8>()
     private var phase: Phase = .handshaking
+    private var closeError: Error?
     private var recordReader = TLS13.RecordReader()
     private var handshakeReader = TLS13.HandshakeReader()
     private var transcript: TLS13.Transcript?
@@ -87,11 +98,10 @@ final class RealityTLSByteTransport: VisionDirectByteTransport {
     private var leaf: TLS13.LeafCertificate?
     private var handshakeCompletion: ((Result<any ByteTransport, Error>) -> Void)?
     private var receiveCompletion: ((Data?, Bool, Error?) -> Void)?
-    private var plaintextQueue: [Data] = []
-    private var plaintextHead = 0
+    private var plaintextBuffer = Data()
     private var receivingRaw = false
     private var sending = false
-    private var sendQueue: [(Data, (Error?) -> Void)] = []
+    private var sendQueue: [QueuedSend] = []
     private var visionDirectWrite = false
     private var visionDirectRead = false
     private var directReadBuffer = Data()
@@ -102,8 +112,9 @@ final class RealityTLSByteTransport: VisionDirectByteTransport {
         do {
             let configuration = try Configuration(policy: policy,
                                                   fallbackServerName: fallbackServerName)
+            let visionFlow = VLESSVisionAddons.recognizes(policy.parameters["flow"] ?? "")
             let transport = RealityTLSByteTransport(raw: raw, configuration: configuration,
-                                                     queue: queue)
+                                                     usesVisionFlow: visionFlow, queue: queue)
             transport.handshakeCompletion = completion
             transport.startHandshake()
         } catch {
@@ -111,9 +122,11 @@ final class RealityTLSByteTransport: VisionDirectByteTransport {
         }
     }
 
-    private init(raw: any ByteTransport, configuration: Configuration, queue: DispatchQueue) {
+    private init(raw: any ByteTransport, configuration: Configuration,
+                 usesVisionFlow: Bool = false, queue: DispatchQueue) {
         self.raw = raw
         self.configuration = configuration
+        self.usesVisionFlow = usesVisionFlow
         self.queue = DispatchQueue(label: "app.hajimi.reality-tls", target: queue)
         self.queue.setSpecific(key: queueKey, value: 1)
     }
@@ -198,25 +211,57 @@ final class RealityTLSByteTransport: VisionDirectByteTransport {
             guard self.phase == .ready else {
                 completion(NativeOutboundError.connection("REALITY TLS 尚未就绪")); return
             }
-            self.sendQueue.append((data, completion)); self.flushSendQueue()
+            self.sendQueue.append(QueuedSend(data: data, directWrite: self.visionDirectWrite,
+                                             completion: completion))
+            self.flushSendQueue()
         }
     }
 
     func receive(completion: @escaping (Data?, Bool, Error?) -> Void) {
         queue.async {
-            guard self.phase != .closed else { completion(nil, true, nil); return }
+            if self.phase == .closed {
+                if self.closeError == nil, !self.plaintextBuffer.isEmpty {
+                    let tail = self.plaintextBuffer
+                    self.plaintextBuffer.removeAll()
+                    completion(tail, true, nil)
+                } else {
+                    completion(nil, true, self.closeError)
+                }
+                return
+            }
             guard self.receiveCompletion == nil else {
                 completion(nil, true, NativeOutboundError.protocolError("REALITY TLS 不支持并发 receive")); return
             }
-            if self.plaintextHead < self.plaintextQueue.count {
-                let data = self.plaintextQueue[self.plaintextHead]; self.plaintextHead += 1
-                self.compactPlaintextQueue(); completion(data, false, nil)
+            if !self.visionDirectRead, self.recordReader.pendingByteCount > 0,
+               self.plaintextBuffer.count < Self.receiveMaximum,
+               !(self.usesVisionFlow && !self.plaintextBuffer.isEmpty) {
+                do { try self.decryptBufferedRecords() } catch {
+                    self.receiveCompletion = completion
+                    self.fail(error)
+                    return
+                }
+                if self.phase == .closed {
+                    if self.closeError == nil, !self.plaintextBuffer.isEmpty {
+                        let tail = self.plaintextBuffer
+                        self.plaintextBuffer.removeAll()
+                        completion(tail, true, nil)
+                    } else {
+                        completion(nil, true, self.closeError)
+                    }
+                    return
+                }
+            }
+            if !self.plaintextBuffer.isEmpty {
+                let data = self.plaintextBuffer
+                self.plaintextBuffer.removeAll(keepingCapacity: data.count <= 262_144)
+                completion(data, false, nil)
             } else if self.visionDirectRead, !self.directReadBuffer.isEmpty {
                 let value = self.directReadBuffer
                 self.directReadBuffer.removeAll(keepingCapacity: true)
                 completion(value, false, nil)
             } else {
-                self.receiveCompletion = completion; self.readRaw()
+                self.receiveCompletion = completion
+                self.readRaw()
             }
         }
     }
@@ -230,7 +275,7 @@ final class RealityTLSByteTransport: VisionDirectByteTransport {
             guard !self.visionDirectRead else { return }
             self.visionDirectRead = true
             self.directReadBuffer.append(self.recordReader.takePendingBytes())
-            if self.plaintextHead >= self.plaintextQueue.count,
+            if self.plaintextBuffer.isEmpty,
                !self.directReadBuffer.isEmpty,
                let completion = self.receiveCompletion {
                 let value = self.directReadBuffer
@@ -282,13 +327,33 @@ final class RealityTLSByteTransport: VisionDirectByteTransport {
     }
 
     private func consume(_ data: Data) throws {
-        recordReader.append(data)
-        while let record = try recordReader.next() {
+        if !data.isEmpty {
+            recordReader.append(data)
+        }
+        try decryptBufferedRecords()
+        if phase != .closed, !plaintextBuffer.isEmpty, let completion = receiveCompletion {
+            let chunk = plaintextBuffer
+            plaintextBuffer.removeAll(keepingCapacity: chunk.count <= 262_144)
+            receiveCompletion = nil
+            completion(chunk, false, nil)
+        }
+    }
+
+    private func decryptBufferedRecords() throws {
+        while phase != .closed {
+            if phase == .ready, !plaintextBuffer.isEmpty {
+                if usesVisionFlow || plaintextBuffer.count >= Self.receiveMaximum {
+                    break
+                }
+            }
+            guard let record = try recordReader.next() else { break }
             switch phase {
-            case .handshaking: try consumeHandshakeRecord(record)
+            case .handshaking:
+                try consumeHandshakeRecord(record)
             case .ready:
-                if try consumeApplicationRecord(record) { return }
-            case .closed: return
+                try consumeApplicationRecord(record)
+            case .closed:
+                return
             }
         }
     }
@@ -468,15 +533,17 @@ final class RealityTLSByteTransport: VisionDirectByteTransport {
         }}
     }
 
-    private func consumeApplicationRecord(_ record: TLS13.Record) throws -> Bool {
-        if record.contentType == TLS13.ContentType.changeCipherSpec.rawValue { return false }
+    private func consumeApplicationRecord(_ record: TLS13.Record) throws {
+        if record.contentType == TLS13.ContentType.changeCipherSpec.rawValue { return }
         guard let protector = serverApplicationProtector else {
             throw NativeOutboundError.crypto("REALITY TLS 缺少应用流量密钥")
         }
         let opened = try protector.unprotect(record)
         switch TLS13.ContentType(rawValue: opened.contentType) {
         case .applicationData:
-            if !opened.content.isEmpty { deliver(opened.content); return true }
+            if !opened.content.isEmpty {
+                plaintextBuffer.append(opened.content)
+            }
         case .alert:
             let alert = try TLS13.Alert(opened.content)
             if alert.isCloseNotify { close(nil) }
@@ -494,7 +561,6 @@ final class RealityTLSByteTransport: VisionDirectByteTransport {
             }
         default: break
         }
-        return false
     }
 
     private func sendKeyUpdateResponse() throws {
@@ -508,53 +574,103 @@ final class RealityTLSByteTransport: VisionDirectByteTransport {
     private func flushSendQueue() {
         guard !sending, phase == .ready, !sendQueue.isEmpty else { return }
         sending = true
-        let (data, completion) = sendQueue.removeFirst()
-        if visionDirectWrite {
-            raw.send(data) { error in self.queue.async {
-                self.sending = false; completion(error)
+
+        let directMode = sendQueue[0].directWrite
+        var batchCount = 1
+        var totalPlaintext = sendQueue[0].data.count
+        while batchCount < sendQueue.count, sendQueue[batchCount].directWrite == directMode {
+            let nextLen = sendQueue[batchCount].data.count
+            guard totalPlaintext + nextLen <= Self.maximumCoalescedSendBytes else { break }
+            totalPlaintext += nextLen
+            batchCount += 1
+        }
+        let batch = Array(sendQueue.prefix(batchCount))
+        sendQueue.removeFirst(batchCount)
+
+        if directMode {
+            let wire: Data
+            if batch.count == 1 {
+                wire = batch[0].data
+            } else {
+                var combined = Data(capacity: totalPlaintext)
+                for item in batch { combined.append(item.data) }
+                wire = combined
+            }
+            raw.send(wire) { error in self.queue.async {
+                self.sending = false
+                for item in batch { item.completion(error) }
                 if let error { self.fail(error) } else { self.flushSendQueue() }
             }}
             return
         }
+
         do {
             guard let protector = clientApplicationProtector else {
                 throw NativeOutboundError.crypto("REALITY TLS 缺少应用写密钥")
             }
-            var records = Data(); var offset = 0
-            while offset < data.count {
-                let end = min(data.count, offset + TLS13.maximumPlaintextLength)
-                records.append(try protector.protect(contentType: .applicationData,
-                                                      content: Data(data[offset..<end])))
-                offset = end
+            let maxChunk = TLS13.maximumPlaintextLength
+            let perRecordOverhead = TLS13.recordHeaderLength + 1 + protector.suite.aead.tagLength
+            let recordCount = totalPlaintext > 0 ? ((totalPlaintext + maxChunk - 1) / maxChunk) : 0
+            var records = Data(capacity: totalPlaintext + recordCount * perRecordOverhead)
+
+            if batch.count == 1 {
+                let single = batch[0].data
+                var offset = single.startIndex
+                while offset < single.endIndex {
+                    let end = single.index(offset, offsetBy: min(maxChunk, single.distance(from: offset, to: single.endIndex)))
+                    try protector.protect(into: &records, contentType: .applicationData, content: single[offset..<end])
+                    offset = end
+                }
+            } else if totalPlaintext > 0 {
+                var coalesced = Data(capacity: totalPlaintext)
+                for item in batch where !item.data.isEmpty {
+                    coalesced.append(item.data)
+                }
+                var offset = coalesced.startIndex
+                while offset < coalesced.endIndex {
+                    let end = coalesced.index(offset, offsetBy: min(maxChunk, coalesced.distance(from: offset, to: coalesced.endIndex)))
+                    try protector.protect(into: &records, contentType: .applicationData, content: coalesced[offset..<end])
+                    offset = end
+                }
             }
+
             raw.send(records) { error in self.queue.async {
-                self.sending = false; completion(error)
+                self.sending = false
+                for item in batch { item.completion(error) }
                 if let error { self.fail(error) } else { self.flushSendQueue() }
             }}
-        } catch { sending = false; completion(error); fail(error) }
-    }
-
-    private func deliver(_ data: Data) {
-        if let completion = receiveCompletion {
-            receiveCompletion = nil; completion(data, false, nil)
-        } else { plaintextQueue.append(data) }
-    }
-
-    private func compactPlaintextQueue() {
-        if plaintextHead == plaintextQueue.count { plaintextQueue.removeAll(keepingCapacity: true); plaintextHead = 0 }
+        } catch {
+            sending = false
+            for item in batch { item.completion(error) }
+            fail(error)
+        }
     }
 
     private func fail(_ error: Error) { close(error) }
 
     private func close(_ error: Error?) {
         guard phase != .closed else { return }
-        phase = .closed; raw.cancel()
+        phase = .closed
+        closeError = error
+        raw.cancel()
         let handshake = handshakeCompletion; handshakeCompletion = nil
         handshake?(.failure(error ?? NativeOutboundError.connection("REALITY TLS 连接已关闭")))
         let receive = receiveCompletion; receiveCompletion = nil
-        receive?(nil, true, error)
+        if let error {
+            plaintextBuffer.removeAll()
+            receive?(nil, true, error)
+        } else if let receive {
+            if !plaintextBuffer.isEmpty {
+                let tail = plaintextBuffer
+                plaintextBuffer.removeAll()
+                receive(tail, true, nil)
+            } else {
+                receive(nil, true, nil)
+            }
+        }
         let sends = sendQueue; sendQueue.removeAll()
-        sends.forEach { $0.1(error ?? NativeOutboundError.connection("REALITY TLS 连接已关闭")) }
+        let sendErr = error ?? NativeOutboundError.connection("REALITY TLS 连接已关闭")
+        for item in sends { item.completion(sendErr) }
     }
 }
 

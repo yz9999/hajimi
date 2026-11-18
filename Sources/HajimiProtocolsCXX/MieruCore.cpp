@@ -119,37 +119,55 @@ std::vector<Buffer> mieruCandidateKeys(const std::string &username, const std::s
     return keys;
 }
 
+namespace {
+void fillMieruNonce24(const std::string &username, const uint8_t *prefix20, uint8_t dstNonce24[24]) {
+    std::memcpy(dstNonce24, prefix20, 20);
+    for (size_t i = 0; i < 16; ++i) {
+        if (dstNonce24[i] < 0x20 || dstNonce24[i] > 0x7e) {
+            dstNonce24[i] = uint8_t(0x20 + (dstNonce24[i] % 0x5f));
+        }
+    }
+    if (username.size() <= 240) {
+        uint8_t tagInput[256];
+        if (!username.empty()) std::memcpy(tagInput, username.data(), username.size());
+        std::memcpy(tagInput + username.size(), dstNonce24, 16);
+        Buffer digest = crypto::digestSlice("SHA256", tagInput, username.size() + 16);
+        std::memcpy(dstNonce24 + 20, digest.data(), 4);
+    } else {
+        Buffer tagInput;
+        tagInput.reserve(username.size() + 16);
+        tagInput.insert(tagInput.end(), username.begin(), username.end());
+        tagInput.insert(tagInput.end(), dstNonce24, dstNonce24 + 16);
+        Buffer digest = crypto::digest("SHA256", tagInput);
+        std::memcpy(dstNonce24 + 20, digest.data(), 4);
+    }
+}
+} // namespace
+
 // Mieru 24-byte XChaCha20-Poly1305 nonce with printable ASCII prefix (NONCE_TYPE_PRINTABLE) and 4-byte user tag
 Buffer mieruMakeNonce(const std::string &username, const Buffer &randomPrefix20) {
     if (randomPrefix20.size() < 20) throw std::runtime_error("Invalid Mieru nonce prefix");
-    Buffer nonce;
-    nonce.reserve(24);
-    nonce.insert(nonce.end(), randomPrefix20.begin(), randomPrefix20.begin() + 20);
-    for (size_t i = 0; i < 16; ++i) {
-        if (nonce[i] < 0x20 || nonce[i] > 0x7e) {
-            nonce[i] = uint8_t(0x20 + (nonce[i] % 0x5f));
-        }
-    }
-    Buffer tagInput;
-    tagInput.reserve(username.size() + 16);
-    tagInput.insert(tagInput.end(), username.begin(), username.end());
-    tagInput.insert(tagInput.end(), nonce.begin(), nonce.begin() + 16);
-    Buffer digest = crypto::digest("SHA256", tagInput);
-    nonce.insert(nonce.end(), digest.begin(), digest.begin() + 4);
+    Buffer nonce(24);
+    fillMieruNonce24(username, randomPrefix20.data(), nonce.data());
     return nonce;
 }
 
 Buffer sealMieruUDPSegmentWithKey(const std::string &username, const Buffer &key,
                                   const Buffer &meta32, const Buffer &payload) {
-    Buffer nonce = mieruMakeNonce(username, crypto::randomBytes(20));
-    Buffer wire;
-    wire.reserve(24 + 48 + (payload.empty() ? 0 : payload.size() + 16));
-    wire.insert(wire.end(), nonce.begin(), nonce.end());
-    Buffer sealedMeta = crypto::seal(crypto::AEAD::XChaCha20Poly1305, key, nonce, meta32);
-    wire.insert(wire.end(), sealedMeta.begin(), sealedMeta.end());
+    if (meta32.size() != 32) throw std::runtime_error("Invalid Mieru metadata size");
+    const size_t totalLen = 24 + 48 + (payload.empty() ? 0 : (payload.size() + 16));
+    Buffer wire(totalLen);
+    Buffer rnd20 = crypto::randomBytes(20);
+    fillMieruNonce24(username, rnd20.data(), wire.data());
+    if (!crypto::sealInto(crypto::AEAD::XChaCha20Poly1305, key.data(), key.size(),
+                          wire.data(), 24, meta32.data(), 32, wire.data() + 24)) {
+        throw std::runtime_error("Mieru AEAD metadata encryption failed");
+    }
     if (!payload.empty()) {
-        Buffer sealedPayload = crypto::seal(crypto::AEAD::XChaCha20Poly1305, key, nonce, payload);
-        wire.insert(wire.end(), sealedPayload.begin(), sealedPayload.end());
+        if (!crypto::sealInto(crypto::AEAD::XChaCha20Poly1305, key.data(), key.size(),
+                              wire.data(), 24, payload.data(), payload.size(), wire.data() + 72)) {
+            throw std::runtime_error("Mieru AEAD payload encryption failed");
+        }
     }
     return wire;
 }

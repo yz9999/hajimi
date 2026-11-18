@@ -59,8 +59,10 @@ void quarter(std::array<uint32_t, 16> &s, unsigned a, unsigned b, unsigned c, un
     s[a] += s[b]; s[d] = rotl(s[d] ^ s[a], 8);
     s[c] += s[d]; s[b] = rotl(s[b] ^ s[c], 7);
 }
-void hChaCha20Into(const Buffer &key, const Buffer &nonce, std::array<uint8_t, 32> &out) {
-    require(key.size() == 32 && nonce.size() >= 16, "HChaCha20 key or nonce length invalid");
+bool hChaCha20Into(const uint8_t *keyPtr, size_t keyLen,
+                   const uint8_t *noncePtr, size_t nonceLen,
+                   std::array<uint8_t, 32> &out) noexcept {
+    if (!keyPtr || !noncePtr || keyLen != 32 || nonceLen < 16) return false;
     struct HChaChaCache {
         bool valid = false;
         std::array<uint8_t, 32> key{};
@@ -74,14 +76,14 @@ void hChaCha20Into(const Buffer &key, const Buffer &nonce, std::array<uint8_t, 3
     };
     thread_local HChaChaCache cache;
     if (cache.valid &&
-        std::memcmp(cache.nonce16.data(), nonce.data(), 16) == 0 &&
-        CRYPTO_memcmp(cache.key.data(), key.data(), 32) == 0) {
+        std::memcmp(cache.nonce16.data(), noncePtr, 16) == 0 &&
+        CRYPTO_memcmp(cache.key.data(), keyPtr, 32) == 0) {
         out = cache.derived;
-        return;
+        return true;
     }
     std::array<uint32_t,16> state{0x61707865,0x3320646e,0x79622d32,0x6b206574};
-    for (unsigned i = 0; i < 8; ++i) state[i+4] = load32(key.data() + i*4);
-    for (unsigned i = 0; i < 4; ++i) state[i+12] = load32(nonce.data() + i*4);
+    for (unsigned i = 0; i < 8; ++i) state[i+4] = load32(keyPtr + i*4);
+    for (unsigned i = 0; i < 4; ++i) state[i+12] = load32(noncePtr + i*4);
     for (unsigned i = 0; i < 10; ++i) {
         quarter(state,0,4,8,12); quarter(state,1,5,9,13);
         quarter(state,2,6,10,14); quarter(state,3,7,11,15);
@@ -93,12 +95,13 @@ void hChaCha20Into(const Buffer &key, const Buffer &nonce, std::array<uint8_t, 3
         store32(state[i+12], out.data()+(i+4)*4);
     }
     OPENSSL_cleanse(state.data(), sizeof(state));
-    std::memcpy(cache.key.data(), key.data(), 32);
-    std::memcpy(cache.nonce16.data(), nonce.data(), 16);
+    std::memcpy(cache.key.data(), keyPtr, 32);
+    std::memcpy(cache.nonce16.data(), noncePtr, 16);
     cache.derived = out;
     cache.valid = true;
+    return true;
 }
-const EVP_CIPHER *cipherFor(AEAD method) {
+const EVP_CIPHER *cipherForNoThrow(AEAD method) noexcept {
     switch (method) {
     case AEAD::AES128GCM: return EVP_aes_128_gcm();
     case AEAD::AES192GCM: return EVP_aes_192_gcm();
@@ -106,7 +109,12 @@ const EVP_CIPHER *cipherFor(AEAD method) {
     case AEAD::ChaCha20Poly1305:
     case AEAD::XChaCha20Poly1305: return EVP_chacha20_poly1305();
     }
-    throw std::runtime_error("Unknown AEAD method");
+    return nullptr;
+}
+const EVP_CIPHER *cipherFor(AEAD method) {
+    const EVP_CIPHER *c = cipherForNoThrow(method);
+    if (!c) throw std::runtime_error("Unknown AEAD method");
+    return c;
 }
 unsigned cipherSlotFor(AEAD method) noexcept {
     switch (method) {
@@ -118,26 +126,61 @@ unsigned cipherSlotFor(AEAD method) noexcept {
     }
     return 0;
 }
+struct AEADSlot {
+    CipherContext ctx{EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_free};
+    bool initialized = false;
+    uint8_t lastKey[32]{};
+    size_t lastKeyLen = 0;
+    ~AEADSlot() {
+        OPENSSL_cleanse(lastKey, sizeof(lastKey));
+        lastKeyLen = 0;
+    }
+};
+void invalidateAEADSlot(AEADSlot &slot) noexcept {
+    slot.lastKeyLen = 0;
+    slot.initialized = false;
+    OPENSSL_cleanse(slot.lastKey, sizeof(slot.lastKey));
+    if (slot.ctx) EVP_CIPHER_CTX_reset(slot.ctx.get());
+}
 EVP_CIPHER_CTX *reusableAEADContext(AEAD method, const EVP_CIPHER *algorithm, bool encrypt,
-                                    const uint8_t *keyPtr, const uint8_t *noncePtr) {
-    struct Slot {
-        CipherContext ctx{EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_free};
-        bool bound = false;
-    };
-    thread_local Slot slots[4][2];
-    Slot &slot = slots[cipherSlotFor(method)][encrypt ? 1 : 0];
-    require(slot.ctx != nullptr, "AEAD cipher context allocation failed");
+                                    const uint8_t *keyPtr, size_t keyLength,
+                                    const uint8_t *noncePtr, AEADSlot *&outSlot) noexcept {
+    thread_local AEADSlot slots[4][2];
+    AEADSlot &slot = slots[cipherSlotFor(method)][encrypt ? 1 : 0];
+    outSlot = &slot;
+    if (!slot.ctx) return nullptr;
     EVP_CIPHER_CTX *raw = slot.ctx.get();
-    if (slot.bound) {
-        if (EVP_CipherInit_ex(raw, nullptr, nullptr, keyPtr, noncePtr, encrypt ? 1 : 0) == 1) {
+    const bool reuseKeySchedule = (method == AEAD::AES128GCM || method == AEAD::AES256GCM);
+    if (reuseKeySchedule && slot.initialized &&
+        slot.lastKeyLen == keyLength &&
+        CRYPTO_memcmp(slot.lastKey, keyPtr, keyLength) == 0) {
+        if (EVP_CipherInit_ex(raw, nullptr, nullptr, nullptr, noncePtr, -1) == 1) {
             return raw;
         }
-        EVP_CIPHER_CTX_reset(raw);
-        slot.bound = false;
+        invalidateAEADSlot(slot);
+    } else if (slot.initialized) {
+        if (EVP_CipherInit_ex(raw, nullptr, nullptr, keyPtr, noncePtr, encrypt ? 1 : 0) == 1) {
+            if (reuseKeySchedule && keyLength <= sizeof(slot.lastKey)) {
+                std::memcpy(slot.lastKey, keyPtr, keyLength);
+                slot.lastKeyLen = keyLength;
+            } else {
+                slot.lastKeyLen = 0;
+            }
+            return raw;
+        }
+        invalidateAEADSlot(slot);
     }
-    require(EVP_CipherInit_ex(raw, algorithm, nullptr, keyPtr, noncePtr, encrypt ? 1 : 0) == 1,
-            "AEAD initialization failed");
-    slot.bound = true;
+    if (EVP_CipherInit_ex(raw, algorithm, nullptr, keyPtr, noncePtr, encrypt ? 1 : 0) != 1) {
+        invalidateAEADSlot(slot);
+        return nullptr;
+    }
+    slot.initialized = true;
+    if (reuseKeySchedule && keyLength <= sizeof(slot.lastKey)) {
+        std::memcpy(slot.lastKey, keyPtr, keyLength);
+        slot.lastKeyLen = keyLength;
+    } else {
+        slot.lastKeyLen = 0;
+    }
     return raw;
 }
 }
@@ -283,12 +326,23 @@ Buffer aesECBBlock(const Buffer &block, const Buffer &key, bool encrypt) {
 }
 
 namespace {
-Buffer aeadSlice(bool encrypt, AEAD method, const Buffer &key, const Buffer &nonce,
-                 const uint8_t *inputPtr, size_t inputLen, const Buffer &aad) {
-    const EVP_CIPHER *algorithm = cipherFor(method);
-    require(key.size() == size_t(EVP_CIPHER_get_key_length(algorithm)),"AEAD key length invalid");
-    require(nonce.size() == (method == AEAD::XChaCha20Poly1305 ? 24u : 12u),"AEAD nonce length invalid");
-    require(encrypt || inputLen >= 16,"AEAD ciphertext is truncated");
+bool aeadIntoImpl(bool encrypt, AEAD method,
+                  const uint8_t *key, size_t keyLen,
+                  const uint8_t *nonce, size_t nonceLen,
+                  const uint8_t *inputPtr, size_t inputLen,
+                  uint8_t *dstPtr,
+                  const uint8_t *aadPtr, size_t aadLen) noexcept {
+    const EVP_CIPHER *algorithm = cipherForNoThrow(method);
+    if (!algorithm || !key || !nonce) return false;
+    const size_t expectedKeyLen = size_t(EVP_CIPHER_get_key_length(algorithm));
+    const size_t expectedNonceLen = (method == AEAD::XChaCha20Poly1305) ? 24u : 12u;
+    if (keyLen != expectedKeyLen || nonceLen != expectedNonceLen) return false;
+    if (!encrypt && inputLen < 16) return false;
+    const size_t dataLength = encrypt ? inputLen : (inputLen - 16);
+    if (dataLength > size_t(INT_MAX) || aadLen > size_t(INT_MAX)) return false;
+    if ((inputLen > 0 && !inputPtr) || (aadLen > 0 && !aadPtr)) return false;
+    if ((encrypt && !dstPtr) || (!encrypt && dataLength > 0 && !dstPtr)) return false;
+
     std::array<uint8_t, 32> derivedKey{};
     std::array<uint8_t, 12> derivedNonce{};
     struct SubkeyGuard {
@@ -296,42 +350,110 @@ Buffer aeadSlice(bool encrypt, AEAD method, const Buffer &key, const Buffer &non
         bool active;
         ~SubkeyGuard() { if (active) OPENSSL_cleanse(k.data(), k.size()); }
     } guard{derivedKey, method == AEAD::XChaCha20Poly1305};
-    const uint8_t *keyPtr = key.data();
-    const uint8_t *noncePtr = nonce.data();
+
+    const uint8_t *actualKeyPtr = key;
+    size_t actualKeyLen = keyLen;
+    const uint8_t *actualNoncePtr = nonce;
     if (method == AEAD::XChaCha20Poly1305) {
-        hChaCha20Into(key, nonce, derivedKey);
-        std::copy(nonce.begin() + 16, nonce.end(), derivedNonce.begin() + 4);
-        keyPtr = derivedKey.data();
-        noncePtr = derivedNonce.data();
+        if (!hChaCha20Into(key, keyLen, nonce, nonceLen, derivedKey)) return false;
+        std::memcpy(derivedNonce.data() + 4, nonce + 16, 8);
+        actualKeyPtr = derivedKey.data();
+        actualKeyLen = 32;
+        actualNoncePtr = derivedNonce.data();
     }
-    EVP_CIPHER_CTX *ctx = reusableAEADContext(method, algorithm, encrypt, keyPtr, noncePtr);
-    int written=0, final=0;
-    if (!aad.empty()) {
-        require(EVP_CipherUpdate(ctx,nullptr,&written,aad.data(),length(aad.size())) == 1,
-                "AEAD associated data processing failed");
+
+    uint8_t savedTag[16]{};
+    if (!encrypt) {
+        std::memcpy(savedTag, inputPtr + dataLength, 16);
+    }
+
+    ERR_set_mark();
+    AEADSlot *slot = nullptr;
+    EVP_CIPHER_CTX *ctx = reusableAEADContext(method, algorithm, encrypt,
+                                              actualKeyPtr, actualKeyLen, actualNoncePtr, slot);
+    if (!ctx) {
+        ERR_pop_to_mark();
+        return false;
+    }
+
+    auto failOp = [&]() noexcept -> bool {
+        if (!encrypt && dataLength > 0 && dstPtr) {
+            OPENSSL_cleanse(dstPtr, dataLength);
+        }
+        if (slot) invalidateAEADSlot(*slot);
+        ERR_pop_to_mark();
+        return false;
+    };
+
+    int written = 0, final = 0;
+    if (aadLen > 0) {
+        if (EVP_CipherUpdate(ctx, nullptr, &written, aadPtr, static_cast<int>(aadLen)) != 1) {
+            return failOp();
+        }
         written = 0;
     }
-    size_t dataLength = encrypt ? inputLen : inputLen-16;
-    Buffer output(dataLength + 16);
     if (dataLength > 0) {
-        require(EVP_CipherUpdate(ctx,output.data(),&written,inputPtr,length(dataLength)) == 1,
-                "AEAD processing failed");
+        if (EVP_CipherUpdate(ctx, dstPtr, &written, inputPtr, static_cast<int>(dataLength)) != 1) {
+            return failOp();
+        }
     }
-    if (!encrypt) require(EVP_CIPHER_CTX_ctrl(ctx,EVP_CTRL_AEAD_SET_TAG,16,
-                                const_cast<uint8_t *>(inputPtr+dataLength)) == 1,"AEAD tag setup failed");
-    if (EVP_CipherFinal_ex(ctx,output.data()+written,&final) != 1) {
-        OPENSSL_cleanse(output.data(),output.size());
-        throw std::runtime_error("AEAD authentication failed");
+    if (!encrypt) {
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, savedTag) != 1) {
+            return failOp();
+        }
     }
-    require(size_t(written+final) == dataLength,"AEAD output length invalid");
+    uint8_t finalScratch[16]{};
+    if (EVP_CipherFinal_ex(ctx, finalScratch, &final) != 1) {
+        return failOp();
+    }
+    if (final < 0 || size_t(written + final) != dataLength) {
+        return failOp();
+    }
+    if (final > 0 && dstPtr) {
+        std::memcpy(dstPtr + written, finalScratch, size_t(final));
+    }
     if (encrypt) {
-        require(EVP_CIPHER_CTX_ctrl(ctx,EVP_CTRL_AEAD_GET_TAG,16,output.data()+dataLength) == 1,
-                "AEAD tag retrieval failed");
-    } else {
-        output.resize(dataLength);
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, dstPtr + dataLength) != 1) {
+            return failOp();
+        }
+    }
+    ERR_clear_last_mark();
+    return true;
+}
+
+Buffer aeadSlice(bool encrypt, AEAD method, const Buffer &key, const Buffer &nonce,
+                 const uint8_t *inputPtr, size_t inputLen, const Buffer &aad) {
+    const EVP_CIPHER *algorithm = cipherFor(method);
+    require(key.size() == size_t(EVP_CIPHER_get_key_length(algorithm)), "AEAD key length invalid");
+    require(nonce.size() == (method == AEAD::XChaCha20Poly1305 ? 24u : 12u), "AEAD nonce length invalid");
+    require(encrypt || inputLen >= 16, "AEAD ciphertext is truncated");
+    const size_t dataLength = encrypt ? inputLen : (inputLen - 16);
+    (void)length(dataLength);
+    if (!aad.empty()) (void)length(aad.size());
+    Buffer output(encrypt ? (dataLength + 16) : dataLength);
+    uint8_t *dst = output.empty() ? nullptr : output.data();
+    if (!aeadIntoImpl(encrypt, method, key.data(), key.size(), nonce.data(), nonce.size(),
+                      inputPtr, inputLen, dst, aad.data(), aad.size())) {
+        throw std::runtime_error(encrypt ? "AEAD processing failed" : "AEAD authentication failed");
     }
     return output;
 }
+}
+bool sealInto(AEAD method, const uint8_t *key, size_t keyLen,
+              const uint8_t *nonce, size_t nonceLen,
+              const uint8_t *plain, size_t plainLen,
+              uint8_t *dstCipherAndTag,
+              const uint8_t *aad, size_t aadLen) {
+    return aeadIntoImpl(true, method, key, keyLen, nonce, nonceLen,
+                        plain, plainLen, dstCipherAndTag, aad, aadLen);
+}
+bool openInto(AEAD method, const uint8_t *key, size_t keyLen,
+              const uint8_t *nonce, size_t nonceLen,
+              const uint8_t *cipherAndTag, size_t cipherAndTagLen,
+              uint8_t *dstPlain,
+              const uint8_t *aad, size_t aadLen) {
+    return aeadIntoImpl(false, method, key, keyLen, nonce, nonceLen,
+                        cipherAndTag, cipherAndTagLen, dstPlain, aad, aadLen);
 }
 Buffer seal(AEAD method, const Buffer &key, const Buffer &nonce, const Buffer &plain, const Buffer &aad) {
     return aeadSlice(true,method,key,nonce,plain.data(),plain.size(),aad);

@@ -108,252 +108,255 @@ public enum DNSWireAnalyzer {
     /// root `OPT` record (or creates a root `OPT` record advertising 1232-byte UDP payload
     /// per RFC 9715 when `ARCOUNT == 0`) to solicit authoritative error-reporting agent domains.
     public static func attachingReportChannelRequest(_ query: Data) -> Data? {
-        let bytes = [UInt8](query)
-        guard bytes.count >= 12,
-              bytes[2] & 0x80 == 0,
-              read16(bytes, 4) == 1,
-              read16(bytes, 6) == 0,
-              read16(bytes, 8) == 0 else { return nil }
-        let arcount = read16(bytes, 10)
-        guard arcount <= 1 else { return nil }
-        var seen = Set<Int>()
-        guard let qname = readName(bytes, at: 12, visited: &seen),
-              qname.end + 4 <= bytes.count else { return nil }
-        let questionEnd = qname.end + 4
-        let optionBytes: [UInt8] = [0x00, 0x12, 0x00, 0x00] // Option 18 (REPORT-CHANNEL), length 0
+        query.withUnsafeBytes { bytes in
+            guard bytes.count >= 12,
+                  bytes[2] & 0x80 == 0,
+                  read16(bytes, 4) == 1,
+                  read16(bytes, 6) == 0,
+                  read16(bytes, 8) == 0 else { return nil }
+            let arcount = read16(bytes, 10)
+            guard arcount <= 1 else { return nil }
+            var seen = Set<Int>()
+            guard let qname = readName(bytes, at: 12, visited: &seen),
+                  qname.end + 4 <= bytes.count else { return nil }
+            let questionEnd = qname.end + 4
+            let optionBytes: [UInt8] = [0x00, 0x12, 0x00, 0x00] // Option 18 (REPORT-CHANNEL), length 0
 
-        if arcount == 0 {
-            guard questionEnd == bytes.count else { return nil }
-            var out = bytes
-            out[10] = 0x00
-            out[11] = 0x01
-            out.append(contentsOf: [
-                0x00,                   // root owner "."
-                0x00, 0x29,             // TYPE = OPT (41)
-                0x04, 0xd0,             // CLASS = 1232 UDP payload (RFC 9715)
-                0x00, 0x00, 0x00, 0x00, // EXT-RCODE=0, VERSION=0, FLAGS=0
-                0x00, 0x04              // RDLENGTH = 4
-            ])
+            if arcount == 0 {
+                guard questionEnd == bytes.count else { return nil }
+                var out = Data(capacity: bytes.count + 15)
+                out.append(bytes.bindMemory(to: UInt8.self))
+                out[10] = 0x00
+                out[11] = 0x01
+                out.append(contentsOf: [
+                    0x00,                   // root owner "."
+                    0x00, 0x29,             // TYPE = OPT (41)
+                    0x04, 0xd0,             // CLASS = 1232 UDP payload (RFC 9715)
+                    0x00, 0x00, 0x00, 0x00, // EXT-RCODE=0, VERSION=0, FLAGS=0
+                    0x00, 0x04              // RDLENGTH = 4
+                ])
+                out.append(contentsOf: optionBytes)
+                return out
+            }
+
+            // ARCOUNT == 1: verify root uncompressed OPT record at tail
+            guard questionEnd + 11 <= bytes.count,
+                  bytes[questionEnd] == 0,
+                  read16(bytes, questionEnd + 1) == 41 else { return nil }
+            let rdlen = Int(read16(bytes, questionEnd + 9))
+            guard questionEnd + 11 + rdlen == bytes.count,
+                  rdlen + 4 <= 65535 else { return nil }
+            // Check if Option 18 is already present
+            var optPos = questionEnd + 11
+            while optPos + 4 <= bytes.count {
+                let code = read16(bytes, optPos)
+                let len = Int(read16(bytes, optPos + 2))
+                optPos += 4
+                guard optPos + len <= bytes.count else { return nil }
+                if code == ednsOptionReportChannel { return query }
+                optPos += len
+            }
+            var out = Data(capacity: bytes.count + 4)
+            out.append(bytes.bindMemory(to: UInt8.self))
+            let newLen = UInt16(rdlen + 4)
+            out[questionEnd + 9] = UInt8(newLen >> 8)
+            out[questionEnd + 10] = UInt8(newLen & 0xff)
             out.append(contentsOf: optionBytes)
-            return Data(out)
+            return out
         }
-
-        // ARCOUNT == 1: verify root uncompressed OPT record at tail
-        guard questionEnd + 11 <= bytes.count,
-              bytes[questionEnd] == 0,
-              read16(bytes, questionEnd + 1) == 41 else { return nil }
-        let rdlen = Int(read16(bytes, questionEnd + 9))
-        guard questionEnd + 11 + rdlen == bytes.count,
-              rdlen + 4 <= 65535 else { return nil }
-        // Check if Option 18 is already present
-        var optPos = questionEnd + 11
-        while optPos + 4 <= bytes.count {
-            let code = read16(bytes, optPos)
-            let len = Int(read16(bytes, optPos + 2))
-            optPos += 4
-            guard optPos + len <= bytes.count else { return nil }
-            if code == ednsOptionReportChannel { return query }
-            optPos += len
-        }
-        var out = bytes
-        let newLen = UInt16(rdlen + 4)
-        out[questionEnd + 9] = UInt8(newLen >> 8)
-        out[questionEnd + 10] = UInt8(newLen & 0xff)
-        out.append(contentsOf: optionBytes)
-        return Data(out)
     }
 
     /// Performs single-pass wire inspection, tunneling anomaly scoring, RFC 2308 negative TTL
     /// calculation, RFC 9567 `REPORT-CHANNEL` validation, and Happy Eyeballs v3 candidate synthesis.
     public static func analyze(_ message: Data, queryByteCount: Int? = nil, defaultPort: UInt16 = 443) -> DiagnosticReport? {
-        let bytes = [UInt8](message)
-        guard (12...65535).contains(bytes.count) else { return nil }
+        guard (12...65535).contains(message.count) else { return nil }
+        return message.withUnsafeBytes { bytes -> DiagnosticReport? in
+            let txid = read16(bytes, 0)
+            let flags = read16(bytes, 2)
+            let isResponse = (flags & 0x8000) != 0
+            let opcode = UInt8((flags >> 11) & 0x0f)
+            let aa = (flags & 0x0400) != 0
+            let tc = (flags & 0x0200) != 0
+            let rd = (flags & 0x0100) != 0
+            let ra = (flags & 0x0080) != 0
+            let ad = (flags & 0x0020) != 0
+            let cd = (flags & 0x0010) != 0
+            var fullRcode = UInt16(flags & 0x000f)
 
-        let txid = read16(bytes, 0)
-        let flags = read16(bytes, 2)
-        let isResponse = (flags & 0x8000) != 0
-        let opcode = UInt8((flags >> 11) & 0x0f)
-        let aa = (flags & 0x0400) != 0
-        let tc = (flags & 0x0200) != 0
-        let rd = (flags & 0x0100) != 0
-        let ra = (flags & 0x0080) != 0
-        let ad = (flags & 0x0020) != 0
-        let cd = (flags & 0x0010) != 0
-        var fullRcode = UInt16(flags & 0x000f)
+            let qdcount = Int(read16(bytes, 4))
+            let ancount = Int(read16(bytes, 6))
+            let nscount = Int(read16(bytes, 8))
+            let arcount = Int(read16(bytes, 10))
+            guard qdcount >= 1, ancount + nscount + arcount <= 512 else { return nil }
 
-        let qdcount = Int(read16(bytes, 4))
-        let ancount = Int(read16(bytes, 6))
-        let nscount = Int(read16(bytes, 8))
-        let arcount = Int(read16(bytes, 10))
-        guard qdcount >= 1, ancount + nscount + arcount <= 512 else { return nil }
+            var pos = 12
+            var qnameStr = "."
+            var qtype: UInt16 = 0
+            var qclass: UInt16 = 0
+            var labelCount = 0
+            var maxLabel = 0
+            var entropy = 0.0
+            var hexRatio = 0.0
 
-        var pos = 12
-        var qnameStr = "."
-        var qtype: UInt16 = 0
-        var qclass: UInt16 = 0
-        var labelCount = 0
-        var maxLabel = 0
-        var entropy = 0.0
-        var hexRatio = 0.0
-
-        for q in 0..<qdcount {
-            var seen = Set<Int>()
-            guard let parsed = readName(bytes, at: pos, visited: &seen),
-                  parsed.end + 4 <= bytes.count else { return nil }
-            if q == 0 {
-                qnameStr = parsed.normalized
-                labelCount = parsed.labels.count
-                maxLabel = parsed.labels.map(\.count).max() ?? 0
-                (entropy, hexRatio) = computeLabelMetrics(parsed.labels)
-                qtype = read16(bytes, parsed.end)
-                qclass = read16(bytes, parsed.end + 2)
-            }
-            pos = parsed.end + 4
-        }
-
-        let risk = classifyTunnelingRisk(qname: qnameStr, qtype: qtype, labelCount: labelCount,
-                                         maxLabelLength: maxLabel, entropy: entropy, hexRatio: hexRatio)
-
-        var cnameHops = 0
-        var minPosTTL: UInt32?
-        var minNegTTL: UInt32?
-        var ednsPayload: UInt16?
-        var dnssecDO = false
-        var ede: DNSExtendedError?
-        var reportAgent: String?
-        var ipv4Answers: [String] = []
-        var ipv6Answers: [String] = []
-        var svcbRecords: [ParsedSVCB] = []
-
-        let sections = [ancount, nscount, arcount]
-        for (secIdx, count) in sections.enumerated() {
-            for _ in 0..<count {
-                let ownerStart = pos
+            for q in 0..<qdcount {
                 var seen = Set<Int>()
-                guard let owner = readName(bytes, at: pos, visited: &seen),
-                      owner.end + 10 <= bytes.count else { return nil }
-                pos = owner.end
-                let rtype = read16(bytes, pos)
-                let rclass = read16(bytes, pos + 2)
-                let rttl = read32(bytes, pos + 4)
-                let rdlen = Int(read16(bytes, pos + 8))
-                pos += 10
-                guard pos + rdlen <= bytes.count else { return nil }
-                let rdataEnd = pos + rdlen
-
-                if secIdx == 0 {
-                    if rtype != 41 {
-                        minPosTTL = minPosTTL.map { min($0, rttl) } ?? rttl
-                    }
-                    if rtype == 5 {
-                        cnameHops += 1
-                    } else if rtype == 1 && (rclass & 0x7fff) == 1 && rdlen == 4 {
-                        ipv4Answers.append("\(bytes[pos]).\(bytes[pos + 1]).\(bytes[pos + 2]).\(bytes[pos + 3])")
-                    } else if rtype == 28 && (rclass & 0x7fff) == 1 && rdlen == 16 {
-                        if let v6 = formatIPv6(Array(bytes[pos..<rdataEnd])) {
-                            ipv6Answers.append(v6)
-                        }
-                    } else if (rtype == 64 || rtype == 65) && (rclass & 0x7fff) == 1 {
-                        if let svc = parseSVCB(bytes, from: pos, to: rdataEnd, fallbackTarget: qnameStr, defaultPort: defaultPort) {
-                            svcbRecords.append(svc)
-                        }
-                    }
-                } else if secIdx == 1 {
-                    // RFC 2308 §3 & §5: Authority SOA negative caching lifetime = min(SOA RR TTL, SOA.MINIMUM)
-                    if rtype == 6 && (rclass & 0x7fff) == 1 {
-                        var s1 = Set<Int>(), s2 = Set<Int>()
-                        if let mname = readName(bytes, at: pos, visited: &s1),
-                           mname.end <= rdataEnd,
-                           let rname = readName(bytes, at: mname.end, visited: &s2),
-                           rname.end + 20 == rdataEnd {
-                            let soaMinimum = read32(bytes, rname.end + 16)
-                            let candidate = min(rttl, soaMinimum)
-                            minNegTTL = minNegTTL.map { min($0, candidate) } ?? candidate
-                        }
-                    }
-                } else {
-                    // Additional section: EDNS0 OPT (RFC 6891) + glue A/AAAA
-                    if rtype == 41 && owner.normalized == "." && bytes[ownerStart] == 0 {
-                        ednsPayload = rclass
-                        let extRcode = UInt16((rttl >> 24) & 0xff)
-                        if extRcode != 0 {
-                            fullRcode = (extRcode << 4) | (flags & 0x000f)
-                        }
-                        dnssecDO = ((rttl >> 15) & 1) != 0
-                        var opt = pos
-                        while opt + 4 <= rdataEnd {
-                            let optCode = read16(bytes, opt)
-                            let optLen = Int(read16(bytes, opt + 2))
-                            opt += 4
-                            guard opt + optLen <= rdataEnd else { return nil }
-                            if optCode == ednsOptionExtendedError && optLen >= 2 && ede == nil {
-                                let infoCode = read16(bytes, opt)
-                                let extraBytes = Array(bytes[(opt + 2)..<(opt + optLen)])
-                                let text = extraBytes.isEmpty ? nil : String(decoding: extraBytes, as: UTF8.self)
-                                    .trimmingCharacters(in: .controlCharacters)
-                                ede = DNSExtendedError(infoCode: infoCode, extraText: text?.isEmpty == true ? nil : text)
-                            } else if optCode == ednsOptionReportChannel && optLen > 1 && reportAgent == nil {
-                                if let agent = parseUncompressedDomainOption(bytes, from: opt, length: optLen),
-                                   isSafeReportChannelAgent(agent, forQName: qnameStr) {
-                                    reportAgent = agent
-                                }
-                            }
-                            opt += optLen
-                        }
-                    }
+                guard let parsed = readName(bytes, at: pos, visited: &seen),
+                      parsed.end + 4 <= bytes.count else { return nil }
+                if q == 0 {
+                    qnameStr = parsed.normalized
+                    labelCount = parsed.labels.count
+                    maxLabel = parsed.labels.map(\.count).max() ?? 0
+                    (entropy, hexRatio) = computeLabelMetrics(parsed.labels)
+                    qtype = read16(bytes, parsed.end)
+                    qclass = read16(bytes, parsed.end + 2)
                 }
-                pos = rdataEnd
+                pos = parsed.end + 4
             }
+
+            let risk = classifyTunnelingRisk(qname: qnameStr, qtype: qtype, labelCount: labelCount,
+                                             maxLabelLength: maxLabel, entropy: entropy, hexRatio: hexRatio)
+
+            var cnameHops = 0
+            var minPosTTL: UInt32?
+            var minNegTTL: UInt32?
+            var ednsPayload: UInt16?
+            var dnssecDO = false
+            var ede: DNSExtendedError?
+            var reportAgent: String?
+            var ipv4Answers: [String] = []
+            var ipv6Answers: [String] = []
+            var svcbRecords: [ParsedSVCB] = []
+
+            let sections = [ancount, nscount, arcount]
+            for (secIdx, count) in sections.enumerated() {
+                for _ in 0..<count {
+                    let ownerStart = pos
+                    var seen = Set<Int>()
+                    guard let owner = readName(bytes, at: pos, visited: &seen),
+                          owner.end + 10 <= bytes.count else { return nil }
+                    pos = owner.end
+                    let rtype = read16(bytes, pos)
+                    let rclass = read16(bytes, pos + 2)
+                    let rttl = read32(bytes, pos + 4)
+                    let rdlen = Int(read16(bytes, pos + 8))
+                    pos += 10
+                    guard pos + rdlen <= bytes.count else { return nil }
+                    let rdataEnd = pos + rdlen
+
+                    if secIdx == 0 {
+                        if rtype != 41 {
+                            minPosTTL = minPosTTL.map { min($0, rttl) } ?? rttl
+                        }
+                        if rtype == 5 {
+                            cnameHops += 1
+                        } else if rtype == 1 && (rclass & 0x7fff) == 1 && rdlen == 4 {
+                            ipv4Answers.append("\(bytes[pos]).\(bytes[pos + 1]).\(bytes[pos + 2]).\(bytes[pos + 3])")
+                        } else if rtype == 28 && (rclass & 0x7fff) == 1 && rdlen == 16 {
+                            if let v6 = formatIPv6(UnsafeRawBufferPointer(rebasing: bytes[pos..<rdataEnd])) {
+                                ipv6Answers.append(v6)
+                            }
+                        } else if (rtype == 64 || rtype == 65) && (rclass & 0x7fff) == 1 {
+                            if let svc = parseSVCB(bytes, from: pos, to: rdataEnd, fallbackTarget: qnameStr, defaultPort: defaultPort) {
+                                svcbRecords.append(svc)
+                            }
+                        }
+                    } else if secIdx == 1 {
+                        // RFC 2308 §3 & §5: Authority SOA negative caching lifetime = min(SOA RR TTL, SOA.MINIMUM)
+                        if rtype == 6 && (rclass & 0x7fff) == 1 {
+                            var s1 = Set<Int>(), s2 = Set<Int>()
+                            if let mname = readName(bytes, at: pos, visited: &s1),
+                               mname.end <= rdataEnd,
+                               let rname = readName(bytes, at: mname.end, visited: &s2),
+                               rname.end + 20 == rdataEnd {
+                                let soaMinimum = read32(bytes, rname.end + 16)
+                                let candidate = min(rttl, soaMinimum)
+                                minNegTTL = minNegTTL.map { min($0, candidate) } ?? candidate
+                            }
+                        }
+                    } else {
+                        // Additional section: EDNS0 OPT (RFC 6891) + glue A/AAAA
+                        if rtype == 41 && owner.normalized == "." && bytes[ownerStart] == 0 {
+                            ednsPayload = rclass
+                            let extRcode = UInt16((rttl >> 24) & 0xff)
+                            if extRcode != 0 {
+                                fullRcode = (extRcode << 4) | (flags & 0x000f)
+                            }
+                            dnssecDO = ((rttl >> 15) & 1) != 0
+                            var opt = pos
+                            while opt + 4 <= rdataEnd {
+                                let optCode = read16(bytes, opt)
+                                let optLen = Int(read16(bytes, opt + 2))
+                                opt += 4
+                                guard opt + optLen <= rdataEnd else { return nil }
+                                if optCode == ednsOptionExtendedError && optLen >= 2 && ede == nil {
+                                    let infoCode = read16(bytes, opt)
+                                    let extraSlice = UnsafeRawBufferPointer(rebasing: bytes[(opt + 2)..<(opt + optLen)])
+                                    let text = extraSlice.isEmpty ? nil : String(decoding: extraSlice, as: UTF8.self)
+                                        .trimmingCharacters(in: .controlCharacters)
+                                    ede = DNSExtendedError(infoCode: infoCode, extraText: text?.isEmpty == true ? nil : text)
+                                } else if optCode == ednsOptionReportChannel && optLen > 1 && reportAgent == nil {
+                                    if let agent = parseUncompressedDomainOption(bytes, from: opt, length: optLen),
+                                       isSafeReportChannelAgent(agent, forQName: qnameStr) {
+                                        reportAgent = agent
+                                    }
+                                }
+                                opt += optLen
+                            }
+                        }
+                    }
+                    pos = rdataEnd
+                }
+            }
+
+            let effectiveNegTTL: UInt32? = (isResponse && ancount == 0 && (fullRcode == 0 || fullRcode == 3))
+                ? minNegTTL : nil
+            let fragRisk: Bool = {
+                if let payload = ednsPayload, payload > recommendedUDPPayloadIPv6 { return true }
+                return isResponse && bytes.count > Int(recommendedUDPPayloadIPv6)
+            }()
+            let amp: Double? = {
+                guard isResponse, let qLen = queryByteCount, qLen > 0 else { return nil }
+                return Double(bytes.count) / Double(qLen)
+            }()
+
+            let heCandidates = synthesizeHappyEyeballsCandidates(
+                qname: qnameStr, defaultPort: defaultPort,
+                svcbRecords: svcbRecords, ipv6Answers: ipv6Answers, ipv4Answers: ipv4Answers)
+
+            return DiagnosticReport(
+                transactionID: txid,
+                isResponse: isResponse,
+                opcode: opcode,
+                rcode: fullRcode,
+                isAuthoritative: aa,
+                isTruncated: tc,
+                recursionDesired: rd,
+                recursionAvailable: ra,
+                authenticatedData: ad,
+                checkingDisabled: cd,
+                dnssecOK: dnssecDO,
+                qname: qnameStr,
+                qtype: qtype,
+                qclass: qclass,
+                labelCount: labelCount,
+                maxLabelLength: maxLabel,
+                shannonEntropyBits: entropy,
+                hexCharacterRatio: hexRatio,
+                tunnelingRisk: risk,
+                answerCount: ancount,
+                authorityCount: nscount,
+                additionalCount: arcount,
+                cnameHopCount: cnameHops,
+                minimumPositiveTTL: ancount > 0 ? minPosTTL : nil,
+                negativeCacheTTL: effectiveNegTTL,
+                ednsUDPPayloadSize: ednsPayload,
+                hasUDPFragmentationRisk: fragRisk,
+                extendedError: ede,
+                reportChannelAgentDomain: reportAgent,
+                amplificationFactor: amp,
+                happyEyeballsCandidates: heCandidates
+            )
         }
-
-        let effectiveNegTTL: UInt32? = (isResponse && ancount == 0 && (fullRcode == 0 || fullRcode == 3))
-            ? minNegTTL : nil
-        let fragRisk: Bool = {
-            if let payload = ednsPayload, payload > recommendedUDPPayloadIPv6 { return true }
-            return isResponse && bytes.count > Int(recommendedUDPPayloadIPv6)
-        }()
-        let amp: Double? = {
-            guard isResponse, let qLen = queryByteCount, qLen > 0 else { return nil }
-            return Double(bytes.count) / Double(qLen)
-        }()
-
-        let heCandidates = synthesizeHappyEyeballsCandidates(
-            qname: qnameStr, defaultPort: defaultPort,
-            svcbRecords: svcbRecords, ipv6Answers: ipv6Answers, ipv4Answers: ipv4Answers)
-
-        return DiagnosticReport(
-            transactionID: txid,
-            isResponse: isResponse,
-            opcode: opcode,
-            rcode: fullRcode,
-            isAuthoritative: aa,
-            isTruncated: tc,
-            recursionDesired: rd,
-            recursionAvailable: ra,
-            authenticatedData: ad,
-            checkingDisabled: cd,
-            dnssecOK: dnssecDO,
-            qname: qnameStr,
-            qtype: qtype,
-            qclass: qclass,
-            labelCount: labelCount,
-            maxLabelLength: maxLabel,
-            shannonEntropyBits: entropy,
-            hexCharacterRatio: hexRatio,
-            tunnelingRisk: risk,
-            answerCount: ancount,
-            authorityCount: nscount,
-            additionalCount: arcount,
-            cnameHopCount: cnameHops,
-            minimumPositiveTTL: ancount > 0 ? minPosTTL : nil,
-            negativeCacheTTL: effectiveNegTTL,
-            ednsUDPPayloadSize: ednsPayload,
-            hasUDPFragmentationRisk: fragRisk,
-            extendedError: ede,
-            reportChannelAgentDomain: reportAgent,
-            amplificationFactor: amp,
-            happyEyeballsCandidates: heCandidates
-        )
     }
 
     // MARK: - Private Wire Helpers
@@ -375,18 +378,20 @@ public enum DNSWireAnalyzer {
         let dohPath: String?
     }
 
-    private static func read16(_ bytes: [UInt8], _ offset: Int) -> UInt16 {
+    @inline(__always)
+    private static func read16(_ bytes: UnsafeRawBufferPointer, _ offset: Int) -> UInt16 {
         (UInt16(bytes[offset]) << 8) | UInt16(bytes[offset + 1])
     }
 
-    private static func read32(_ bytes: [UInt8], _ offset: Int) -> UInt32 {
+    @inline(__always)
+    private static func read32(_ bytes: UnsafeRawBufferPointer, _ offset: Int) -> UInt32 {
         (UInt32(bytes[offset]) << 24)
             | (UInt32(bytes[offset + 1]) << 16)
             | (UInt32(bytes[offset + 2]) << 8)
             | UInt32(bytes[offset + 3])
     }
 
-    private static func readName(_ bytes: [UInt8], at start: Int, visited: inout Set<Int>) -> ParsedName? {
+    private static func readName(_ bytes: UnsafeRawBufferPointer, at start: Int, visited: inout Set<Int>) -> ParsedName? {
         guard start < bytes.count else { return nil }
         var cur = start
         var nextAfterPointer: Int?
@@ -425,7 +430,7 @@ public enum DNSWireAnalyzer {
         }
     }
 
-    private static func parseUncompressedDomainOption(_ bytes: [UInt8], from start: Int, length: Int) -> String? {
+    private static func parseUncompressedDomainOption(_ bytes: UnsafeRawBufferPointer, from start: Int, length: Int) -> String? {
         let end = start + length
         guard length > 1, length <= 255, end <= bytes.count else { return nil }
         var cur = start
@@ -439,7 +444,8 @@ public enum DNSWireAnalyzer {
             guard (lbl & 0xc0) == 0, lbl <= 63, cur + 1 + lbl <= end else { return nil }
             var chars: [UInt8] = []
             chars.reserveCapacity(lbl)
-            for b in bytes[(cur + 1)..<(cur + 1 + lbl)] {
+            for idx in (cur + 1)..<(cur + 1 + lbl) {
+                let b = bytes[idx]
                 guard b > 0x20 && b < 0x7f else { return nil }
                 chars.append((65...90).contains(b) ? b + 32 : b)
             }
@@ -494,7 +500,7 @@ public enum DNSWireAnalyzer {
         return .none
     }
 
-    private static func formatIPv6(_ octets: [UInt8]) -> String? {
+    private static func formatIPv6(_ octets: UnsafeRawBufferPointer) -> String? {
         guard octets.count == 16 else { return nil }
         var groups: [UInt16] = []
         groups.reserveCapacity(8)
@@ -527,7 +533,7 @@ public enum DNSWireAnalyzer {
         return joined.hasPrefix(":") && !joined.hasPrefix("::") ? ":" + joined : joined
     }
 
-    private static func parseSVCB(_ bytes: [UInt8], from start: Int, to end: Int,
+    private static func parseSVCB(_ bytes: UnsafeRawBufferPointer, from start: Int, to end: Int,
                                   fallbackTarget: String, defaultPort: UInt16) -> ParsedSVCB? {
         guard end - start >= 3 else { return nil }
         let priority = read16(bytes, start)
@@ -557,7 +563,8 @@ public enum DNSWireAnalyzer {
                 while p < valEnd {
                     let l = Int(bytes[p]); p += 1
                     guard l > 0, p + l <= valEnd else { break }
-                    alpns.append(String(decoding: bytes[p..<(p + l)], as: UTF8.self).lowercased())
+                    let slice = UnsafeRawBufferPointer(rebasing: bytes[p..<(p + l)])
+                    alpns.append(String(decoding: slice, as: UTF8.self).lowercased())
                     p += l
                 }
             case 3 where len == 2: // port
@@ -567,13 +574,15 @@ public enum DNSWireAnalyzer {
                     v4Hints.append("\(bytes[i]).\(bytes[i + 1]).\(bytes[i + 2]).\(bytes[i + 3])")
                 }
             case 5 where len >= 4: // ech (ECHConfigList)
-                ech = Data(bytes[cur..<valEnd])
+                ech = Data(UnsafeRawBufferPointer(rebasing: bytes[cur..<valEnd]))
             case 6 where len > 0 && len % 16 == 0: // ipv6hint
                 for i in stride(from: cur, to: valEnd, by: 16) {
-                    if let s = formatIPv6(Array(bytes[i..<(i + 16)])) { v6Hints.append(s) }
+                    if let s = formatIPv6(UnsafeRawBufferPointer(rebasing: bytes[i..<(i + 16)])) {
+                        v6Hints.append(s)
+                    }
                 }
             case 7 where len > 0 && bytes[cur] == 0x2f: // dohpath (RFC 9461)
-                let slice = bytes[cur..<valEnd]
+                let slice = UnsafeRawBufferPointer(rebasing: bytes[cur..<valEnd])
                 if slice.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) {
                     dohPath = String(decoding: slice, as: UTF8.self)
                 }

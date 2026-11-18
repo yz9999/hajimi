@@ -12,6 +12,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <stdexcept>
 
 namespace hajimi {
@@ -248,26 +249,22 @@ struct Authentication : std::enable_shared_from_this<Authentication> {
             } catch (const std::exception &e) { self->finish(false, e.what()); }
         });
     }
-    void hysteria2(unsigned index = 0) {
+    void hysteria2() {
         if (abort()) return;
         auto self = shared_from_this();
-        if (index < 3) {
-            connection->open(true, [self, index](std::shared_ptr<Stream> stream, Error error) {
-                if (self->abort()) return;
-                if (!error.empty()) { self->finish(false, error); return; }
-                Buffer bytes{static_cast<uint8_t>(index == 0 ? 0 : index + 1)};
-                if (index == 0) {
-                    Buffer settings{1, 0, 7, 0, 6}; append(settings, varint(65536));
-                    bytes.push_back(4); append(bytes, varint(settings.size())); append(bytes, settings);
-                }
-                stream->write(std::move(bytes), [self, index](Error error) {
-                    if (self->abort()) return;
-                    if (!error.empty()) self->finish(false, error); else self->hysteria2(index + 1);
-                });
-            });
-            return;
-        }
         connection->receivePeerStreams([](std::shared_ptr<Stream> stream) { drain(stream); });
+        connection->open(true, [self](std::shared_ptr<Stream> controlStream, Error error) {
+            if (self->abort()) return;
+            if (!error.empty()) { self->finish(false, error); return; }
+            try {
+                Buffer settings{1, 0, 7, 0, 6}; append(settings, varint(65536));
+                Buffer bytes{0, 4}; append(bytes, varint(settings.size())); append(bytes, settings);
+                controlStream->write(std::move(bytes), [self](Error writeErr) {
+                    if (self->abort()) return;
+                    if (!writeErr.empty()) self->finish(false, writeErr);
+                });
+            } catch (const std::exception &e) { self->finish(false, e.what()); }
+        });
         connection->open(false, [self](std::shared_ptr<Stream> stream, Error error) {
             if (self->abort()) return;
             if (!error.empty()) { self->finish(false, error); return; }
@@ -281,13 +278,14 @@ struct Authentication : std::enable_shared_from_this<Authentication> {
                 auto response = std::make_shared<HTTP3Auth>(); response->connection = self->connection;
                 response->stream = stream; response->reader = std::make_shared<Reader>(stream, 65536);
                 response->completion = [self](bool udp, Error error) { self->finish(udp, error); };
-                stream->write(std::move(request), [self, stream, response](Error error) {
-                    if (self->abort()) return;
-                    if (!error.empty()) { self->finish(false, error); return; }
-                    stream->shutdownWrite([response](Error error) {
-                        if (response->abort()) return;
-                        if (!error.empty()) response->finish(false, error); else response->response();
-                    });
+                response->response();
+                stream->write(std::move(request), [response](Error writeErr) {
+                    if (response->abort()) return;
+                    if (!writeErr.empty()) response->finish(false, writeErr);
+                });
+                stream->shutdownWrite([response](Error finErr) {
+                    if (response->abort()) return;
+                    if (!finErr.empty()) response->finish(false, finErr);
                 });
             } catch (const std::exception &e) { self->finish(false, e.what()); }
         });
@@ -361,23 +359,305 @@ void hysteria1Request(std::shared_ptr<Connection> connection, Target target, boo
     });
 }
 
-void hysteria2Response(std::shared_ptr<Reader> reader, WriteCallback completion) {
-    reader->exactly(1, [reader, completion](Buffer status, Error error) {
-        if (!error.empty()) { completion(error); return; }
-        readVarint(reader, [reader, completion, status](uint64_t length, Error error) {
-            if (!error.empty() || length > 2048) { completion(error.empty() ? "Invalid Hysteria2 response length" : error); return; }
-            reader->exactly(static_cast<size_t>(length), [reader, completion, status](Buffer, Error error) {
-                if (!error.empty()) { completion(error); return; }
-                readVarint(reader, [reader, completion, status](uint64_t length, Error error) {
-                    if (!error.empty() || length > 4096) { completion(error.empty() ? "Invalid Hysteria2 response padding" : error); return; }
-                    reader->exactly(static_cast<size_t>(length), [completion, status](Buffer, Error error) {
-                        completion(!error.empty() ? error : status[0] == 0 ? Error{} : "Hysteria2 connection rejected");
-                    });
-                });
-            });
+class Hysteria2TCPStream final : public Stream, public std::enable_shared_from_this<Hysteria2TCPStream> {
+    enum class HeaderStage : uint8_t { Status = 0, MsgLen, MsgBody, PadLen, PadBody, Done };
+    std::shared_ptr<quic::SharedStream> inner_;
+    Buffer requestHeader_;
+    bool requestDispatched_ = false;
+    bool standaloneRequestInFlight_ = false;
+    bool writeShutdownRequested_ = false;
+    bool closed_ = false;
+    bool reading_ = false;
+    Error terminalError_;
+    std::deque<std::pair<Buffer, WriteCallback>> pendingWrites_;
+    WriteCallback pendingShutdown_;
+    HeaderStage stage_ = HeaderStage::Status;
+    uint8_t responseStatus_ = 0;
+    size_t remainingSkip_ = 0;
+    Buffer rxBuf_;
+    size_t rxPos_ = 0;
+    bool rxEof_ = false;
+
+    void flushStandaloneRequest() {
+        auto self = shared_from_this();
+        Buffer req = std::move(requestHeader_);
+        Buffer().swap(requestHeader_);
+        inner_->write(std::move(req), [self](Error err) {
+            if (self->closed_) return;
+            self->standaloneRequestInFlight_ = false;
+            if (!err.empty()) {
+                if (self->terminalError_.empty()) self->terminalError_ = err;
+                if (self->inner_) { self->inner_->close(); self->inner_.reset(); }
+                auto writes = std::move(self->pendingWrites_);
+                self->pendingWrites_.clear();
+                auto shutdownCb = std::exchange(self->pendingShutdown_, {});
+                for (auto &w : writes) if (w.second) w.second(err);
+                if (shutdownCb) shutdownCb(err);
+                return;
+            }
+            auto writes = std::move(self->pendingWrites_);
+            self->pendingWrites_.clear();
+            auto shutdownCb = std::exchange(self->pendingShutdown_, {});
+            for (auto &w : writes) {
+                if (self->closed_ || !self->inner_) {
+                    if (w.second) w.second("QUIC stream is closed");
+                } else {
+                    self->inner_->write(std::move(w.first), std::move(w.second));
+                }
+            }
+            if (shutdownCb) {
+                if (self->closed_ || !self->inner_) shutdownCb("QUIC stream is closed");
+                else self->inner_->shutdownWrite(std::move(shutdownCb));
+            }
         });
-    });
-}
+    }
+
+    Error advanceHeaderParse() {
+        while (stage_ != HeaderStage::Done) {
+            const size_t avail = rxBuf_.size() - rxPos_;
+            switch (stage_) {
+            case HeaderStage::Status: {
+                if (avail < 1) return {};
+                responseStatus_ = rxBuf_[rxPos_++];
+                stage_ = HeaderStage::MsgLen;
+                break;
+            }
+            case HeaderStage::MsgLen: {
+                if (avail < 1) return {};
+                size_t vlen = size_t(1) << (rxBuf_[rxPos_] >> 6);
+                if (avail < vlen) return {};
+                uint64_t msgLen = 0;
+                auto res = hajimi_quic_varint_decode(rxBuf_.data() + rxPos_, vlen, &msgLen);
+                if (res.status != HAJIMI_CODEC_OK) return "Invalid QUIC varint";
+                if (msgLen > 2048) return "Invalid Hysteria2 response length";
+                rxPos_ += vlen;
+                remainingSkip_ = static_cast<size_t>(msgLen);
+                stage_ = HeaderStage::MsgBody;
+                break;
+            }
+            case HeaderStage::MsgBody: {
+                size_t skip = std::min(avail, remainingSkip_);
+                rxPos_ += skip;
+                remainingSkip_ -= skip;
+                if (remainingSkip_ > 0) return {};
+                stage_ = HeaderStage::PadLen;
+                break;
+            }
+            case HeaderStage::PadLen: {
+                if (avail < 1) return {};
+                size_t vlen = size_t(1) << (rxBuf_[rxPos_] >> 6);
+                if (avail < vlen) return {};
+                uint64_t padLen = 0;
+                auto res = hajimi_quic_varint_decode(rxBuf_.data() + rxPos_, vlen, &padLen);
+                if (res.status != HAJIMI_CODEC_OK) return "Invalid QUIC varint";
+                if (padLen > 4096) return "Invalid Hysteria2 response padding";
+                rxPos_ += vlen;
+                remainingSkip_ = static_cast<size_t>(padLen);
+                stage_ = HeaderStage::PadBody;
+                break;
+            }
+            case HeaderStage::PadBody: {
+                size_t skip = std::min(avail, remainingSkip_);
+                rxPos_ += skip;
+                remainingSkip_ -= skip;
+                if (remainingSkip_ > 0) return {};
+                if (responseStatus_ != 0) return "Hysteria2 connection rejected";
+                stage_ = HeaderStage::Done;
+                break;
+            }
+            case HeaderStage::Done:
+                break;
+            }
+        }
+        return {};
+    }
+
+    void pumpHeaderRead(size_t maximum, ReadCallback completion) {
+        if (closed_ || !inner_) {
+            reading_ = false;
+            completion({}, true, terminalError_.empty() ? "QUIC stream is closed" : terminalError_);
+            return;
+        }
+        size_t fetchSize = std::min<size_t>(maximumReadBytes, std::max<size_t>(maximum, 4096));
+        auto self = shared_from_this();
+        inner_->read(fetchSize, [self, maximum, completion = std::move(completion)](Buffer chunk, bool eof, Error err) mutable {
+            if (self->closed_) {
+                self->reading_ = false;
+                completion({}, true, self->terminalError_.empty() ? "QUIC stream is closed" : self->terminalError_);
+                return;
+            }
+            if (!err.empty()) {
+                self->reading_ = false;
+                if (!self->terminalError_.empty()) err = self->terminalError_;
+                else self->terminalError_ = err;
+                completion({}, true, std::move(err));
+                return;
+            }
+            if (!chunk.empty()) {
+                if (self->rxPos_ > 0 && self->rxPos_ == self->rxBuf_.size()) {
+                    self->rxBuf_.clear();
+                    self->rxPos_ = 0;
+                } else if (self->rxPos_ >= 2048) {
+                    self->rxBuf_.erase(self->rxBuf_.begin(), self->rxBuf_.begin() + static_cast<std::ptrdiff_t>(self->rxPos_));
+                    self->rxPos_ = 0;
+                }
+                append(self->rxBuf_, chunk);
+            }
+            if (eof) self->rxEof_ = true;
+            Error parseErr = self->advanceHeaderParse();
+            if (!parseErr.empty()) {
+                self->reading_ = false;
+                self->terminalError_ = parseErr;
+                if (self->inner_) { self->inner_->close(); self->inner_.reset(); }
+                completion({}, true, std::move(parseErr));
+                return;
+            }
+            if (self->stage_ != HeaderStage::Done) {
+                if (self->rxEof_) {
+                    self->reading_ = false;
+                    self->terminalError_ = "EOF";
+                    if (self->inner_) { self->inner_->close(); self->inner_.reset(); }
+                    completion({}, true, "EOF");
+                    return;
+                }
+                self->pumpHeaderRead(maximum, std::move(completion));
+                return;
+            }
+            self->reading_ = false;
+            size_t avail = self->rxBuf_.size() - self->rxPos_;
+            if (avail > 0) {
+                size_t take = std::min(maximum, avail);
+                Buffer out(self->rxBuf_.begin() + static_cast<std::ptrdiff_t>(self->rxPos_),
+                           self->rxBuf_.begin() + static_cast<std::ptrdiff_t>(self->rxPos_ + take));
+                self->rxPos_ += take;
+                bool outEof = false;
+                if (self->rxPos_ == self->rxBuf_.size()) {
+                    Buffer().swap(self->rxBuf_);
+                    self->rxPos_ = 0;
+                    outEof = self->rxEof_;
+                }
+                completion(std::move(out), outEof, {});
+                return;
+            }
+            Buffer().swap(self->rxBuf_);
+            self->rxPos_ = 0;
+            if (self->rxEof_) {
+                completion({}, true, {});
+                return;
+            }
+            if (!self->inner_) {
+                completion({}, true, "QUIC stream is closed");
+                return;
+            }
+            self->inner_->read(maximum, std::move(completion));
+        });
+    }
+
+public:
+    Hysteria2TCPStream(std::shared_ptr<quic::SharedStream> inner, Buffer requestHeader)
+        : inner_(std::move(inner)), requestHeader_(std::move(requestHeader)) {}
+    ~Hysteria2TCPStream() override { close(); }
+
+    bool supportsHalfClose() const override { return true; }
+
+    void write(Buffer value, WriteCallback completion) override {
+        if (closed_ || !inner_) { if (completion) completion("QUIC stream is closed"); return; }
+        if (!terminalError_.empty()) { if (completion) completion(terminalError_); return; }
+        if (writeShutdownRequested_) { if (completion) completion("QUIC stream is closed for writing"); return; }
+        if (!requestDispatched_) {
+            requestDispatched_ = true;
+            Buffer combined;
+            combined.reserve(requestHeader_.size() + value.size());
+            combined.insert(combined.end(), requestHeader_.begin(), requestHeader_.end());
+            combined.insert(combined.end(), value.begin(), value.end());
+            Buffer().swap(requestHeader_);
+            inner_->write(std::move(combined), std::move(completion));
+            return;
+        }
+        if (standaloneRequestInFlight_) {
+            pendingWrites_.emplace_back(std::move(value), std::move(completion));
+            return;
+        }
+        inner_->write(std::move(value), std::move(completion));
+    }
+
+    void read(size_t maximum, ReadCallback completion) override {
+        if (closed_ || !inner_) { completion({}, true, "QUIC stream is closed"); return; }
+        if (!terminalError_.empty()) { completion({}, true, terminalError_); return; }
+        if (reading_ || !maximum || maximum > maximumReadBytes) {
+            completion({}, false, "Invalid or overlapping QUIC read");
+            return;
+        }
+        if (!requestDispatched_) {
+            requestDispatched_ = true;
+            standaloneRequestInFlight_ = true;
+            flushStandaloneRequest();
+        }
+        if (stage_ == HeaderStage::Done) {
+            if (rxPos_ < rxBuf_.size()) {
+                size_t avail = rxBuf_.size() - rxPos_;
+                size_t take = std::min(maximum, avail);
+                Buffer out(rxBuf_.begin() + static_cast<std::ptrdiff_t>(rxPos_),
+                           rxBuf_.begin() + static_cast<std::ptrdiff_t>(rxPos_ + take));
+                rxPos_ += take;
+                bool outEof = false;
+                if (rxPos_ == rxBuf_.size()) {
+                    Buffer().swap(rxBuf_);
+                    rxPos_ = 0;
+                    outEof = rxEof_;
+                }
+                completion(std::move(out), outEof, {});
+                return;
+            }
+            if (rxEof_) {
+                completion({}, true, {});
+                return;
+            }
+            inner_->read(maximum, std::move(completion));
+            return;
+        }
+        reading_ = true;
+        pumpHeaderRead(maximum, std::move(completion));
+    }
+
+    void shutdownWrite(WriteCallback completion) override {
+        if (closed_ || !inner_) { if (completion) completion("QUIC stream is closed"); return; }
+        if (!terminalError_.empty()) { if (completion) completion(terminalError_); return; }
+        if (writeShutdownRequested_) { if (completion) completion("QUIC write side is already closed"); return; }
+        writeShutdownRequested_ = true;
+        if (!requestDispatched_) {
+            requestDispatched_ = true;
+            standaloneRequestInFlight_ = true;
+            pendingShutdown_ = std::move(completion);
+            flushStandaloneRequest();
+            return;
+        }
+        if (standaloneRequestInFlight_) {
+            pendingShutdown_ = std::move(completion);
+            return;
+        }
+        inner_->shutdownWrite(std::move(completion));
+    }
+
+    void close() override {
+        if (closed_) return;
+        closed_ = true;
+        Buffer().swap(requestHeader_);
+        Buffer().swap(rxBuf_);
+        rxPos_ = 0;
+        auto writes = std::move(pendingWrites_);
+        pendingWrites_.clear();
+        auto shutdownCb = std::exchange(pendingShutdown_, {});
+        if (inner_) {
+            inner_->close();
+            inner_.reset();
+        }
+        for (auto &w : writes) {
+            if (w.second) w.second("QUIC stream is closed");
+        }
+        if (shutdownCb) shutdownCb("QUIC stream is closed");
+    }
+};
 
 void heartbeat(std::weak_ptr<Connection> connection, std::shared_ptr<TransportFactory> factory, double interval) {
     if (!factory->after) return;
@@ -698,29 +978,24 @@ static void connectQUICProtocolWithRetry(const Node &node, const Target &target,
                 return;
             }
             try {
-                auto destination = address(target); Buffer request;
-                if (node.type == "tuic") request = encoded([&](uint8_t *out, size_t size) {
-                    return hajimi_tuic5_encode_connect(&destination, out, size);
-                });
-                else {
-                    auto padding = crypto::randomBytes(64);
-                    request = encoded([&](uint8_t *out, size_t size) {
-                        return hajimi_hysteria2_encode_request(&destination, padding.data(), padding.size(), out, size);
+                auto destination = address(target);
+                if (node.type == "tuic") {
+                    Buffer request = encoded([&](uint8_t *out, size_t size) {
+                        return hajimi_tuic5_encode_connect(&destination, out, size);
                     });
-                }
-                stream->write(std::move(request), [node, stream, connection, completion](Error error) {
-                    if (connection->isClosed()) { stream->close(); completion(nullptr, "QUIC connection cancelled"); return; }
-                    if (!error.empty()) { stream->close(); completion(nullptr, error); return; }
-                    if (node.type == "tuic") {
-                        completion(std::make_shared<quic::SharedStream>(connection, stream), {}); return;
-                    }
-                    auto reader = std::make_shared<Reader>(stream);
-                    hysteria2Response(reader, [reader, stream, connection, completion](Error error) {
+                    stream->write(std::move(request), [stream, connection, completion](Error error) {
                         if (connection->isClosed()) { stream->close(); completion(nullptr, "QUIC connection cancelled"); return; }
                         if (!error.empty()) { stream->close(); completion(nullptr, error); return; }
-                        completion(std::make_shared<quic::SharedStream>(connection, stream, reader), {});
+                        completion(std::make_shared<quic::SharedStream>(connection, stream), {});
                     });
+                    return;
+                }
+                auto padding = crypto::randomBytes(64);
+                Buffer request = encoded([&](uint8_t *out, size_t size) {
+                    return hajimi_hysteria2_encode_request(&destination, padding.data(), padding.size(), out, size);
                 });
+                auto shared = std::make_shared<quic::SharedStream>(connection, stream);
+                completion(std::make_shared<Hysteria2TCPStream>(std::move(shared), std::move(request)), {});
             } catch (const std::exception &e) { stream->close(); completion(nullptr, e.what()); }
         });
     });

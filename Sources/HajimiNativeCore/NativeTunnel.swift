@@ -111,6 +111,11 @@ public final class NativeTunnel {
     private var pendingFrameHead = 0
     private var pendingFrameBytes = 0
     private var maintenanceTimer: DispatchSourceTimer?
+    private var activeRetransmitTimer: DispatchSourceTimer?
+    private var activeRetransmitTimerSuspended = true
+    private var activeOutstandingFlowCount = 0
+    private(set) var isDrainingPacketBatch = false
+    private var dirtyTCPFlows: [TCPFlow] = []
     private var tcpFlows: [FlowKey: TCPFlow] = [:]
     private var udpFlows: [FlowKey: UDPFlow] = [:]
     private var ipv4Identifier: UInt16 = UInt16.random(in: 1...UInt16.max)
@@ -118,9 +123,6 @@ public final class NativeTunnel {
     /// every event was itself a measurable share of the data plane's cost.
     /// Only ever touched from `queue`, which is serial.
     private var readBuffer = [UInt8](repeating: 0, count: 65_540)
-    /// Scratch for C-built download/UDP packets. Reused so the hot path
-    /// does not allocate a Data per segment.
-    private var buildBuffer = [UInt8](repeating: 0, count: 9_216)
     private var stopped = true
     private var totalFlowCount = 0
     private var uploadedByteCount: UInt64 = 0
@@ -133,6 +135,10 @@ public final class NativeTunnel {
     private var streamRegressionConnector: (() -> NativeOutboundByteStream)?
     var streamRegressionInitialSequence: UInt32?
     var packetLoadCounters: NativeTunnelPacketLoadCounters?
+
+    var isActiveRetransmitTimerRunningForSelfTest: Bool {
+        queue.sync { activeRetransmitTimer != nil && !activeRetransmitTimerSuspended }
+    }
 
     public init(router: NativePacketRouter) throws {
         self.router = router
@@ -147,6 +153,14 @@ public final class NativeTunnel {
               ProxyEngine.currentOutboundInterface == nil else {
             throw NativeTunnelError.utun("Native stream memory fixture requires its isolated CLI flag")
         }
+        return try makeIsolatedSelfTestTunnel(stream: stream,
+                                              initialSequence: initialSequence,
+                                              packetLoadCounters: packetLoadCounters)
+    }
+
+    static func makeIsolatedSelfTestTunnel(stream: NativeOutboundByteStream,
+                                           initialSequence: UInt32,
+                                           packetLoadCounters: NativeTunnelPacketLoadCounters? = nil) throws -> NativeTunnel {
         // An accidentally unhandled target fails closed; the fixture must
         // never construct a physical TCP/UDP/DNS connection.
         let profile = try ProfileParser.parse("[Rule]\nFINAL,REJECT\n")
@@ -199,6 +213,16 @@ public final class NativeTunnel {
         self.interfaceName = interfaceName
         stopped = false
         let readerEpoch = readerReadiness.begin()
+
+        // Create on-demand 20 ms active retransmit timer in suspended state before
+        // resuming `readSource`, so early queued packets see a valid timer instance.
+        let retransmitTimer = DispatchSource.makeTimerSource(queue: queue)
+        retransmitTimer.schedule(deadline: .now() + .milliseconds(20),
+                                 repeating: .milliseconds(20), leeway: .milliseconds(2))
+        retransmitTimer.setEventHandler { [weak self] in self?.performActiveRetransmitTick() }
+        activeRetransmitTimer = retransmitTimer
+        activeRetransmitTimerSuspended = true
+        activeOutstandingFlowCount = 0
 
         let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: queue)
         source.setRegistrationHandler { [weak self] in
@@ -254,11 +278,15 @@ public final class NativeTunnel {
             self.stopped = true
             self.maintenanceTimer?.cancel()
             self.maintenanceTimer = nil
+            self.cancelActiveRetransmitTimer()
             self.readSource?.cancel()
             self.readSource = nil
             self.icmpRelay.stop()
             self.writeSource?.cancel()
             self.writeSource = nil
+            self.isDrainingPacketBatch = false
+            for flow in self.dirtyTCPFlows { flow.inDirtyBatch = false }
+            self.dirtyTCPFlows.removeAll(keepingCapacity: false)
             self.pendingFrames.removeAll(keepingCapacity: false)
             self.pendingFrameHead = 0
             self.pendingFrameBytes = 0
@@ -268,12 +296,77 @@ public final class NativeTunnel {
             self.udpFlows.removeAll(keepingCapacity: false)
             tcp.forEach { $0.close(sendReset: false, removeFromOwner: false) }
             udp.forEach { $0.close(removeFromOwner: false) }
+            self.activeOutstandingFlowCount = 0
             self.flushFlowEventsIfNeeded()
             if self.descriptor >= 0 { Darwin.close(self.descriptor); self.descriptor = -1 }
             self.interfaceName = nil
         }
         if DispatchQueue.getSpecific(key: Self.queueSpecificKey) != nil { cleanup() }
         else { queue.sync(execute: cleanup) }
+    }
+
+    private func cancelActiveRetransmitTimer() {
+        guard let timer = activeRetransmitTimer else { return }
+        activeRetransmitTimer = nil
+        // libdispatch traps on deallocation if a DispatchSource is cancelled while suspended.
+        if activeRetransmitTimerSuspended {
+            activeRetransmitTimerSuspended = false
+            timer.resume()
+        }
+        timer.cancel()
+    }
+
+    func tcpFlowOutstandingStateChanged(hasOutstanding: Bool) {
+        if hasOutstanding {
+            activeOutstandingFlowCount += 1
+        } else {
+            activeOutstandingFlowCount = max(0, activeOutstandingFlowCount - 1)
+        }
+        syncActiveRetransmitTimerState()
+    }
+
+    private func syncActiveRetransmitTimerState() {
+        guard !stopped, !stopRequested.value, let timer = activeRetransmitTimer else { return }
+        if activeOutstandingFlowCount > 0 {
+            if activeRetransmitTimerSuspended {
+                timer.schedule(deadline: .now() + .milliseconds(20),
+                               repeating: .milliseconds(20), leeway: .milliseconds(2))
+                activeRetransmitTimerSuspended = false
+                timer.resume()
+            }
+        } else if !activeRetransmitTimerSuspended {
+            activeRetransmitTimerSuspended = true
+            timer.suspend()
+        }
+    }
+
+    private func performActiveRetransmitTick() {
+        guard !stopped, !stopRequested.value else { return }
+        guard activeOutstandingFlowCount > 0 else {
+            syncActiveRetransmitTimerState()
+            return
+        }
+        let now = Date()
+        for flow in Array(tcpFlows.values) where flow.hasOutstandingSegments {
+            flow.retransmitTick(now: now)
+        }
+        syncActiveRetransmitTimerState()
+    }
+
+    func markTCPFlowDirty(_ flow: TCPFlow) {
+        guard !flow.inDirtyBatch else { return }
+        flow.inDirtyBatch = true
+        dirtyTCPFlows.append(flow)
+    }
+
+    private func flushDirtyTCPFlows() {
+        guard !dirtyTCPFlows.isEmpty else { return }
+        let dirty = dirtyTCPFlows
+        dirtyTCPFlows.removeAll(keepingCapacity: true)
+        for flow in dirty {
+            flow.inDirtyBatch = false
+            flow.flushBatchIfNeeded()
+        }
     }
 
     public func statistics() -> NativeTunnelStatistics {
@@ -290,18 +383,27 @@ public final class NativeTunnel {
     /// flows are resolved against the new routing snapshot.
     public func resetFlows() {
         queue.sync {
+            for flow in dirtyTCPFlows { flow.inDirtyBatch = false }
+            dirtyTCPFlows.removeAll(keepingCapacity: true)
             let tcp = Array(tcpFlows.values), udp = Array(udpFlows.values)
             tcpFlows.removeAll(keepingCapacity: true)
             udpFlows.removeAll(keepingCapacity: true)
             icmpRelay.stop()
             tcp.forEach { $0.close(sendReset: true, removeFromOwner: false) }
             udp.forEach { $0.close(removeFromOwner: false) }
+            activeOutstandingFlowCount = 0
+            syncActiveRetransmitTimerState()
             flushFlowEventsIfNeeded()
         }
     }
 
     private func drainPackets() {
         guard descriptor >= 0, !stopped else { return }
+        isDrainingPacketBatch = true
+        defer {
+            isDrainingPacketBatch = false
+            flushDirtyTCPFlows()
+        }
         // A full-route utun can remain readable continuously. Bound each
         // dispatch-source turn by both count and elapsed work. Returning
         // leaves unread packets on the read source; they are not discarded.
@@ -327,6 +429,25 @@ public final class NativeTunnel {
             counters.drainPacketsPeak = max(counters.drainPacketsPeak, processed)
             counters.drainNanosecondsPeak = max(counters.drainNanosecondsPeak,
                 DispatchTime.now().uptimeNanoseconds - budget.started)
+        }
+    }
+
+    func processIPPacketForSelfTest(_ packet: Data) {
+        queue.sync {
+            packet.withUnsafeBytes { handleIPPacket($0) }
+        }
+    }
+
+    func processIPPacketBatchForSelfTest(_ packets: [Data]) {
+        queue.sync {
+            isDrainingPacketBatch = true
+            defer {
+                isDrainingPacketBatch = false
+                flushDirtyTCPFlows()
+            }
+            for packet in packets {
+                packet.withUnsafeBytes { handleIPPacket($0) }
+            }
         }
     }
 
@@ -436,7 +557,8 @@ public final class NativeTunnel {
 
     func connectTCPFlow(_ flow: TCPFlow) {
         if let streamRegressionConnector {
-            guard flow.key.remoteAddress.hostString == "203.0.113.7", flow.key.remotePort == 9443 else {
+            let host = flow.key.remoteAddress.hostString
+            guard (host == "203.0.113.7" || host == "2001:db8::7"), flow.key.remotePort == 9443 else {
                 flow.connected(.failure(NativeTunnelError.utun("Unexpected memory fixture target")))
                 return
             }
@@ -490,11 +612,12 @@ public final class NativeTunnel {
                                payload: Data = Data(), payloadOffset: Int = 0,
                                payloadCount: Int? = nil, includeMSS: Bool = false,
                                windowScale: UInt8? = nil,
-                               sackPermitted: Bool = false) -> Data? {
+                               sackPermitted: Bool = false,
+                               sackBlocks: [SACKBlock] = []) -> Data? {
         guard payloadOffset >= 0, payloadOffset <= payload.count else { return nil }
         let count = payloadCount ?? (payload.count - payloadOffset)
         guard count >= 0, count <= payload.count - payloadOffset else { return nil }
-        if !includeMSS, windowScale == nil, !sackPermitted {
+        if !includeMSS, windowScale == nil, !sackPermitted, sackBlocks.isEmpty {
             let built: Data?? = CDataPlane.withBorrowedPayload(payload, offset: payloadOffset, count: count) { body in
                 buildSimpleTCP(key: key, sequence: sequence, acknowledgment: acknowledgment,
                                flags: flags, window: window, payload: body)
@@ -516,25 +639,34 @@ public final class NativeTunnel {
                                                         - (key.version == .v4 ? 0 : 20)) : nil,
                                        windowScale: windowScale,
                                        sackPermitted: sackPermitted,
+                                       sackBlocks: sackBlocks,
                                        identifier: nextIPv4Identifier())
         guard writeReturningOK(packet, version: key.version) else { return nil }
         return packet
     }
 
-    /// No-option data/ACK segments — the download hot path. Built in C into a
-    /// reused scratch buffer. The caller borrows the original receive range;
-    /// only the resulting owned retransmission packet is materialized.
+    /// No-option data/ACK segments — the download hot path. Allocates the exact
+    /// output `Data` once and writes headers + payload directly in place in C,
+    /// avoiding a scratch buffer and a second 8.2 KiB `memcpy`.
     private func buildSimpleTCP(key: FlowKey, sequence: UInt32, acknowledgment: UInt32,
                                 flags: TCPFlags, window: UInt16, payload: UnsafeRawBufferPointer) -> Data? {
+        let headerLen = key.version == .v6 ? 60 : 40
+        let exactPacketLen = headerLen + payload.count
+        if key.version == .v4 {
+            guard exactPacketLen <= Int(UInt16.max) else { return nil }
+        } else {
+            guard payload.count <= Int(UInt16.max) - 20 else { return nil }
+        }
         var sourceBytes = (UInt64(0), UInt64(0))
         var destinationBytes = (UInt64(0), UInt64(0))
         let identifier = nextIPv4Identifier()
-        return withUnsafeMutableBytes(of: &sourceBytes) { sourceRaw in
+        var packet = Data(count: exactPacketLen)
+        let written = withUnsafeMutableBytes(of: &sourceBytes) { sourceRaw in
             withUnsafeMutableBytes(of: &destinationBytes) { destinationRaw in
                 key.remoteAddress.copyBytes(to: sourceRaw.baseAddress!.assumingMemoryBound(to: UInt8.self))
                 key.clientAddress.copyBytes(to: destinationRaw.baseAddress!.assumingMemoryBound(to: UInt8.self))
-                return buildBuffer.withUnsafeMutableBytes { out in
-                    let written = CDataPlane.buildTCP(
+                return packet.withUnsafeMutableBytes { out in
+                    CDataPlane.buildTCP(
                         into: out,
                         version: key.version.rawValue,
                         source: sourceRaw.baseAddress!.assumingMemoryBound(to: UInt8.self),
@@ -548,11 +680,11 @@ public final class NativeTunnel {
                         window: window,
                         payload: payload,
                         identifier: identifier)
-                    guard written > 0 else { return nil }
-                    return Data(bytes: out.baseAddress!, count: written)
                 }
             }
         }
+        guard written == exactPacketLen else { return nil }
+        return packet
     }
 
     func writeICMPEchoReply(to client: IPAddress, from remote: IPAddress,
@@ -637,16 +769,21 @@ public final class NativeTunnel {
 
     func writeUDP(key: FlowKey, remoteAddress: IPAddress, remotePort: UInt16,
                               payload: Data) {
+        guard payload.count <= Int(UInt16.max) - 8 else { return }
+        let headerLen = key.version == .v6 ? 48 : 28
+        let exactPacketLen = headerLen + payload.count
+        if key.version == .v4, exactPacketLen > Int(UInt16.max) { return }
         let identifier = nextIPv4Identifier()
         var sourceBytes = (UInt64(0), UInt64(0))
         var destinationBytes = (UInt64(0), UInt64(0))
-        let packet = withUnsafeMutableBytes(of: &sourceBytes) { sourceRaw -> Data? in
+        var packet = Data(count: exactPacketLen)
+        let written = withUnsafeMutableBytes(of: &sourceBytes) { sourceRaw -> Int in
             withUnsafeMutableBytes(of: &destinationBytes) { destinationRaw in
                 remoteAddress.copyBytes(to: sourceRaw.baseAddress!.assumingMemoryBound(to: UInt8.self))
                 key.clientAddress.copyBytes(to: destinationRaw.baseAddress!.assumingMemoryBound(to: UInt8.self))
-                return buildBuffer.withUnsafeMutableBytes { out in
+                return packet.withUnsafeMutableBytes { out in
                     payload.withUnsafeBytes { payloadRaw in
-                        let written = CDataPlane.buildUDP(
+                        CDataPlane.buildUDP(
                             into: out,
                             version: key.version.rawValue,
                             source: sourceRaw.baseAddress!.assumingMemoryBound(to: UInt8.self),
@@ -656,13 +793,11 @@ public final class NativeTunnel {
                             destinationPort: key.clientPort,
                             payload: payloadRaw,
                             identifier: identifier)
-                        guard written > 0 else { return nil }
-                        return Data(bytes: out.baseAddress!, count: written)
                     }
                 }
             }
         }
-        guard let packet else { return }
+        guard written == exactPacketLen else { return }
         downloadedByteCount &+= UInt64(payload.count)
         write(packet, version: key.version)
     }
@@ -1134,6 +1269,7 @@ struct ParsedTCPSegment {
     let acknowledgment: UInt32
     let flags: TCPFlags
     let window: UInt16
+    let maximumSegmentSize: UInt16?
     let windowScale: UInt8?
     let sackPermitted: Bool
     let sackBlocks: [SACKBlock]
@@ -1164,6 +1300,7 @@ struct ParsedTCPSegment {
         acknowledgment = parsed.acknowledgment
         flags = TCPFlags(rawValue: parsed.flags)
         window = parsed.window
+        maximumSegmentSize = options.has_mss == 0 ? nil : options.mss
         windowScale = options.has_window_scale == 0 ? nil : options.window_scale
         sackPermitted = options.sack_permitted != 0
         sackBlocks = withUnsafeBytes(of: &options.sacks) { raw in
@@ -1360,6 +1497,12 @@ struct RetransmissionTimer {
         var value = native
         return hajimi_rto_timeout(&value, UInt32(clamping: retries))
     }
+
+    /// RFC 8985 RACK-TLP probe timeout (PTO) in seconds for an unacknowledged flight.
+    func probeTimeout(flightSize: Int, mss: Int) -> TimeInterval {
+        var value = native
+        return hajimi_rack_tlp_pto(&value, max(0, flightSize), max(536, mss))
+    }
 }
 
 struct ParsedUDPDatagram {
@@ -1466,11 +1609,14 @@ struct TCPHandshakeAcknowledgmentState {
 }
 
 final class TCPFlow {
+    static let minimumBDPWindowBytes = 512 * 1_024
+
     let id = UUID()
     var unreportedUploadBytes: Int = 0
     var unreportedDownloadBytes: Int = 0
     let key: FlowKey
     let upstreamQueue: DispatchQueue
+    let peerEffectiveMSS: Int
     private weak var owner: NativeTunnel?
     private let initial: ParsedTCPSegment
     private let receiveState: OpaquePointer?
@@ -1502,6 +1648,13 @@ final class TCPFlow {
     private var outstanding: [OutstandingSegment] = []
     private var outstandingHead = 0
     private var outstandingPayloadByteCount = 0
+    private var registeredWithActiveRetransmitTimer = false
+    private var tlpProbeSentForCurrentFlight = false
+    var inDirtyBatch = false
+    private var needsBatchAck = false
+    private var needsBatchRemoteFlush = false
+    private var batchUnackedBytes = 0
+    private var batchCoalescedSegments = 0
     private var remoteConnected = false
     private var clientFinished: Bool { hajimi_tcp_reassembly_finished(receiveState) != 0 }
     private var remoteFinished = false
@@ -1522,6 +1675,8 @@ final class TCPFlow {
     private var sackApplicationState = SACKApplicationState()
 
     private var retransmissionTimer = RetransmissionTimer()
+    private var bdpEstimator = NativeBDPEstimator(windowSeconds: 10.0)
+    private var deliveredBytesInRound = 0
 
     /// Segments that arrived ahead of `expectedClientSequence`. Keyed by the
     /// starting sequence so a later in-order arrival can release the chain
@@ -1538,12 +1693,20 @@ final class TCPFlow {
     var lastActivityDate: Date { lastActivity }
     var isFullyConnected: Bool { handshake.isEstablished && remoteConnected }
     var isHalfClosed: Bool { clientFinished || remoteFinished }
+    var hasOutstandingSegments: Bool { !closed && outstandingHead < outstanding.count }
 
     init(key: FlowKey, initial: ParsedTCPSegment, owner: NativeTunnel) {
         self.key = key
         self.initial = initial
         self.owner = owner
         self.upstreamQueue = owner.upstreamQueue(for: key)
+        // RFC 9293 §3.7.1 client MSS negotiation clamped to utun IPv4 (8192) / IPv6 (8172) limits.
+        let maxUtunMSS = key.version == .v6 ? 8_172 : 8_192
+        if let advertisedMSS = initial.maximumSegmentSize {
+            self.peerEffectiveMSS = min(max(Int(advertisedMSS), 536), maxUtunMSS)
+        } else {
+            self.peerEffectiveMSS = key.version == .v6 ? 1_220 : 536
+        }
         initialServerSequence = owner.streamRegressionInitialSequence
             ?? UInt32.random(in: 1...UInt32.max - 1_000_000)
         receiveState = hajimi_tcp_reassembly_create(initial.sequence &+ 1, 256 * 1_024, 64)
@@ -1607,31 +1770,94 @@ final class TCPFlow {
             if closed { return }
         }
 
-        var shouldAcknowledge = false
+        let batchMode = owner?.isDrainingPacketBatch == true
+        var immediateAck = segment.flags.contains(.syn)
+        var payloadNeedsAck = false
         if !segment.payload.isEmpty {
-            ingestClientPayload(segment.payload, sequence: segment.sequence)
-            shouldAcknowledge = true
+            let canDefer = batchMode && !segment.flags.contains(.syn) && !segment.flags.contains(.fin)
+            let deferredInOrder = ingestClientPayload(segment.payload,
+                                                      sequence: segment.sequence,
+                                                      deferFlush: canDefer)
+            payloadNeedsAck = true
+            if !deferredInOrder {
+                immediateAck = true
+            }
         }
         if segment.flags.contains(.fin) {
             let finSequence = segment.sequence &+ UInt32(segment.payload.count)
             hajimi_tcp_reassembly_fin(receiveState, finSequence)
-            shouldAcknowledge = true
+            immediateAck = true
         }
-        if shouldAcknowledge {
+        if immediateAck {
+            if needsBatchRemoteFlush {
+                needsBatchRemoteFlush = false
+                flushRemoteWrites()
+            }
             sendAcknowledgment()
-            if clientFinished && remoteFinished && outstandingHead == outstanding.count { close(sendReset: false) }
+            if clientFinished && remoteFinished && outstandingHead == outstanding.count {
+                close(sendReset: false)
+            }
+        } else if payloadNeedsAck {
+            if batchMode, batchUnackedBytes < 65_536, batchCoalescedSegments < 32 {
+                needsBatchAck = true
+                owner?.markTCPFlowDirty(self)
+            } else {
+                if needsBatchRemoteFlush {
+                    needsBatchRemoteFlush = false
+                    flushRemoteWrites()
+                }
+                sendAcknowledgment()
+                if clientFinished && remoteFinished && outstandingHead == outstanding.count {
+                    close(sendReset: false)
+                }
+            }
+        }
+    }
+
+    func flushBatchIfNeeded() {
+        guard !closed else {
+            needsBatchAck = false
+            needsBatchRemoteFlush = false
+            batchUnackedBytes = 0
+            batchCoalescedSegments = 0
+            return
+        }
+        if needsBatchRemoteFlush {
+            needsBatchRemoteFlush = false
+            flushRemoteWrites()
+        }
+        if needsBatchAck {
+            sendAcknowledgment()
+            if clientFinished && remoteFinished && outstandingHead == outstanding.count {
+                close(sendReset: false)
+            }
         }
     }
 
     /// Accepts in-order bytes immediately and parks later segments until the gap
     /// fills, then drains any contiguous run that is already buffered.
-    private func ingestClientPayload(_ payload: Data, sequence: UInt32) {
-        payload.withUnsafeBytes { bytes in
-            _ = hajimi_tcp_reassembly_ingest(receiveState, sequence,
+    /// Returns `true` when the segment was a clean in-order upload whose ACK and
+    /// upstream write were deferred until the end of the packet batch.
+    @discardableResult
+    private func ingestClientPayload(_ payload: Data, sequence: UInt32, deferFlush: Bool) -> Bool {
+        let wasInOrder = (sequence == expectedClientSequence)
+            && (hajimi_tcp_reassembly_buffered(receiveState) == 0)
+        let released = payload.withUnsafeBytes { bytes in
+            hajimi_tcp_reassembly_ingest(receiveState, sequence,
                 bytes.baseAddress?.assumingMemoryBound(to: UInt8.self), bytes.count,
                 Unmanaged.passUnretained(self).toOpaque(), Self.consumeUpload)
         }
+        let bufferedAfter = hajimi_tcp_reassembly_buffered(receiveState)
+        if deferFlush, wasInOrder, released > 0, bufferedAfter == 0 {
+            batchUnackedBytes += released
+            batchCoalescedSegments += 1
+            needsBatchRemoteFlush = true
+            owner?.markTCPFlowDirty(self)
+            return true
+        }
+        needsBatchRemoteFlush = false
         flushRemoteWrites()
+        return false
     }
 
     private func flushContiguousOutOfOrder() {
@@ -1665,7 +1891,11 @@ final class TCPFlow {
         } else {
             idleLimit = 300
         }
-        if now.timeIntervalSince(lastActivity) > idleLimit { close(sendReset: true); return }
+        let idleSeconds = now.timeIntervalSince(lastActivity)
+        if idleSeconds > idleLimit { close(sendReset: true); return }
+        if remoteWrites.isEmpty, remoteWrites.residentCapacity > 0, idleSeconds >= 1.0 {
+            remoteWrites.shrinkToFit()
+        }
         if clientAdvertisedWindow == 0, handshake.isEstablished,
            remoteDeliveryBytes > 0 || outstandingHead < outstanding.count || remoteEOFPending {
             // A lost window-update ACK otherwise leaves a completely ACKed
@@ -1681,18 +1911,55 @@ final class TCPFlow {
             return
         }
         resetPersist()
+        checkRetransmission(now: now)
+    }
+
+    func retransmitTick(now: Date) {
+        guard !closed, clientAdvertisedWindow > 0 else { return }
+        checkRetransmission(now: now)
+    }
+
+    private func checkRetransmission(now: Date) {
         // SACK is advisory: a receiver may discard previously SACKed bytes.
         // RTO must always be able to retry the cumulative-ACK head, including
         // when later unsacked data exists. Fast retransmit still uses holes.
         guard outstandingHead < outstanding.count else { return }
-        let index = outstandingHead
-        let retries = outstanding[index].retries
-        let timeout = retransmissionTimer.timeout(retries: retries)
-        guard now.timeIntervalSince(outstanding[index].sentAt) >= timeout else { return }
-        if retries >= 8 { close(sendReset: true); return }
-        outstanding[index].sacked = false
+        let headIndex = outstandingHead
+        let headRetries = outstanding[headIndex].retries
+
+        // RFC 8985 §7.2-7.3 Tail Loss Probe (TLP): before falling back to RTO on
+        // an open flight, transmit a single probe of the highest-sequence unsacked
+        // data segment once PTO elapses.
+        if !tlpProbeSentForCurrentFlight, handshake.isEstablished,
+           clientAdvertisedWindow > 0, headRetries == 0,
+           let probeIndex = highestUnsackedPayloadSegmentIndex() {
+            let pto = retransmissionTimer.probeTimeout(
+                flightSize: outstandingPayloadByteCount, mss: peerEffectiveMSS)
+            if now.timeIntervalSince(outstanding[probeIndex].sentAt) >= pto {
+                tlpProbeSentForCurrentFlight = true
+                outstanding[probeIndex].retransmitted = true
+                if probeIndex == headIndex {
+                    outstanding[probeIndex].sentAt = now
+                }
+                owner?.rewrite(outstanding[probeIndex].packet, version: key.version)
+                return
+            }
+        }
+
+        let timeout = retransmissionTimer.timeout(retries: headRetries)
+        guard now.timeIntervalSince(outstanding[headIndex].sentAt) >= timeout else { return }
+        if headRetries >= 8 { close(sendReset: true); return }
+        tlpProbeSentForCurrentFlight = true
+        if outstanding[headIndex].payloadBytes > 0 {
+            let lostBytes = max(peerEffectiveMSS, outstanding[headIndex].payloadBytes)
+            bdpEstimator.observeLoss(inflightBytes: max(outstandingPayloadByteCount, lostBytes),
+                                     lostBytes: lostBytes,
+                                     deliveredBytes: deliveredBytesInRound)
+            deliveredBytesInRound = 0
+        }
+        outstanding[headIndex].sacked = false
         sackApplicationState.invalidate()
-        retransmit(at: index, now: now)
+        retransmit(at: headIndex, now: now)
     }
 
     private func resetPersist() {
@@ -1720,6 +1987,10 @@ final class TCPFlow {
     func close(sendReset: Bool, removeFromOwner: Bool = true) {
         guard !closed else { return }
         closed = true
+        needsBatchAck = false
+        needsBatchRemoteFlush = false
+        batchUnackedBytes = 0
+        batchCoalescedSegments = 0
         // A reset/idle failure after a payload send is an observed failed
         // stream response. Normal EOF and explicit teardown are not counted
         // as failed network samples merely because there was no response.
@@ -1735,8 +2006,12 @@ final class TCPFlow {
         }
         remoteStream?.cancel(); remoteStream = nil
         remoteWrites.clear()
+        remoteWrites.shrinkToFit()
         remoteDeliveryBuffer.removeAll(keepingCapacity: false)
         outstanding.removeAll(keepingCapacity: false)
+        outstandingHead = 0
+        outstandingPayloadByteCount = 0
+        updateActiveRetransmitRegistration()
         let remUp = unreportedUploadBytes
         let remDown = unreportedDownloadBytes
         unreportedUploadBytes = 0
@@ -1759,6 +2034,7 @@ final class TCPFlow {
         if advanced {
             lastClientAcknowledgment = sequence
             duplicateAcknowledgments = 0
+            tlpProbeSentForCurrentFlight = false
         } else if duplicateCandidate, sequence == lastClientAcknowledgment,
                   outstandingHead < outstanding.count,
                   outstanding[outstandingHead].payloadBytes > 0 {
@@ -1766,20 +2042,46 @@ final class TCPFlow {
         }
 
         let previousHead = outstandingHead
+        var newlyDeliveredBytes = 0
+        var latestCleanRTT: TimeInterval?
         while outstandingHead < outstanding.count,
               sequenceGreaterOrEqual(sequence, outstanding[outstandingHead].endSequence) {
             let segment = outstanding[outstandingHead]
+            newlyDeliveredBytes += segment.payloadBytes
             if !segment.retransmitted {
-                retransmissionTimer.update(sample: now.timeIntervalSince(segment.sentAt))
+                let sample = max(0.000_2, now.timeIntervalSince(segment.sentAt))
+                retransmissionTimer.update(sample: sample)
+                if segment.payloadBytes > 0 {
+                    latestCleanRTT = sample
+                }
             }
             outstandingPayloadByteCount -= segment.payloadBytes
             outstandingHead += 1
         }
         owner?.packetLoadCounters?.outstandingAcknowledged += outstandingHead - previousHead
         compactOutstandingIfNeeded()
+        updateActiveRetransmitRegistration()
+
+        if newlyDeliveredBytes > 0 {
+            deliveredBytesInRound += newlyDeliveredBytes
+            if let cleanRTT = latestCleanRTT {
+                let uptime = ProcessInfo.processInfo.systemUptime
+                bdpEstimator.observe(deliveredBytes: newlyDeliveredBytes,
+                                     rtt: cleanRTT, timestamp: uptime)
+                bdpEstimator.observeLoss(
+                    inflightBytes: max(outstandingPayloadByteCount, newlyDeliveredBytes),
+                    lostBytes: 0,
+                    deliveredBytes: newlyDeliveredBytes)
+            }
+        }
 
         if duplicateAcknowledgments >= 3, let index = firstRetransmittableIndex() {
             duplicateAcknowledgments = 0
+            let lostBytes = max(peerEffectiveMSS, outstanding[index].payloadBytes)
+            bdpEstimator.observeLoss(inflightBytes: max(outstandingPayloadByteCount, lostBytes),
+                                     lostBytes: lostBytes,
+                                     deliveredBytes: deliveredBytesInRound)
+            deliveredBytesInRound = 0
             retransmit(at: index, now: now)
         }
 
@@ -1795,6 +2097,7 @@ final class TCPFlow {
     }
 
     private func flushRemoteWrites() {
+        needsBatchRemoteFlush = false
         guard remoteConnected, let stream = remoteStream, !closed, !remoteWriteInFlight,
               remoteWrites.count > 0 else { return }
         // One send() per small TCP segment spent more time in the outbound
@@ -1816,6 +2119,9 @@ final class TCPFlow {
                 // head and a chain parked in the out-of-order map. Try the
                 // map before advertising the larger window.
                 self.flushContiguousOutOfOrder()
+                if self.remoteWrites.isEmpty, self.remoteWrites.residentCapacity >= 256 * 1_024 {
+                    self.remoteWrites.shrinkToFit()
+                }
                 if self.lastAdvertisedReceiveWindow < UInt16.max {
                     self.sendAcknowledgment()
                 }
@@ -1922,7 +2228,7 @@ final class TCPFlow {
                 counters.downloadRetainedPrefixPeak = max(counters.downloadRetainedPrefixPeak, remoteDeliveryOffset)
             }
         }
-        let maximumSegment = NativeTunnel.tcpSegmentPayloadLimit
+        let maximumSegment = peerEffectiveMSS
         var available = availableClientDeliveryBytes
         while remoteDeliveryOffset < remoteDeliveryBuffer.count, available > 0 {
             let count = min(maximumSegment,
@@ -1967,11 +2273,15 @@ final class TCPFlow {
     }
 
     private func sendAcknowledgment() {
+        needsBatchAck = false
+        batchUnackedBytes = 0
+        batchCoalescedSegments = 0
         let window = advertisedReceiveWindow
         lastAdvertisedReceiveWindow = window
+        let sackBlocks = sackEnabled ? NativeReassemblySACK.blocks(from: receiveState) : []
         _ = owner?.writeTCP(key: key, sequence: nextServerSequence,
                             acknowledgment: expectedClientSequence, flags: [.ack],
-                            window: window)
+                            window: window, sackBlocks: sackBlocks)
     }
 
     private func finishRemoteEOFIfPossible() {
@@ -2014,12 +2324,30 @@ final class TCPFlow {
     }
 
     private var availableClientDeliveryBytes: Int {
-        max(0, min(maximumOutstandingPayloadBytes - outstandingPayloadByteCount,
-                   clientAdvertisedWindow - outstandingPayloadByteCount))
+        let bdpCap = bdpEstimator.isInitialized
+            ? bdpEstimator.recommendedWindow(mss: peerEffectiveMSS,
+                                             minWindow: Self.minimumBDPWindowBytes,
+                                             maxWindow: maximumOutstandingPayloadBytes)
+            : maximumOutstandingPayloadBytes
+        let sendLimit = min(maximumOutstandingPayloadBytes, bdpCap)
+        return max(0, min(sendLimit - outstandingPayloadByteCount,
+                           clientAdvertisedWindow - outstandingPayloadByteCount))
     }
 
     private func firstRetransmittableIndex() -> Int? {
         SACKScoreboard.firstRetransmittable(in: outstanding, from: outstandingHead)
+    }
+
+    private func highestUnsackedPayloadSegmentIndex() -> Int? {
+        guard outstandingHead < outstanding.count else { return nil }
+        var index = outstanding.count - 1
+        while index >= outstandingHead {
+            if !outstanding[index].sacked, outstanding[index].payloadBytes > 0 {
+                return index
+            }
+            index -= 1
+        }
+        return nil
     }
 
     private func applySelectiveAcknowledgements(_ blocks: [SACKBlock]) {
@@ -2054,13 +2382,24 @@ final class TCPFlow {
         outstandingHead = 0
     }
 
+    private func updateActiveRetransmitRegistration() {
+        let active = hasOutstandingSegments
+        guard active != registeredWithActiveRetransmitTimer else { return }
+        registeredWithActiveRetransmitTimer = active
+        owner?.tcpFlowOutstandingStateChanged(hasOutstanding: active)
+    }
+
     private func recordOutstandingAppend() {
+        if outstanding.count - outstandingHead == 1 {
+            tlpProbeSentForCurrentFlight = false
+        }
         sackApplicationState.invalidate()
         if let counters = owner?.packetLoadCounters {
             counters.outstandingCreated += 1
             counters.outstandingPeak = max(counters.outstandingPeak, outstanding.count - outstandingHead)
             counters.outstandingStoredPeak = max(counters.outstandingStoredPeak, outstanding.count)
         }
+        updateActiveRetransmitRegistration()
     }
 
 }

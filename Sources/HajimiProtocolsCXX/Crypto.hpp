@@ -27,6 +27,16 @@ Buffer sealSlice(AEAD method, const Buffer &key, const Buffer &nonce,
 Buffer openSlice(AEAD method, const Buffer &key, const Buffer &nonce,
                  const uint8_t *sealed, size_t sealedLen,
                  const Buffer &associatedData = {});
+bool sealInto(AEAD method, const uint8_t *key, size_t keyLen,
+              const uint8_t *nonce, size_t nonceLen,
+              const uint8_t *plain, size_t plainLen,
+              uint8_t *dstCipherAndTag,
+              const uint8_t *aad = nullptr, size_t aadLen = 0);
+bool openInto(AEAD method, const uint8_t *key, size_t keyLen,
+              const uint8_t *nonce, size_t nonceLen,
+              const uint8_t *cipherAndTag, size_t cipherAndTagLen,
+              uint8_t *dstPlain,
+              const uint8_t *aad = nullptr, size_t aadLen = 0);
 Buffer blake3(const Buffer &input, size_t count = 32);
 Buffer blake3Keyed(const Buffer &key, const Buffer &input, size_t count = 32);
 Buffer blake3DeriveKey(const std::string &context, const Buffer &material, size_t count = 32);

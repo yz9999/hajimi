@@ -8,7 +8,13 @@
 #include <stdexcept>
 #include <string>
 
+namespace hajimi::proto_stream {
+inline constexpr size_t kMaxCoalescedWriteBytes = 32768;
+} // namespace hajimi::proto_stream
+
 namespace hajimi::proto_common {
+
+inline constexpr size_t kMaxCoalescedWriteBytes = proto_stream::kMaxCoalescedWriteBytes;
 
 inline std::string lowerAscii(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
@@ -210,7 +216,7 @@ public:
     PrefixedStream(std::shared_ptr<Stream> raw, std::shared_ptr<Reader> reader)
         : raw_(std::move(raw)),
           reader_(std::move(reader)),
-          writer_(std::make_shared<OrderedWriter>(raw_)) {}
+          writer_(std::make_shared<OrderedWriter>(raw_, maximumQueuedBytes, 128, proto_stream::kMaxCoalescedWriteBytes)) {}
 
     void write(Buffer data, WriteCallback completion) override {
         writer_->write(std::move(data), std::move(completion));

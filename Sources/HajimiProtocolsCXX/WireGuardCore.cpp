@@ -14,6 +14,16 @@
 
 namespace hajimi::wg_detail {
 
+namespace {
+EVP_MD_CTX *reusableBlake2sMdCtx() {
+    thread_local std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> tlsMdCtx(
+        EVP_MD_CTX_new(), EVP_MD_CTX_free);
+    if (!tlsMdCtx) throw std::runtime_error("OpenSSL EVP_MD_CTX allocation failed");
+    EVP_MD_CTX_reset(tlsMdCtx.get());
+    return tlsMdCtx.get();
+}
+} // namespace
+
 Buffer blake2s(const void *inData, size_t inLen, size_t outLen,
                const void *keyData, size_t keyLen)  {
     if (outLen == 0 || outLen > 32 || keyLen > 32)
@@ -22,14 +32,16 @@ Buffer blake2s(const void *inData, size_t inLen, size_t outLen,
     const auto *inPtr = (inLen > 0 && inData) ? static_cast<const uint8_t *>(inData) : &emptyByte;
     if (keyLen == 0) {
         if (outLen == 32) {
+            EVP_MD_CTX *ctx = reusableBlake2sMdCtx();
             Buffer out(32);
             unsigned written = 0;
-            if (EVP_Digest(inPtr, inLen, out.data(), &written, EVP_blake2s256(), nullptr) != 1 || written != 32)
+            if (EVP_DigestInit_ex(ctx, EVP_blake2s256(), nullptr) != 1 ||
+                (inLen > 0 && EVP_DigestUpdate(ctx, inPtr, inLen) != 1) ||
+                EVP_DigestFinal_ex(ctx, out.data(), &written) != 1 || written != 32)
                 throw std::runtime_error("OpenSSL EVP_blake2s256 failed");
             return out;
         }
-        std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
-        if (!ctx) throw std::runtime_error("OpenSSL EVP_MD_CTX allocation failed");
+        EVP_MD_CTX *ctx = reusableBlake2sMdCtx();
         size_t sizeParam = outLen;
         OSSL_PARAM params[] = {
             OSSL_PARAM_construct_size_t(OSSL_DIGEST_PARAM_SIZE, &sizeParam),
@@ -37,17 +49,18 @@ Buffer blake2s(const void *inData, size_t inLen, size_t outLen,
         };
         Buffer out(outLen);
         unsigned written = 0;
-        if (EVP_DigestInit_ex2(ctx.get(), EVP_blake2s256(), params) != 1 ||
-            EVP_DigestUpdate(ctx.get(), inPtr, inLen) != 1 ||
-            EVP_DigestFinal_ex(ctx.get(), out.data(), &written) != 1 || written != outLen) {
+        if (EVP_DigestInit_ex2(ctx, EVP_blake2s256(), params) != 1 ||
+            EVP_DigestUpdate(ctx, inPtr, inLen) != 1 ||
+            EVP_DigestFinal_ex(ctx, out.data(), &written) != 1 || written != outLen) {
             throw std::runtime_error("OpenSSL variable-length BLAKE2s failed");
         }
         return out;
     }
     static EVP_MAC *const blake2sMac = EVP_MAC_fetch(nullptr, "BLAKE2SMAC", nullptr);
     if (!blake2sMac) throw std::runtime_error("OpenSSL BLAKE2SMAC algorithm unavailable");
-    std::unique_ptr<EVP_MAC_CTX, decltype(&EVP_MAC_CTX_free)> ctx(EVP_MAC_CTX_new(blake2sMac), EVP_MAC_CTX_free);
-    if (!ctx) throw std::runtime_error("OpenSSL BLAKE2SMAC context allocation failed");
+    thread_local std::unique_ptr<EVP_MAC_CTX, decltype(&EVP_MAC_CTX_free)> tlsMacCtx(
+        EVP_MAC_CTX_new(blake2sMac), EVP_MAC_CTX_free);
+    if (!tlsMacCtx) throw std::runtime_error("OpenSSL BLAKE2SMAC context allocation failed");
     size_t sizeParam = outLen;
     OSSL_PARAM params[] = {
         OSSL_PARAM_construct_size_t(OSSL_MAC_PARAM_SIZE, &sizeParam),
@@ -55,23 +68,22 @@ Buffer blake2s(const void *inData, size_t inLen, size_t outLen,
     };
     Buffer out(outLen);
     size_t written = 0;
-    if (EVP_MAC_init(ctx.get(), static_cast<const uint8_t *>(keyData), keyLen, params) != 1 ||
-        EVP_MAC_update(ctx.get(), inPtr, inLen) != 1 ||
-        EVP_MAC_final(ctx.get(), out.data(), &written, out.size()) != 1 || written != outLen) {
+    if (EVP_MAC_init(tlsMacCtx.get(), static_cast<const uint8_t *>(keyData), keyLen, params) != 1 ||
+        EVP_MAC_update(tlsMacCtx.get(), inPtr, inLen) != 1 ||
+        EVP_MAC_final(tlsMacCtx.get(), out.data(), &written, out.size()) != 1 || written != outLen) {
         throw std::runtime_error("OpenSSL BLAKE2SMAC computation failed");
     }
     return out;
 }
 
 Buffer wgHash2(const Buffer &a, const Buffer &b)  {
-    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
-    if (!ctx) throw std::runtime_error("OpenSSL EVP_MD_CTX allocation failed");
+    EVP_MD_CTX *ctx = reusableBlake2sMdCtx();
     Buffer out(32);
     unsigned written = 0;
-    if (EVP_DigestInit_ex(ctx.get(), EVP_blake2s256(), nullptr) != 1 ||
-        (!a.empty() && EVP_DigestUpdate(ctx.get(), a.data(), a.size()) != 1) ||
-        (!b.empty() && EVP_DigestUpdate(ctx.get(), b.data(), b.size()) != 1) ||
-        EVP_DigestFinal_ex(ctx.get(), out.data(), &written) != 1 || written != 32) {
+    if (EVP_DigestInit_ex(ctx, EVP_blake2s256(), nullptr) != 1 ||
+        (!a.empty() && EVP_DigestUpdate(ctx, a.data(), a.size()) != 1) ||
+        (!b.empty() && EVP_DigestUpdate(ctx, b.data(), b.size()) != 1) ||
+        EVP_DigestFinal_ex(ctx, out.data(), &written) != 1 || written != 32) {
         throw std::runtime_error("OpenSSL wgHash2 failed");
     }
     return out;
@@ -420,6 +432,9 @@ bool consumeHandshakeResponse(const WGConfig &cfg, WGHandshakeState &hs, const B
         hs.sendKey = keys[0];
         hs.recvKey = keys[1];
         hs.sendCounter = 0;
+        hs.replayInit = false;
+        hs.replayMax = 0;
+        hs.replayBitmap.fill(0);
         if (!hs.ephemeralPriv.empty()) {
             OPENSSL_cleanse(hs.ephemeralPriv.data(), hs.ephemeralPriv.size());
             hs.ephemeralPriv.clear();
@@ -436,18 +451,29 @@ bool consumeHandshakeResponse(const WGConfig &cfg, WGHandshakeState &hs, const B
 
 Buffer encryptTransportPacket(const WGConfig &cfg, WGHandshakeState &hs, const Buffer &ipPacket)  {
     size_t paddedLen = ipPacket.empty() ? 0 : ((ipPacket.size() + 15) / 16) * 16;
-    Buffer padded(paddedLen, 0);
-    if (!ipPacket.empty()) std::memcpy(padded.data(), ipPacket.data(), ipPacket.size());
-    uint64_t counter = hs.sendCounter++;
-    auto cipher = crypto::seal(crypto::AEAD::ChaCha20Poly1305, hs.sendKey, wgNonce(counter), padded);
-    Buffer out(16 + cipher.size(), 0);
+    Buffer out(16 + paddedLen + 16);
     out[0] = 4;
     out[1] = cfg.reserved[0];
     out[2] = cfg.reserved[1];
     out[3] = cfg.reserved[2];
     writeLE32(out.data() + 4, hs.serverIndex);
+    uint64_t counter = hs.sendCounter++;
     writeLE64(out.data() + 8, counter);
-    std::memcpy(out.data() + 16, cipher.data(), cipher.size());
+    if (!ipPacket.empty()) {
+        std::memcpy(out.data() + 16, ipPacket.data(), ipPacket.size());
+        if (paddedLen > ipPacket.size()) {
+            std::memset(out.data() + 16 + ipPacket.size(), 0, paddedLen - ipPacket.size());
+        }
+    }
+    uint8_t nonce[12]{};
+    writeLE64(nonce + 4, counter);
+    if (!crypto::sealInto(crypto::AEAD::ChaCha20Poly1305,
+                          hs.sendKey.data(), hs.sendKey.size(),
+                          nonce, sizeof(nonce),
+                          out.data() + 16, paddedLen,
+                          out.data() + 16)) {
+        throw std::runtime_error("WireGuard transport AEAD encryption failed");
+    }
     return out;
 }
 
@@ -456,10 +482,19 @@ bool decryptTransportPacket(WGHandshakeState &hs, const Buffer &pkt, Buffer &ipP
     uint32_t recvIdx = readLE32(pkt.data() + 4);
     if (recvIdx != hs.clientIndex) return false;
     uint64_t counter = readLE64(pkt.data() + 8);
-    if (hs.replayInit && counter + 64 <= hs.replayMax) return false;
+    if (!hs.checkReplay(counter)) return false;
     try {
-        auto plain = crypto::openSlice(crypto::AEAD::ChaCha20Poly1305, hs.recvKey, wgNonce(counter),
-                                       pkt.data() + 16, pkt.size() - 16);
+        uint8_t nonce[12]{};
+        writeLE64(nonce + 4, counter);
+        const size_t plainLen = pkt.size() - 32;
+        Buffer plain(plainLen);
+        if (!crypto::openInto(crypto::AEAD::ChaCha20Poly1305,
+                              hs.recvKey.data(), hs.recvKey.size(),
+                              nonce, sizeof(nonce),
+                              pkt.data() + 16, pkt.size() - 16,
+                              plainLen ? plain.data() : nullptr)) {
+            return false;
+        }
         if (!hs.acceptReplay(counter)) return false;
         if (plain.empty()) {
             ipPacketOut.clear();

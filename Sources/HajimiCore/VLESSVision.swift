@@ -122,45 +122,62 @@ final class VLESSVisionEncoder {
         let shouldEnd = tlsBoundary || (!state.isTLS12OrAbove && state.fallbackBoundary)
         let finalCommand: VLESSVisionCommand = shouldDirect ? .direct
             : (shouldEnd ? .endPadding : .continuePadding)
-        var framed = Data()
         let maximumContent = 8_192 - 21
-        if data.isEmpty {
-            framed.append(encodeFrame(data, command: finalCommand, longPadding: state.isTLS))
+        let framed: Data
+        if data.count <= maximumContent {
+            framed = encodeFrame(data, command: finalCommand, longPadding: state.isTLS)
         } else {
+            let chunkCount = (data.count + maximumContent - 1) / maximumContent
+            var multi = Data(capacity: (includeUUID ? uuid.count : 0) + data.count + chunkCount * 261)
             var offset = 0
             let start = data.startIndex
             while offset < data.count {
                 let end = min(data.count, offset + maximumContent)
                 let command: VLESSVisionCommand = end == data.count
                     ? finalCommand : .continuePadding
-                framed.append(encodeFrame(Data(data[(start + offset)..<(start + end)]), command: command,
-                                          longPadding: state.isTLS))
+                multi.append(encodeFrame(data[(start + offset)..<(start + end)], command: command,
+                                         longPadding: state.isTLS))
                 offset = end
             }
+            framed = multi
         }
         if shouldEnd { padding = false }
         if shouldDirect { direct = true }
         return Encoded(bytes: framed, switchesToDirectAfterWrite: shouldDirect)
     }
 
-    private func encodeFrame(_ content: Data, command: VLESSVisionCommand,
-                             longPadding: Bool) -> Data {
-        let maximum = max(0, 8_192 - 21 - content.count)
+    private func encodeFrame<C: DataProtocol>(_ content: C, command: VLESSVisionCommand,
+                                              longPadding: Bool) -> Data {
+        let contentCount = content.count
+        let maximum = max(0, 8_192 - 21 - contentCount)
         let paddingLength: Int
-        if content.count < 900, longPadding {
-            paddingLength = min(maximum, Int.random(in: 0..<500) + 900 - content.count)
+        if contentCount < 900, longPadding {
+            paddingLength = min(maximum, Int.random(in: 0..<500) + 900 - contentCount)
         } else {
             paddingLength = min(maximum, Int.random(in: 0..<256))
         }
-        var output = Data()
-        if includeUUID { output.append(uuid); includeUUID = false }
-        output.append(command.rawValue)
-        output.append(UInt8(truncatingIfNeeded: content.count >> 8))
-        output.append(UInt8(truncatingIfNeeded: content.count))
-        output.append(UInt8(truncatingIfNeeded: paddingLength >> 8))
-        output.append(UInt8(truncatingIfNeeded: paddingLength))
-        output.append(content)
-        if paddingLength > 0 { output.append(Data(repeating: 0, count: paddingLength)) }
+        let prependUUID = includeUUID
+        if includeUUID { includeUUID = false }
+        let uuidCount = prependUUID ? uuid.count : 0
+        let totalCount = uuidCount + 5 + contentCount + paddingLength
+        // `Data(count:)` zero-initializes storage, so trailing padding zeros require no extra buffer.
+        var output = Data(count: totalCount)
+        output.withUnsafeMutableBytes { raw in
+            var pos = 0
+            if prependUUID && uuidCount > 0 {
+                _ = uuid.copyBytes(to: UnsafeMutableRawBufferPointer(rebasing: raw[0..<uuidCount]))
+                pos = uuidCount
+            }
+            raw[pos] = command.rawValue
+            raw[pos + 1] = UInt8(truncatingIfNeeded: contentCount >> 8)
+            raw[pos + 2] = UInt8(truncatingIfNeeded: contentCount)
+            raw[pos + 3] = UInt8(truncatingIfNeeded: paddingLength >> 8)
+            raw[pos + 4] = UInt8(truncatingIfNeeded: paddingLength)
+            pos += 5
+            if contentCount > 0 {
+                _ = content.copyBytes(to: UnsafeMutableRawBufferPointer(rebasing: raw[pos..<(pos + contentCount)]))
+            }
+        }
         return output
     }
 
@@ -199,6 +216,7 @@ final class VLESSVisionDecoder {
     private let uuid: Data
     private let traffic: VLESSVisionTrafficState
     private var buffer = Data()
+    private var offset = 0
     private var expectsUUID = true
     private var framed = true
     private var direct = false
@@ -214,42 +232,82 @@ final class VLESSVisionDecoder {
             traffic.observeDownlink(data)
             return Decoded(chunks: data.isEmpty ? [] : [data], switchesToDirect: false)
         }
-        buffer.append(data)
+        if !data.isEmpty {
+            if offset == buffer.count && offset > 0 {
+                buffer.removeAll(keepingCapacity: true)
+                offset = 0
+            }
+            buffer.append(data)
+        }
         var output: [Data] = []
         var switched = false
+        let baseStart = buffer.startIndex
         if expectsUUID {
-            guard buffer.count >= 16 else { return Decoded(chunks: [], switchesToDirect: false) }
-            guard Data(buffer.prefix(16)) == uuid else {
+            guard buffer.count - offset >= 16 else { return Decoded(chunks: [], switchesToDirect: false) }
+            let uuidPos = baseStart + offset
+            guard buffer[uuidPos..<(uuidPos + 16)].elementsEqual(uuid) else {
                 throw NativeOutboundError.protocolError("VLESS Vision 响应缺少匹配的 UUID 帧前缀")
             }
-            buffer = Data(buffer.dropFirst(16)); expectsUUID = false
+            offset += 16
+            expectsUUID = false
         }
-        while framed, buffer.count >= 5 {
-            let start = buffer.startIndex
-            guard let command = VLESSVisionCommand(rawValue: buffer[start]) else {
-                throw NativeOutboundError.protocolError("VLESS Vision 未知 padding command \(buffer[start])")
+        while framed, buffer.count - offset >= 5 {
+            let pos = baseStart + offset
+            guard let command = VLESSVisionCommand(rawValue: buffer[pos]) else {
+                throw NativeOutboundError.protocolError("VLESS Vision 未知 padding command \(buffer[pos])")
             }
-            let contentLength = Int(buffer[start + 1]) << 8 | Int(buffer[start + 2])
-            let paddingLength = Int(buffer[start + 3]) << 8 | Int(buffer[start + 4])
+            let contentLength = Int(buffer[pos + 1]) << 8 | Int(buffer[pos + 2])
+            let paddingLength = Int(buffer[pos + 3]) << 8 | Int(buffer[pos + 4])
             guard contentLength <= 65_535,
                   paddingLength <= 65_535 else {
                 throw NativeOutboundError.protocolError("VLESS Vision 帧长度无效")
             }
             let total = 5 + contentLength + paddingLength
-            guard buffer.count >= total else { break }
+            guard buffer.count - offset >= total else { break }
             if contentLength > 0 {
-                let content = Data(buffer[(start + 5)..<(start + 5 + contentLength)])
-                traffic.observeDownlink(content); output.append(content)
+                let content = Data(buffer[(pos + 5)..<(pos + 5 + contentLength)])
+                traffic.observeDownlink(content)
+                output.append(content)
             }
-            buffer = Data(buffer.dropFirst(total))
+            offset += total
             switch command {
-            case .continuePadding: break
+            case .continuePadding:
+                break
             case .endPadding:
                 framed = false
-                if !buffer.isEmpty { let tail = buffer; buffer.removeAll(); traffic.observeDownlink(tail); output.append(tail) }
+                if offset < buffer.count {
+                    let tail = Data(buffer[(baseStart + offset)..<buffer.endIndex])
+                    buffer.removeAll(keepingCapacity: false)
+                    offset = 0
+                    traffic.observeDownlink(tail)
+                    output.append(tail)
+                } else {
+                    buffer.removeAll(keepingCapacity: false)
+                    offset = 0
+                }
             case .direct:
-                framed = false; direct = true; switched = true
-                if !buffer.isEmpty { let tail = buffer; buffer.removeAll(); traffic.observeDownlink(tail); output.append(tail) }
+                framed = false
+                direct = true
+                switched = true
+                if offset < buffer.count {
+                    let tail = Data(buffer[(baseStart + offset)..<buffer.endIndex])
+                    buffer.removeAll(keepingCapacity: false)
+                    offset = 0
+                    traffic.observeDownlink(tail)
+                    output.append(tail)
+                } else {
+                    buffer.removeAll(keepingCapacity: false)
+                    offset = 0
+                }
+            }
+        }
+        if framed, offset > 0 {
+            if offset == buffer.count {
+                buffer.removeAll(keepingCapacity: true)
+                offset = 0
+            } else if offset >= 4_096 && offset * 2 >= buffer.count {
+                buffer = Data(buffer[(baseStart + offset)..<buffer.endIndex])
+                offset = 0
             }
         }
         return Decoded(chunks: output, switchesToDirect: switched)
@@ -446,7 +504,7 @@ public enum VLESSVisionSelfTest {
         let stdTraffic = VLESSVisionTrafficState()
         let stdEncoder = VLESSVisionEncoder(uuid: uuid, traffic: stdTraffic, canDirect: false)
         let stdDecoder = VLESSVisionDecoder(uuid: uuid, traffic: VLESSVisionTrafficState())
-        let sampleHello = Data([0x16, 0x03, 0x01, 0x00, 0xc8] + Array(repeating: UInt8(0x41), count: 200))
+        let sampleHello = Data([0x16, 0x03, 0x01, 0x00, 0xc8, 0x01] + Array(repeating: UInt8(0x41), count: 199))
         let framedHello = stdEncoder.encode(sampleHello).bytes
         let totalContentPlusPad = framedHello.count - 16 - 5
         guard totalContentPlusPad >= 900 && totalContentPlusPad < 1400,

@@ -20,7 +20,123 @@ public final class DNSQueryCache {
         let expires: Date
         let cost: Int
         let isNegative: Bool
-        var access: UInt64
+    }
+    private struct LRUNode {
+        var key: Key
+        var entry: Entry
+        var prev: Int32
+        var next: Int32
+        var alive: Bool
+    }
+    /// O(1) doubly-linked arena-backed LRU map nested inside `DNSQueryCache`
+    /// so standalone Python test extractors keep `DNSQueryCache` self-contained.
+    private struct LRUIndexList {
+        private(set) var nodes: ContiguousArray<LRUNode> = []
+        private var indexByKey: [Key: Int32] = [:]
+        private var freeList: [Int32] = []
+        private(set) var head: Int32 = -1
+        private(set) var tail: Int32 = -1
+        var expireCursor: Int32 = -1
+
+        var count: Int { indexByKey.count }
+        var isEmpty: Bool { indexByKey.isEmpty }
+
+        func entry(for key: Key) -> Entry? {
+            guard let idx = indexByKey[key] else { return nil }
+            return nodes[Int(idx)].entry
+        }
+
+        @discardableResult
+        mutating func touch(key: Key) -> Entry? {
+            guard let idx = indexByKey[key] else { return nil }
+            moveToTail(idx)
+            return nodes[Int(idx)].entry
+        }
+
+        @discardableResult
+        mutating func upsert(key: Key, entry: Entry) -> Entry? {
+            if let idx = indexByKey[key] {
+                let previous = nodes[Int(idx)].entry
+                nodes[Int(idx)].entry = entry
+                moveToTail(idx)
+                return previous
+            }
+            let idx: Int32
+            if let recycled = freeList.popLast() {
+                idx = recycled
+                nodes[Int(idx)] = LRUNode(key: key, entry: entry, prev: tail, next: -1, alive: true)
+            } else {
+                idx = Int32(nodes.count)
+                nodes.append(LRUNode(key: key, entry: entry, prev: tail, next: -1, alive: true))
+            }
+            if tail >= 0 {
+                nodes[Int(tail)].next = idx
+            } else {
+                head = idx
+            }
+            tail = idx
+            indexByKey[key] = idx
+            return nil
+        }
+
+        @discardableResult
+        mutating func removeValue(forKey key: Key) -> Entry? {
+            guard let idx = indexByKey.removeValue(forKey: key) else { return nil }
+            let removed = nodes[Int(idx)].entry
+            unlink(idx)
+            nodes[Int(idx)].alive = false
+            freeList.append(idx)
+            return removed
+        }
+
+        mutating func popOldest() -> (key: Key, entry: Entry)? {
+            guard head >= 0 else { return nil }
+            let oldestKey = nodes[Int(head)].key
+            guard let removed = removeValue(forKey: oldestKey) else { return nil }
+            return (oldestKey, removed)
+        }
+
+        mutating func removeAll() {
+            nodes.removeAll()
+            indexByKey.removeAll()
+            freeList.removeAll()
+            head = -1
+            tail = -1
+            expireCursor = -1
+        }
+
+        private mutating func moveToTail(_ idx: Int32) {
+            guard idx != tail else { return }
+            unlink(idx)
+            nodes[Int(idx)].prev = tail
+            nodes[Int(idx)].next = -1
+            if tail >= 0 {
+                nodes[Int(tail)].next = idx
+            } else {
+                head = idx
+            }
+            tail = idx
+        }
+
+        private mutating func unlink(_ idx: Int32) {
+            let p = nodes[Int(idx)].prev
+            let n = nodes[Int(idx)].next
+            if expireCursor == idx {
+                expireCursor = n
+            }
+            if p >= 0 {
+                nodes[Int(p)].next = n
+            } else {
+                head = n
+            }
+            if n >= 0 {
+                nodes[Int(n)].prev = p
+            } else {
+                tail = p
+            }
+            nodes[Int(idx)].prev = -1
+            nodes[Int(idx)].next = -1
+        }
     }
     fileprivate struct Question {
         let name: String
@@ -50,10 +166,9 @@ public final class DNSQueryCache {
     private let maximumTTL: UInt32
     private let maximumNegativeTTL: UInt32
     private let clock: () -> Date
-    private var entries: [Key: Entry] = [:]
-    private var staleArchive: [Key: Entry] = [:]
+    private var entries = LRUIndexList()
+    private var staleArchive = LRUIndexList()
     private var bytes = 0
-    private var access: UInt64 = 0
     private var lastClock: Date?
     private var positiveHits: UInt64 = 0
     private var negativeHits: UInt64 = 0
@@ -97,22 +212,35 @@ public final class DNSQueryCache {
     }
 
     package static func prepare(_ query: Data) -> PreparedQuery {
-        let bytes = [UInt8](query)
-        let original = Data(bytes)
-        guard let question = inspectQuery(bytes) else {
+        let original = Data(query)
+        let inspectedQuestion: Question? = original.withUnsafeBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return nil }
+            return inspectQuery(UnsafeBufferPointer(start: base, count: raw.count))
+        }
+        guard let question = inspectedQuestion else {
             return PreparedQuery(cacheEligible: false, coalescingIdentity: nil,
                                  query: original, question: nil)
         }
-        var identity = bytes; identity[0] = 0; identity[1] = 0
+        var identity = original
+        identity.withUnsafeMutableBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress, raw.count >= 2 else { return }
+            base[0] = 0
+            base[1] = 0
+        }
         return PreparedQuery(cacheEligible: cacheableReadTypes.contains(question.type),
-                             coalescingIdentity: Data(identity), query: original, question: question)
+                             coalescingIdentity: identity, query: original, question: question)
     }
 
     public static func rewritingResponseID(_ response: Data, for query: Data) -> Data? {
         guard response.count >= 12, query.count >= 12 else { return nil }
-        var bytes = [UInt8](response)
-        bytes[0] = query[query.startIndex]; bytes[1] = query[query.startIndex + 1]
-        let answer = Data(bytes)
+        var answer = Data(response)
+        let q0 = query[query.startIndex]
+        let q1 = query[query.startIndex + 1]
+        answer.withUnsafeMutableBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress, raw.count >= 2 else { return }
+            base[0] = q0
+            base[1] = q1
+        }
         return DNSMessageInspection.responseMatchesQuery(answer, query: query) ? answer : nil
     }
 
@@ -125,9 +253,9 @@ public final class DNSQueryCache {
         let key = Key(scope: scopeKey, question: identity)
         lock.lock(); defer { lock.unlock() }
         let now = clock()
-        guard checkClock(now), var entry = entries[key] else { misses &+= 1; return nil }
+        guard checkClock(now), let entry = entries.entry(for: key) else { misses &+= 1; return nil }
         guard now < entry.expires else { archiveAndRemove(key, now: now); misses &+= 1; return nil }
-        access &+= 1; entry.access = access; entries[key] = entry
+        entries.touch(key: key)
         if entry.isNegative { negativeHits &+= 1 } else { positiveHits &+= 1 }
         let age = UInt32(min(Double(UInt32.max), max(0, ceil(now.timeIntervalSince(entry.inserted)))))
         let remaining = UInt32(min(Double(UInt32.max), max(0, floor(entry.expires.timeIntervalSince(now)))))
@@ -156,9 +284,9 @@ public final class DNSQueryCache {
         let key = Key(scope: scopeKey, question: identity)
         lock.lock(); defer { lock.unlock() }
         let now = clock()
-        guard checkClock(now), var entry = entries[key] else { misses &+= 1; return nil }
+        guard checkClock(now), let entry = entries.entry(for: key) else { misses &+= 1; return nil }
         guard now < entry.expires else { archiveAndRemove(key, now: now); misses &+= 1; return nil }
-        access &+= 1; entry.access = access; entries[key] = entry
+        entries.touch(key: key)
         if entry.isNegative { negativeHits &+= 1 } else { positiveHits &+= 1 }
         let age = UInt32(min(Double(UInt32.max), max(0, ceil(now.timeIntervalSince(entry.inserted)))))
         let remaining = UInt32(min(Double(UInt32.max), max(0, floor(entry.expires.timeIntervalSince(now)))))
@@ -192,14 +320,14 @@ public final class DNSQueryCache {
         lock.lock(); defer { lock.unlock() }
         let now = clock()
         guard checkClock(now) else { return nil }
-        if let active = entries[key] {
+        if let active = entries.entry(for: key) {
             if now >= active.expires {
                 archiveAndRemove(key, now: now)
             } else {
                 return nil
             }
         }
-        guard let stale = staleArchive[key] else { return nil }
+        guard let stale = staleArchive.entry(for: key) else { return nil }
         let overdue = now.timeIntervalSince(stale.expires)
         guard overdue >= 0, overdue <= maximumStaleWindow else {
             staleArchive.removeValue(forKey: key)
@@ -219,18 +347,24 @@ public final class DNSQueryCache {
 
     @discardableResult
     package func store(scopeKey: String, prepared: PreparedQuery, response: Data) -> Bool {
-        let answer = [UInt8](response)
         guard prepared.cacheEligible, let question = prepared.question,
               let identity = prepared.coalescingIdentity,
               // Match the generic inspector's post-case-fold name bound too;
               // some Unicode labels expand when lowercased.
               question.name == "." || question.name.utf8.count <= 253,
-              answer.count >= 12, answer[0] == prepared.query[0], answer[1] == prepared.query[1],
-              // The strict response inspection below checks the question,
-              // class, opcode and flags against the prepared metadata too.
-              let inspected = Self.inspectResponse(answer, question: question),
-              !inspected.fields.isEmpty,
+              response.count >= 12,
               maximumEntries > 0, maximumTTL > 0 else { return false }
+        let answer = Data(response)
+        let q0 = prepared.query[prepared.query.startIndex]
+        let q1 = prepared.query[prepared.query.startIndex + 1]
+        let inspectedResult: (fields: [TTLField], isNegative: Bool)? = answer.withUnsafeBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress,
+                  raw.count >= 12, base[0] == q0, base[1] == q1 else { return nil }
+            // The strict response inspection below checks the question,
+            // class, opcode and flags against the prepared metadata too.
+            return Self.inspectResponse(UnsafeBufferPointer(start: base, count: raw.count), question: question)
+        }
+        guard let inspected = inspectedResult, !inspected.fields.isEmpty else { return false }
         let fields = inspected.fields
         let isNegative = inspected.isNegative
         let cost = answer.count + identity.count + scopeKey.utf8.count
@@ -238,7 +372,9 @@ public final class DNSQueryCache {
             + MemoryLayout<Entry>.stride + MemoryLayout<Key>.stride
         guard cost <= maximumBytes else { return false }
         let ttlCeiling = isNegative ? min(maximumTTL, maximumNegativeTTL) : maximumTTL
-        let lifetime = min(fields.map(\.value).min()!, ttlCeiling)
+        var minFieldTTL = UInt32.max
+        for f in fields where f.value < minFieldTTL { minFieldTTL = f.value }
+        let lifetime = min(minFieldTTL, ttlCeiling)
         guard lifetime > 0 else { return false }
         let key = Key(scope: scopeKey, question: identity)
         lock.lock(); defer { lock.unlock() }
@@ -246,18 +382,21 @@ public final class DNSQueryCache {
         guard checkClock(now) else { return false }
         let expires = now.addingTimeInterval(TimeInterval(lifetime))
         guard expires > now else { return false }
-        expire(now)
+        expireAmortized(now, budget: 8)
         remove(key)
+        if !entries.isEmpty && (entries.count >= maximumEntries || cost > maximumBytes - bytes) {
+            expireAll(now)
+        }
         while !entries.isEmpty && (entries.count >= maximumEntries || cost > maximumBytes - bytes) {
-            guard let oldest = entries.min(by: { $0.value.access < $1.value.access })?.key else { return false }
-            remove(oldest)
+            guard let oldest = entries.popOldest() else { return false }
+            staleArchive.removeValue(forKey: oldest.key)
+            bytes -= oldest.entry.cost
             evictions &+= 1
         }
         guard entries.count < maximumEntries, cost <= maximumBytes - bytes else { return false }
-        access &+= 1
         insertions &+= 1
-        entries[key] = Entry(response: Data(answer), fields: fields, inserted: now,
-                             expires: expires, cost: cost, isNegative: isNegative, access: access)
+        entries.upsert(key: key, entry: Entry(response: answer, fields: fields, inserted: now,
+                                              expires: expires, cost: cost, isNegative: isNegative))
         bytes += cost
         return true
     }
@@ -269,7 +408,7 @@ public final class DNSQueryCache {
     public var usage: (entries: Int, bytes: Int) {
         lock.lock(); defer { lock.unlock() }
         let now = clock()
-        if checkClock(now) { expire(now) }
+        if checkClock(now) { expireAll(now) }
         return (entries.count, bytes)
     }
 
@@ -292,11 +431,10 @@ public final class DNSQueryCache {
         // RFC 8767 §4: Only positive cached answers are retained for emergency Serve-Stale.
         guard !value.isNegative else { return }
         let staleLimit = min(max(1, maximumEntries), 64)
-        if staleArchive.count >= staleLimit,
-           let oldest = staleArchive.min(by: { $0.value.access < $1.value.access })?.key {
-            staleArchive.removeValue(forKey: oldest)
+        while staleArchive.count >= staleLimit {
+            if staleArchive.popOldest() == nil { break }
         }
-        staleArchive[key] = value
+        staleArchive.upsert(key: key, entry: value)
     }
 
     private static func rewriteCachedWire(
@@ -324,14 +462,52 @@ public final class DNSQueryCache {
         }
         return output
     }
-    private func expire(_ now: Date) {
-        for (key, value) in entries where value.expires <= now { archiveAndRemove(key, now: now) }
-        for (key, value) in staleArchive where now.timeIntervalSince(value.expires) > 1800 {
-            staleArchive.removeValue(forKey: key)
+
+    private func expireAmortized(_ now: Date, budget: Int) {
+        var remaining = budget
+        if entries.expireCursor < 0 { entries.expireCursor = entries.head }
+        while remaining > 0, entries.expireCursor >= 0 {
+            remaining -= 1
+            let idx = entries.expireCursor
+            let node = entries.nodes[Int(idx)]
+            entries.expireCursor = node.next
+            if node.alive && node.entry.expires <= now {
+                archiveAndRemove(node.key, now: now)
+            }
+        }
+        var staleRemaining = max(1, budget >> 1)
+        if staleArchive.expireCursor < 0 { staleArchive.expireCursor = staleArchive.head }
+        while staleRemaining > 0, staleArchive.expireCursor >= 0 {
+            staleRemaining -= 1
+            let idx = staleArchive.expireCursor
+            let node = staleArchive.nodes[Int(idx)]
+            staleArchive.expireCursor = node.next
+            if node.alive && now.timeIntervalSince(node.entry.expires) > 1800 {
+                staleArchive.removeValue(forKey: node.key)
+            }
         }
     }
 
-    private static func inspectQuery(_ bytes: [UInt8]) -> Question? {
+    private func expireAll(_ now: Date) {
+        var idx = entries.head
+        while idx >= 0 {
+            let node = entries.nodes[Int(idx)]
+            idx = node.next
+            if node.alive && node.entry.expires <= now {
+                archiveAndRemove(node.key, now: now)
+            }
+        }
+        var sIdx = staleArchive.head
+        while sIdx >= 0 {
+            let node = staleArchive.nodes[Int(sIdx)]
+            sIdx = node.next
+            if node.alive && now.timeIntervalSince(node.entry.expires) > 1800 {
+                staleArchive.removeValue(forKey: node.key)
+            }
+        }
+    }
+
+    private static func inspectQuery(_ bytes: UnsafeBufferPointer<UInt8>) -> Question? {
         // AD advertises that a stub understands the upstream's validation
         // result. Preserve it exactly in the key, rather than disabling cache
         // for common stubs/dig. CD and DO still require uncached handling.
@@ -357,7 +533,7 @@ public final class DNSQueryCache {
                         payloadLimit: payload, recursionDesired: bytes[2] & 1)
     }
 
-    private static func inspectResponse(_ bytes: [UInt8], question: Question)
+    private static func inspectResponse(_ bytes: UnsafeBufferPointer<UInt8>, question: Question)
         -> (fields: [TTLField], isNegative: Bool)? {
         let rcode = bytes.count >= 4 ? (bytes[3] & 0x0f) : 0xff
         guard (12...65_535).contains(bytes.count), bytes.count <= question.payloadLimit,
@@ -365,18 +541,21 @@ public final class DNSQueryCache {
               (rcode == 0 || rcode == 3),
               bytes[2] & 1 == question.recursionDesired,
               read16(bytes, 4) == 1 else { return nil }
-        let counts = [Int(read16(bytes, 6)), Int(read16(bytes, 8)), Int(read16(bytes, 10))]
-        let isNegativeCandidate = (counts[0] == 0 && counts[1] >= 1)
-        guard (rcode == 0 && counts[0] > 0) || isNegativeCandidate,
-              counts.reduce(0, +) <= 256 else { return nil }
+        let anCount = Int(read16(bytes, 6))
+        let nsCount = Int(read16(bytes, 8))
+        let arCount = Int(read16(bytes, 10))
+        let isNegativeCandidate = (anCount == 0 && nsCount >= 1)
+        guard (rcode == 0 && anCount > 0) || isNegativeCandidate,
+              anCount + nsCount + arCount <= 256 else { return nil }
         var names = Set<Int>()
         guard let named = readName(bytes, at: 12, known: &names), named.value == question.name,
               named.end <= bytes.count - 4, read16(bytes, named.end) == question.type,
               read16(bytes, named.end + 2) == 1 else { return nil }
         var offset = named.end + 4, fields: [TTLField] = [], aliases: [String: String] = [:]
         var answerOwners: [String] = [], optCount = 0, authoritySOACount = 0
-        for section in counts.indices {
-            for _ in 0..<counts[section] {
+        for section in 0..<3 {
+            let sectionCount = section == 0 ? anCount : (section == 1 ? nsCount : arCount)
+            for _ in 0..<sectionCount {
                 let ownerOffset = offset
                 guard let owner = readName(bytes, at: offset, known: &names), owner.end <= bytes.count - 10 else { return nil }
                 offset = owner.end
@@ -459,7 +638,7 @@ public final class DNSQueryCache {
     /// SVCB/HTTPS stay whole wire answers. Target names and address hints do not
     /// grant routing or address authority. Initially admit only common, fully
     /// framed parameters; unsupported keys keep their ordinary uncached path.
-    private static func serviceBinding(_ bytes: [UInt8], from start: Int, to end: Int,
+    private static func serviceBinding(_ bytes: UnsafeBufferPointer<UInt8>, from start: Int, to end: Int,
                                        known: inout Set<Int>) -> Bool {
         guard end - start >= 3,
               let target = readName(bytes, at: start + 2, known: &known, compressed: false),
@@ -513,8 +692,13 @@ public final class DNSQueryCache {
                 guard length > 0, length % 16 == 0 else { return false }
             case 7:
                 // RFC 9461 SvcParamKey=7 (dohpath): non-empty relative URI template starting with '/'
-                guard length > 0, bytes[offset] == 0x2f,
-                      bytes[offset..<valueEnd].allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else { return false }
+                guard length > 0, bytes[offset] == 0x2f else { return false }
+                var idx = offset
+                while idx < valueEnd {
+                    let b = bytes[idx]
+                    guard b >= 0x21 && b <= 0x7e else { return false }
+                    idx += 1
+                }
             default: return false
             }
             offset = valueEnd
@@ -522,20 +706,27 @@ public final class DNSQueryCache {
         return mandatory.isSubset(of: keys) && (!keys.contains(2) || keys.contains(1))
     }
 
-    private static func paddingOnly(_ bytes: [UInt8], from start: Int, to end: Int) -> Bool {
+    private static func paddingOnly(_ bytes: UnsafeBufferPointer<UInt8>, from start: Int, to end: Int) -> Bool {
         guard start >= 0, end >= start, end <= bytes.count else { return false }
         if start == end { return true }
         guard end - start >= 4, read16(bytes, start) == 12,
               Int(read16(bytes, start + 2)) == end - start - 4 else { return false }
-        return bytes[(start + 4)..<end].allSatisfy { $0 == 0 }
+        var idx = start + 4
+        while idx < end {
+            if bytes[idx] != 0 { return false }
+            idx += 1
+        }
+        return true
     }
 
     /// Compression targets must be previously parsed name boundaries, never
     /// arbitrary RDATA/TTL bytes that rewriting might turn into another name.
-    private static func readName(_ bytes: [UInt8], at start: Int, known: inout Set<Int>,
+    private static func readName(_ bytes: UnsafeBufferPointer<UInt8>, at start: Int, known: inout Set<Int>,
                                  compressed: Bool = true) -> Name? {
         guard start < bytes.count else { return nil }
-        var offset = start, end: Int?, labels: [String] = [], visited = Set<Int>(), expanded = 1
+        var offset = start, end: Int?, visited = Set<Int>(), expanded = 1
+        var asciiBuf: [UInt8] = []
+        var nonASCIILabels: [String]? = nil
         for _ in 0..<256 {
             guard offset < bytes.count, visited.insert(offset).inserted else { return nil }
             let position = offset, length = Int(bytes[offset])
@@ -549,20 +740,54 @@ public final class DNSQueryCache {
             }
             guard length <= 63 else { return nil }
             known.insert(position); offset += 1
-            if length == 0 { return Name(value: labels.isEmpty ? "." : labels.joined(separator: ".").lowercased(), end: end ?? offset) }
-            guard length <= bytes.count - offset, expanded <= 255 - length - 1,
-                  let label = String(bytes: bytes[offset..<(offset + length)], encoding: .utf8),
-                  !label.contains("."), !label.contains("\\"), !label.contains("\0") else { return nil }
-            expanded += length + 1; labels.append(label); offset += length
+            if length == 0 {
+                let finalEnd = end ?? offset
+                if let labels = nonASCIILabels {
+                    return Name(value: labels.isEmpty ? "." : labels.joined(separator: ".").lowercased(), end: finalEnd)
+                }
+                if asciiBuf.isEmpty {
+                    return Name(value: ".", end: finalEnd)
+                }
+                return Name(value: String(decoding: asciiBuf, as: UTF8.self), end: finalEnd)
+            }
+            guard length <= bytes.count - offset, expanded <= 255 - length - 1 else { return nil }
+            let slice = UnsafeBufferPointer(rebasing: bytes[offset..<(offset + length)])
+            var isPureASCII = (nonASCIILabels == nil)
+            if isPureASCII {
+                for i in 0..<length {
+                    let b = slice[i]
+                    if b >= 0x80 { isPureASCII = false; break }
+                    if b == 0x2e || b == 0x5c || b == 0x00 { return nil }
+                }
+            }
+            if isPureASCII {
+                if !asciiBuf.isEmpty { asciiBuf.append(0x2e) }
+                else { asciiBuf.reserveCapacity(min(253, length * 3)) }
+                for i in 0..<length {
+                    let b = slice[i]
+                    asciiBuf.append((b >= 0x41 && b <= 0x5a) ? (b | 0x20) : b)
+                }
+            } else {
+                if nonASCIILabels == nil {
+                    nonASCIILabels = asciiBuf.isEmpty
+                        ? []
+                        : String(decoding: asciiBuf, as: UTF8.self).split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+                }
+                guard let label = String(bytes: slice, encoding: .utf8),
+                      !label.contains("."), !label.contains("\\"), !label.contains("\0") else { return nil }
+                nonASCIILabels?.append(label)
+            }
+            expanded += length + 1; offset += length
         }
         return nil
     }
-    private static func read16(_ bytes: [UInt8], _ offset: Int) -> UInt16 { UInt16(bytes[offset]) << 8 | UInt16(bytes[offset + 1]) }
-    private static func read32(_ bytes: [UInt8], _ offset: Int) -> UInt32 {
-        UInt32(bytes[offset]) << 24 | UInt32(bytes[offset + 1]) << 16 | UInt32(bytes[offset + 2]) << 8 | UInt32(bytes[offset + 3])
+    @inline(__always)
+    private static func read16(_ bytes: UnsafeBufferPointer<UInt8>, _ offset: Int) -> UInt16 {
+        UInt16(bytes[offset]) << 8 | UInt16(bytes[offset + 1])
     }
-    private static func write32(_ value: UInt32, at offset: Int, in bytes: inout [UInt8]) {
-        for i in 0..<4 { bytes[offset + i] = UInt8(truncatingIfNeeded: value >> (24 - i * 8)) }
+    @inline(__always)
+    private static func read32(_ bytes: UnsafeBufferPointer<UInt8>, _ offset: Int) -> UInt32 {
+        UInt32(bytes[offset]) << 24 | UInt32(bytes[offset + 1]) << 16 | UInt32(bytes[offset + 2]) << 8 | UInt32(bytes[offset + 3])
     }
 }
 

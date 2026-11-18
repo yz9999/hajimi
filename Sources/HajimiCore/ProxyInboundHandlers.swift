@@ -277,11 +277,13 @@ func connectTCP(host: String, port: UInt16,
         }
         let tcpOptions = NWProtocolTCP.Options()
         tcpOptions.noDelay = true
+        tcpOptions.disableAckStretching = true
         parameters = NWParameters(tls: options, tcp: tcpOptions)
     } else {
         parameters = .tcp
         if let tcpOptions = parameters.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
             tcpOptions.noDelay = true
+            tcpOptions.disableAckStretching = true
         }
     }
     if !isLoopbackHost(host) { parameters.requiredInterface = OutboundInterfaceBinding.current }
@@ -590,8 +592,8 @@ final class ConnectionBridge {
                     data, _, complete, error in done(data, complete, error)
                 }
             }, sendHandler: { data, complete, done in
-                client.send(content: data, contentContext: complete ? .finalMessage : .defaultMessage,
-                            isComplete: true, completion: .contentProcessed { done($0) })
+                client.send(content: data, contentContext: .defaultStream,
+                            isComplete: complete, completion: .contentProcessed { done($0) })
             }, cancelHandler: { client.cancel() })
         let nativeRemote: any HJByteStream
         if let stream = remote as? ObjCNetworkByteStream { nativeRemote = stream.native }

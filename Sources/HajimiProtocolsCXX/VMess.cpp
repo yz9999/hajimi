@@ -110,9 +110,11 @@ private:
     size_t offset_ = 0;
 };
 
-static Buffer bodyNonce(uint32_t counter,const Buffer &iv) {
-    if(counter>65535 || iv.size()<12)throw std::runtime_error("VMess nonce sequence exhausted");
-    Buffer nonce;nonce.reserve(12);append16(nonce,uint16_t(counter));nonce.insert(nonce.end(),iv.begin()+2,iv.begin()+12);return nonce;
+static void makeBodyNonce(uint32_t counter, const Buffer &iv, uint8_t nonce[12]) {
+    if (counter > 65535 || iv.size() < 12) throw std::runtime_error("VMess nonce sequence exhausted");
+    nonce[0] = uint8_t(counter >> 8);
+    nonce[1] = uint8_t(counter & 0xff);
+    std::memcpy(nonce + 2, iv.data() + 2, 10);
 }
 static Buffer vmessChaChaPolyKey(const Buffer &key16) {
     Buffer first = crypto::digest("MD5", key16);
@@ -252,8 +254,15 @@ class VMessStream final:public Stream,public std::enable_shared_from_this<VMessS
                 if(!error.empty()){self->failRead(error=="EOF"?"Truncated VMess body frame":error);return;}
                 try{
                     if (padLen > 0) sealed.resize(sealed.size() - padLen);
-                    auto nonce=bodyNonce(self->readCounter_,self->responseIV_);
-                    auto data=crypto::openSlice(self->bodyAead_,self->bodyRxKey_,nonce,sealed.data(),sealed.size());++self->readCounter_;
+                    uint8_t nonce[12];
+                    makeBodyNonce(self->readCounter_,self->responseIV_,nonce);
+                    Buffer data(sealed.size() - 16);
+                    if(!crypto::openInto(self->bodyAead_,self->bodyRxKey_.data(),self->bodyRxKey_.size(),
+                                         nonce,12,sealed.data(),sealed.size(),
+                                         data.empty()?nullptr:data.data())){
+                        throw std::runtime_error("AEAD authentication failed");
+                    }
+                    ++self->readCounter_;
                     if(data.empty()){self->eof_=true;self->finishRead({},true,{});}else self->deliver(std::move(data));
                 }catch(const std::exception &e){self->failRead(e.what());}
             });
@@ -261,7 +270,8 @@ class VMessStream final:public Stream,public std::enable_shared_from_this<VMessS
     }
 public:
     VMessStream(const Node &node,const Target &target,std::shared_ptr<Stream> source,std::shared_ptr<TransportFactory> factory=nullptr)
-        :source_(std::move(source)),factory_(std::move(factory)),reader_(std::make_shared<Reader>(source_)),writer_(std::make_shared<OrderedWriter>(source_)),
+        :source_(std::move(source)),factory_(std::move(factory)),reader_(std::make_shared<Reader>(source_)),
+         writer_(std::make_shared<OrderedWriter>(source_, maximumQueuedBytes, 128, (factory_ && !factory_->after) ? 0 : proto_stream::kMaxCoalescedWriteBytes)),
          udp_(target.udp),coalesceHeader_(!target.udp && factory_ && static_cast<bool>(factory_->after)) {
         std::string rawUuid = node.option("uuid", node.option("username"));
         if (rawUuid.find('=') != std::string::npos && !node.option("username").empty()) {
@@ -349,7 +359,9 @@ public:
         }
         if(bodyEncrypted_ && writeCounter_+chunks>65536){close();completion("VMess nonce sequence exhausted");return;}
         try{
-            Buffer output;output.reserve(headerBytes+data.size()+chunks*perChunkOverhead);
+            const size_t maxPadPerChunk = globalPadding_ ? 63 : 0;
+            Buffer output;
+            output.reserve(headerBytes + data.size() + chunks * (perChunkOverhead + maxPadPerChunk));
             if(!headerSent_){
                 headerSent_=true;
                 output.insert(output.end(),request_.begin(),request_.end());
@@ -377,12 +389,20 @@ public:
                     size_t padLen = globalPadding_ ? (txMask_.nextMask() % 64) : 0;
                     uint16_t wireLen = uint16_t(count + 16 + padLen);
                     if (chunkMasking_) wireLen ^= txMask_.nextMask();
-                    Buffer sealed=crypto::sealSlice(bodyAead_,bodyTxKey_,bodyNonce(writeCounter_,requestIV_),data.data()+offset,count);
-                    append16(output,wireLen);
-                    output.insert(output.end(),sealed.begin(),sealed.end());
+                    uint8_t nonce[12];
+                    makeBodyNonce(writeCounter_,requestIV_,nonce);
+                    size_t basePos = output.size();
+                    output.resize(basePos + 2 + count + 16 + padLen);
+                    output[basePos] = uint8_t(wireLen >> 8);
+                    output[basePos + 1] = uint8_t(wireLen & 0xff);
+                    if(!crypto::sealInto(bodyAead_,bodyTxKey_.data(),bodyTxKey_.size(),
+                                         nonce,12,data.data()+offset,count,
+                                         output.data()+basePos+2)){
+                        throw std::runtime_error("AEAD processing failed");
+                    }
                     if (padLen > 0) {
                         auto pad = crypto::randomBytes(padLen);
-                        output.insert(output.end(), pad.begin(), pad.end());
+                        std::memcpy(output.data() + basePos + 2 + count + 16, pad.data(), padLen);
                     }
                     ++writeCounter_;offset+=count;
                 }
@@ -406,7 +426,7 @@ public:
         if(!writer_->canAccept(headerBytes+eofBytes)){completion("VMess write queue limit exceeded");return;}
         writeEnded_=true;
         try{
-            Buffer frame;frame.reserve(headerBytes+eofBytes);
+            Buffer frame;frame.reserve(headerBytes+eofBytes+(globalPadding_?63:0));
             if(!headerSent_){
                 headerSent_=true;
                 frame.insert(frame.end(),request_.begin(),request_.end());
@@ -415,13 +435,22 @@ public:
             if(chunkStream_){
                 size_t padLen = globalPadding_ ? (txMask_.nextMask() % 64) : 0;
                 if(bodyEncrypted_){
-                    auto sealed=crypto::seal(bodyAead_,bodyTxKey_,bodyNonce(writeCounter_,requestIV_),{});++writeCounter_;
-                    uint16_t wireLen = uint16_t(sealed.size() + padLen);
+                    uint8_t nonce[12];
+                    makeBodyNonce(writeCounter_,requestIV_,nonce);
+                    ++writeCounter_;
+                    uint16_t wireLen = uint16_t(16 + padLen);
                     if (chunkMasking_) wireLen ^= txMask_.nextMask();
-                    append16(frame,wireLen);frame.insert(frame.end(),sealed.begin(),sealed.end());
+                    size_t basePos = frame.size();
+                    frame.resize(basePos + 2 + 16 + padLen);
+                    frame[basePos] = uint8_t(wireLen >> 8);
+                    frame[basePos + 1] = uint8_t(wireLen & 0xff);
+                    if(!crypto::sealInto(bodyAead_,bodyTxKey_.data(),bodyTxKey_.size(),
+                                         nonce,12,nullptr,0,frame.data()+basePos+2)){
+                        throw std::runtime_error("AEAD processing failed");
+                    }
                     if (padLen > 0) {
                         auto pad = crypto::randomBytes(padLen);
-                        frame.insert(frame.end(), pad.begin(), pad.end());
+                        std::memcpy(frame.data() + basePos + 18, pad.data(), padLen);
                     }
                 }else{
                     uint16_t wireLen = uint16_t(padLen);

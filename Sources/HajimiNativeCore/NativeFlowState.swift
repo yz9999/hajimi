@@ -10,6 +10,7 @@ final class NativeByteQueue {
     deinit { hajimi_byte_queue_destroy(handle) }
     var isValid: Bool { handle != nil }
     var count: Int { hajimi_byte_queue_size(handle) }
+    var isEmpty: Bool { count == 0 }
     var residentCapacity: Int { hajimi_byte_queue_capacity(handle) }
     /// Growth reserves the entire new buffer before freeing the old one.
     /// Advertise only storage that can fit this shared-budget snapshot.
@@ -41,4 +42,67 @@ final class NativeByteQueue {
     }
     func consume(_ count: Int) { _ = hajimi_byte_queue_consume(handle, count) }
     func clear() { hajimi_byte_queue_clear(handle) }
+    /// Releases idle ring-buffer backing storage back to the global 32 MiB budget when empty.
+    func shrinkToFit() { hajimi_byte_queue_shrink_to_fit(handle) }
+}
+
+/// Bridges C++ out-of-order TCP reassembly intervals into RFC 2018 SACK option blocks.
+enum NativeReassemblySACK {
+    static func blocks(from receiveState: OpaquePointer?, maximum: Int = 4) -> [SACKBlock] {
+        guard let receiveState, maximum > 0,
+              hajimi_tcp_reassembly_buffered(receiveState) > 0 else {
+            return []
+        }
+        let capped = min(maximum, 4)
+        var ranges = (hajimi_sack_range(), hajimi_sack_range(),
+                      hajimi_sack_range(), hajimi_sack_range())
+        return withUnsafeMutablePointer(to: &ranges) { tuplePtr in
+            tuplePtr.withMemoryRebound(to: hajimi_sack_range.self, capacity: 4) { base in
+                let count = hajimi_tcp_reassembly_sack_blocks(receiveState, base, capped)
+                guard count > 0 else { return [] }
+                var result: [SACKBlock] = []
+                result.reserveCapacity(count)
+                for index in 0..<count {
+                    result.append(SACKBlock(start: base[index].start, end: base[index].end))
+                }
+                return result
+            }
+        }
+    }
+}
+
+/// Swift value wrapper around C++ BBRv3 / CoDel (`hajimi_bdp_estimator`) bandwidth-delay
+/// product and standing-queue window bounding.
+struct NativeBDPEstimator {
+    private var native: hajimi_bdp_estimator
+
+    init(windowSeconds: TimeInterval = 10.0) {
+        var value = hajimi_bdp_estimator()
+        hajimi_bdp_init(&value, windowSeconds)
+        self.native = value
+    }
+
+    var isInitialized: Bool { native.initialized != 0 }
+    var standingQueueRounds: UInt32 { native.standing_queue_rounds }
+    var lossEvents: UInt32 { native.loss_events }
+
+    var maxBandwidth: Double {
+        var value = native
+        return hajimi_bdp_max_bandwidth(&value)
+    }
+
+    mutating func observe(deliveredBytes: Int, rtt: TimeInterval, timestamp: TimeInterval) {
+        guard deliveredBytes > 0 else { return }
+        hajimi_bdp_observe(&native, deliveredBytes, rtt, timestamp)
+    }
+
+    mutating func observeLoss(inflightBytes: Int, lostBytes: Int, deliveredBytes: Int) {
+        guard inflightBytes > 0 else { return }
+        hajimi_bdp_observe_loss(&native, inflightBytes, max(0, lostBytes), max(0, deliveredBytes))
+    }
+
+    func recommendedWindow(mss: Int, minWindow: Int, maxWindow: Int) -> Int {
+        var value = native
+        return hajimi_bdp_recommended_window(&value, max(536, mss), max(0, minWindow), max(0, maxWindow))
+    }
 }

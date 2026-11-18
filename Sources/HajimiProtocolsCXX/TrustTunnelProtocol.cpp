@@ -137,7 +137,7 @@ class HTTP3ConnectStream final : public Stream, public std::enable_shared_from_t
 public:
     HTTP3ConnectStream(std::shared_ptr<quic::Connection> connection, std::shared_ptr<Stream> stream, std::shared_ptr<Reader> reader)
         : connection_(std::move(connection)), stream_(std::move(stream)), reader_(std::move(reader)),
-          writer_(std::make_shared<OrderedWriter>(stream_)) {}
+          writer_(std::make_shared<OrderedWriter>(stream_, maximumQueuedBytes, 128, proto_stream::kMaxCoalescedWriteBytes)) {}
     ~HTTP3ConnectStream() override { close(); }
 
     void write(Buffer data, WriteCallback completion) override {

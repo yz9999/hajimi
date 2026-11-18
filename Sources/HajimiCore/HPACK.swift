@@ -108,23 +108,36 @@ public enum HPACK {
     /// Encodes with `prefixBits` available in the first octet, whose high bits
     /// the caller has already set.
     static func encodeInteger(_ value: Int, prefixBits: Int, firstByte: UInt8) -> Data {
+        var out = Data(capacity: 6)
+        appendEncodedInteger(value, prefixBits: prefixBits, firstByte: firstByte, to: &out)
+        return out
+    }
+
+    @inline(__always)
+    static func appendEncodedInteger(_ value: Int, prefixBits: Int, firstByte: UInt8, to out: inout Data) {
         let limit = (1 << prefixBits) - 1
-        var out = Data()
         if value < limit {
             out.append(firstByte | UInt8(value))
-            return out
+            return
         }
         out.append(firstByte | UInt8(limit))
         var remainder = value - limit
         while remainder >= 128 {
-            out.append(UInt8(remainder % 128 + 128))
-            remainder /= 128
+            out.append(UInt8(truncatingIfNeeded: remainder & 0x7F) | 0x80)
+            remainder >>= 7
         }
         out.append(UInt8(remainder))
-        return out
     }
 
     static func decodeInteger(_ bytes: [UInt8], _ index: inout Int,
+                              prefixBits: Int) throws -> Int {
+        try bytes.withUnsafeBytes { raw in
+            try decodeInteger(raw, &index, prefixBits: prefixBits)
+        }
+    }
+
+    @inline(__always)
+    static func decodeInteger(_ bytes: UnsafeRawBufferPointer, _ index: inout Int,
                               prefixBits: Int) throws -> Int {
         guard index < bytes.count else { throw DecodeError.truncated }
         let limit = (1 << prefixBits) - 1
@@ -149,10 +162,18 @@ public enum HPACK {
     // MARK: Dynamic table (RFC 7541 §2.3.2)
 
     /// Entries are evicted from the end as the table exceeds its size limit.
-    /// Both peers must apply the same rule or every index after an eviction
-    /// refers to a different header on each side.
+    /// Backed by a power-of-two ring buffer so insertion at index 0 and eviction
+    /// from the tail are both O(1) without shifting elements.
     public final class DynamicTable {
-        private var entries: [(name: String, value: String, size: Int)] = []
+        private struct TableEntry {
+            var name: String
+            var value: String
+            var size: Int
+        }
+
+        private var ring: ContiguousArray<TableEntry?>
+        private var head = 0
+        private(set) var count = 0
         private(set) var size = 0
         public private(set) var capacity: Int
         public private(set) var maximumCapacity: Int
@@ -161,13 +182,13 @@ public enum HPACK {
             let clamped = max(0, capacity)
             self.capacity = clamped
             self.maximumCapacity = max(clamped, maximumCapacity ?? 65_536)
+            self.ring = ContiguousArray<TableEntry?>(repeating: nil, count: 16)
         }
 
-        var count: Int { entries.count }
-
         func entry(at index: Int) -> (name: String, value: String)? {
-            guard index >= 0, index < entries.count else { return nil }
-            let item = entries[index]
+            guard index >= 0, index < count else { return nil }
+            let slot = (head + index) & (ring.count - 1)
+            guard let item = ring[slot] else { return nil }
             return (item.name, item.value)
         }
 
@@ -178,13 +199,20 @@ public enum HPACK {
             // RFC 7541 §4.4: an entry larger than capacity empties the table immediately
             // without allocating or shifting existing elements.
             guard cost <= capacity else {
-                entries.removeAll(keepingCapacity: true)
-                size = 0
+                clearAll()
                 return
             }
-            entries.insert((name, value, cost), at: 0)
+            let targetLimit = capacity - cost
+            while size > targetLimit, count > 0 {
+                popOldest()
+            }
+            if count == ring.count {
+                growRing()
+            }
+            head = (head - 1) & (ring.count - 1)
+            ring[head] = TableEntry(name: name, value: value, size: cost)
+            count += 1
             size += cost
-            evict()
         }
 
         func setCapacity(_ newCapacity: Int) {
@@ -193,12 +221,82 @@ public enum HPACK {
         }
 
         private func evict() {
-            while size > capacity, let last = entries.last {
-                size -= last.size
-                entries.removeLast()
+            while size > capacity, count > 0 {
+                popOldest()
+            }
+            if count == 0 {
+                head = 0
+                size = 0
             }
         }
+
+        @inline(__always)
+        private func popOldest() {
+            let tailSlot = (head + count - 1) & (ring.count - 1)
+            if let removed = ring[tailSlot] {
+                size -= removed.size
+                ring[tailSlot] = nil
+            }
+            count -= 1
+            if count == 0 {
+                head = 0
+                size = 0
+            }
+        }
+
+        private func clearAll() {
+            if count > 0 {
+                let mask = ring.count - 1
+                for i in 0..<count {
+                    ring[(head + i) & mask] = nil
+                }
+                count = 0
+                head = 0
+                size = 0
+            }
+        }
+
+        private func growRing() {
+            let newCount = ring.count << 1
+            var expanded = ContiguousArray<TableEntry?>(repeating: nil, count: newCount)
+            let mask = ring.count - 1
+            for i in 0..<count {
+                expanded[i] = ring[(head + i) & mask]
+            }
+            ring = expanded
+            head = 0
+        }
     }
+
+    // MARK: Static table O(1) lookup maps (RFC 7541 Appendix A)
+
+    private struct StaticPairKey: Hashable {
+        let name: String
+        let value: String
+    }
+
+    private static let staticExactMap: [StaticPairKey: Int] = {
+        var map: [StaticPairKey: Int] = [:]
+        map.reserveCapacity(hpackStaticTable.count)
+        for (offset, entry) in hpackStaticTable.enumerated() {
+            let key = StaticPairKey(name: entry.name, value: entry.value)
+            if map[key] == nil {
+                map[key] = offset + 1
+            }
+        }
+        return map
+    }()
+
+    private static let staticNameMap: [String: Int] = {
+        var map: [String: Int] = [:]
+        map.reserveCapacity(hpackStaticTable.count)
+        for (offset, entry) in hpackStaticTable.enumerated() {
+            if map[entry.name] == nil {
+                map[entry.name] = offset + 1
+            }
+        }
+        return map
+    }()
 
     // MARK: Encoding
 
@@ -209,51 +307,53 @@ public enum HPACK {
     /// bytes saved by dynamic indexing are not worth a failure mode where a
     /// single mismatch corrupts every subsequent request on the connection.
     public static func encode(_ headers: [HeaderField], huffman: Bool = true) -> Data {
-        var out = Data()
+        var out = Data(capacity: headers.count * 24)
         for header in headers {
             let name = header.name.lowercased()
             if let index = staticIndex(name: name, value: header.value) {
-                out.append(contentsOf: encodeInteger(index, prefixBits: 7, firstByte: 0x80))
+                appendEncodedInteger(index, prefixBits: 7, firstByte: 0x80, to: &out)
                 continue
             }
             if let index = staticIndex(name: name, value: nil) {
                 // Literal without indexing, name taken from the static table.
-                out.append(contentsOf: encodeInteger(index, prefixBits: 4, firstByte: 0x00))
+                appendEncodedInteger(index, prefixBits: 4, firstByte: 0x00, to: &out)
             } else {
                 out.append(0x00)
-                out.append(encodeString(name, huffman: huffman))
+                appendEncodedString(name, huffman: huffman, to: &out)
             }
-            out.append(encodeString(header.value, huffman: huffman))
+            appendEncodedString(header.value, huffman: huffman, to: &out)
         }
         return out
     }
 
+    @inline(__always)
     private static func staticIndex(name: String, value: String?) -> Int? {
-        for (offset, entry) in hpackStaticTable.enumerated() {
-            guard entry.name == name else { continue }
-            if let value {
-                if entry.value == value { return offset + 1 }
-            } else {
-                return offset + 1
-            }
+        if let value {
+            return staticExactMap[StaticPairKey(name: name, value: value)]
         }
-        return nil
+        return staticNameMap[name]
     }
 
     static func encodeString(_ value: String, huffman: Bool) -> Data {
-        let raw = Data(value.utf8)
-        if huffman {
-            let encoded = Huffman.encode(raw)
-            // Only worth it when it actually shrinks the field.
-            if encoded.count < raw.count {
-                var out = encodeInteger(encoded.count, prefixBits: 7, firstByte: 0x80)
+        var out = Data(capacity: value.utf8.count + 4)
+        appendEncodedString(value, huffman: huffman, to: &out)
+        return out
+    }
+
+    private static func appendEncodedString(_ value: String, huffman: Bool, to out: inout Data) {
+        let rawCount = value.utf8.count
+        if huffman, rawCount > 0 {
+            let huffLen = Huffman.encodedByteLength(value.utf8)
+            // Only use Huffman when strictly smaller than raw UTF-8/ASCII length.
+            if huffLen < rawCount {
+                let encoded = Huffman.encode(value)
+                appendEncodedInteger(encoded.count, prefixBits: 7, firstByte: 0x80, to: &out)
                 out.append(encoded)
-                return out
+                return
             }
         }
-        var out = encodeInteger(raw.count, prefixBits: 7, firstByte: 0x00)
-        out.append(raw)
-        return out
+        appendEncodedInteger(rawCount, prefixBits: 7, firstByte: 0x00, to: &out)
+        out.append(contentsOf: value.utf8)
     }
 
     // MARK: Decoding
@@ -262,58 +362,59 @@ public enum HPACK {
     private static let maximumDecodedBytes = 131_072
 
     public static func decode(_ data: Data, table: DynamicTable) throws -> [HeaderField] {
-        let bytes = [UInt8](data)
-        var index = 0
-        var decodedBytes = 0
-        var headers: [HeaderField] = []
-        while index < bytes.count {
-            guard headers.count < maximumHeaderFields else {
-                throw DecodeError.integerOverflow
-            }
-            let byte = bytes[index]
-            if byte & 0x80 != 0 {
-                // Indexed header field.
-                let position = try decodeInteger(bytes, &index, prefixBits: 7)
-                guard position > 0, let entry = lookup(position, table: table) else {
-                    throw DecodeError.invalidIndex(position)
+        try data.withUnsafeBytes { bytes in
+            var index = 0
+            var decodedBytes = 0
+            var headers: [HeaderField] = []
+            while index < bytes.count {
+                guard headers.count < maximumHeaderFields else {
+                    throw DecodeError.integerOverflow
                 }
-                decodedBytes += entry.name.utf8.count + entry.value.utf8.count
+                let byte = bytes[index]
+                if byte & 0x80 != 0 {
+                    // Indexed header field.
+                    let position = try decodeInteger(bytes, &index, prefixBits: 7)
+                    guard position > 0, let entry = lookup(position, table: table) else {
+                        throw DecodeError.invalidIndex(position)
+                    }
+                    decodedBytes += entry.name.utf8.count + entry.value.utf8.count
+                    guard decodedBytes <= maximumDecodedBytes else {
+                        throw DecodeError.integerOverflow
+                    }
+                    headers.append(HeaderField(name: entry.name, value: entry.value))
+                    continue
+                }
+                if byte & 0xE0 == 0x20 {
+                    // Dynamic table size update (RFC 7541 §4.2: must not exceed protocol max).
+                    let size = try decodeInteger(bytes, &index, prefixBits: 5)
+                    guard size <= table.maximumCapacity else {
+                        throw DecodeError.invalidIndex(size)
+                    }
+                    table.setCapacity(size)
+                    continue
+                }
+                let indexed = byte & 0x40 != 0
+                let prefix = indexed ? 6 : 4
+                let nameIndex = try decodeInteger(bytes, &index, prefixBits: prefix)
+                let name: String
+                if nameIndex == 0 {
+                    name = try decodeString(bytes, &index)
+                } else {
+                    guard let entry = lookup(nameIndex, table: table) else {
+                        throw DecodeError.invalidIndex(nameIndex)
+                    }
+                    name = entry.name
+                }
+                let value = try decodeString(bytes, &index)
+                decodedBytes += name.utf8.count + value.utf8.count
                 guard decodedBytes <= maximumDecodedBytes else {
                     throw DecodeError.integerOverflow
                 }
-                headers.append(HeaderField(name: entry.name, value: entry.value))
-                continue
+                if indexed { table.add(name: name, value: value) }
+                headers.append(HeaderField(name: name, value: value))
             }
-            if byte & 0xE0 == 0x20 {
-                // Dynamic table size update (RFC 7541 §4.2: must not exceed protocol max).
-                let size = try decodeInteger(bytes, &index, prefixBits: 5)
-                guard size <= table.maximumCapacity else {
-                    throw DecodeError.invalidIndex(size)
-                }
-                table.setCapacity(size)
-                continue
-            }
-            let indexed = byte & 0x40 != 0
-            let prefix = indexed ? 6 : 4
-            let nameIndex = try decodeInteger(bytes, &index, prefixBits: prefix)
-            let name: String
-            if nameIndex == 0 {
-                name = try decodeString(bytes, &index)
-            } else {
-                guard let entry = lookup(nameIndex, table: table) else {
-                    throw DecodeError.invalidIndex(nameIndex)
-                }
-                name = entry.name
-            }
-            let value = try decodeString(bytes, &index)
-            decodedBytes += name.utf8.count + value.utf8.count
-            guard decodedBytes <= maximumDecodedBytes else {
-                throw DecodeError.integerOverflow
-            }
-            if indexed { table.add(name: name, value: value) }
-            headers.append(HeaderField(name: name, value: value))
+            return headers
         }
-        return headers
     }
 
     private static func lookup(_ index: Int, table: DynamicTable) -> (name: String, value: String)? {
@@ -325,14 +426,26 @@ public enum HPACK {
     }
 
     static func decodeString(_ bytes: [UInt8], _ index: inout Int) throws -> String {
+        try bytes.withUnsafeBytes { raw in
+            try decodeString(raw, &index)
+        }
+    }
+
+    static func decodeString(_ bytes: UnsafeRawBufferPointer, _ index: inout Int) throws -> String {
         guard index < bytes.count else { throw DecodeError.truncated }
         let huffman = bytes[index] & 0x80 != 0
         let length = try decodeInteger(bytes, &index, prefixBits: 7)
-        guard index + length <= bytes.count else { throw DecodeError.truncated }
-        let raw = Data(bytes[index..<(index + length)])
+        guard length >= 0, index <= bytes.count - length else { throw DecodeError.truncated }
+        let slice = UnsafeRawBufferPointer(rebasing: bytes[index..<(index + length)])
         index += length
-        let decoded = huffman ? try Huffman.decode(raw) : raw
-        guard let text = String(data: decoded, encoding: .utf8) else {
+        if huffman {
+            let decoded = try Huffman.decode(slice)
+            guard let text = String(data: decoded, encoding: .utf8) else {
+                throw DecodeError.invalidHuffman
+            }
+            return text
+        }
+        guard let text = String(bytes: slice, encoding: .utf8) else {
             throw DecodeError.invalidHuffman
         }
         return text

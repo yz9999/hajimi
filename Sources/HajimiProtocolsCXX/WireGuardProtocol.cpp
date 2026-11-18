@@ -382,7 +382,6 @@ private:
     std::unordered_map<std::string, std::pair<uint32_t, uint64_t>> dnsCache_;
     std::unordered_map<std::string, std::pair<std::array<uint8_t, 16>, uint64_t>> dnsCacheV6_;
     uint16_t nextPort_ = 32768;
-    uint16_t dnsTxid_ = 0x3100;
     unsigned retryCount_ = 0;
     bool connecting_ = false;
     bool established_ = false;
@@ -780,6 +779,11 @@ public:
     ~WireGuardTCPStream() override {
         closed_ = true;
         if (tunnel_ && localPort_) tunnel_->unregisterTCP(localPort_);
+        auto deferred = std::move(deferredWriteCompletions_);
+        deferredWriteCompletions_.clear();
+        for (auto &cb : deferred) {
+            if (cb) cb(terminal_.empty() ? Error("WireGuard TCP stream closed") : terminal_);
+        }
     }
 
     void start() {
@@ -812,26 +816,30 @@ public:
     void write(Buffer data, WriteCallback completion) override {
         auto self = shared_from_this();
         factory_->post([self, data = std::move(data), completion = std::move(completion)]() mutable {
-            if (self->closed_ || self->tcpState_ != TCPState::Established) {
+            if (self->closed_ || self->tcpState_ != TCPState::Established || self->finQueued_) {
                 completion(self->terminal_.empty() ? "WireGuard TCP stream closed" : self->terminal_);
                 return;
             }
-            if (data.size() > maximumQueuedBytes - self->queuedWriteBytes_) {
+            if (data.empty()) { completion({}); return; }
+            const size_t bufferedNow = self->unsentBytes_ + size_t(self->inFlightBytes());
+            if (bufferedNow > kMaxStreamBufferBytes || data.size() > kMaxStreamBufferBytes - bufferedNow) {
                 completion("WireGuard TCP write queue exceeded");
                 return;
             }
-            if (data.empty()) { completion({}); return; }
-            self->queuedWriteBytes_ += data.size();
             size_t off = 0;
             size_t mss = std::min<size_t>(1240, self->peerMSS_);
             while (off < data.size()) {
                 size_t chunk = std::min<size_t>(mss, data.size() - off);
                 self->unsent_.emplace_back(data.begin() + off, data.begin() + off + chunk);
+                self->unsentBytes_ += chunk;
                 off += chunk;
             }
             self->flushSendQueue();
-            self->queuedWriteBytes_ -= data.size();
-            completion({});
+            if (self->unsentBytes_ + size_t(self->inFlightBytes()) >= kWriteHighWaterBytes) {
+                self->deferredWriteCompletions_.push_back(std::move(completion));
+            } else {
+                completion({});
+            }
         });
     }
 
@@ -872,12 +880,17 @@ public:
     }
 
 private:
+    static constexpr size_t kMaxStreamBufferBytes = maximumQueuedBytes;
+    static constexpr size_t kWriteHighWaterBytes = 256 * 1024;
+    static constexpr size_t kWriteLowWaterBytes = 128 * 1024;
+
     enum class TCPState { WGHandshake, DNSResolve, SynSent, Established, Closed };
     struct UnackedSeg {
         uint32_t seq;
         Buffer data;
         uint32_t retries = 0;
         bool sacked = false;
+        bool retransmitted = false;
         std::chrono::steady_clock::time_point txTime;
     };
 
@@ -906,17 +919,23 @@ private:
     uint32_t cwnd_ = 10 * 1240;
     uint32_t ssthresh_ = 64 * 1024;
     uint32_t dupAckCount_ = 0;
+    bool inFastRecovery_ = false;
+    uint32_t recoverSeq_ = 0;
     double srtt_ = 0.0;
     double rttvar_ = 0.0;
     double rto_ = 0.5;
     std::chrono::steady_clock::time_point synTxTime_{};
     std::deque<Buffer> unsent_;
+    size_t unsentBytes_ = 0;
+    std::deque<WriteCallback> deferredWriteCompletions_;
     std::deque<UnackedSeg> unacked_;
     std::map<uint32_t, Buffer> outOfOrder_;
     proto_common::CursorBuffer recvBuf_;
-    size_t queuedWriteBytes_ = 0;
     size_t readMax_ = 0;
     ReadCallback pendingRead_;
+    uint32_t unackedRxSegs_ = 0;
+    bool ackDeferred_ = false;
+    bool periodicTickScheduled_ = false;
     bool retransmitScheduled_ = false;
     bool finQueued_ = false;
     bool finSent_ = false;
@@ -970,19 +989,105 @@ private:
         return uint32_t(sndNxt_ - sndUna_);
     }
 
+    bool computeSackMetrics(uint32_t &maxSackedSeqOut, uint32_t &sackedAboveFrontOut, uint32_t &pipeOut) const {
+        bool hasSacked = false;
+        uint32_t maxSacked = sndUna_;
+        uint32_t sackedAboveFront = 0;
+        for (size_t i = 0; i < unacked_.size(); ++i) {
+            const auto &seg = unacked_[i];
+            if (seg.sacked) {
+                uint32_t endSeq = seg.seq + uint32_t(seg.data.size());
+                if (!hasSacked || int32_t(endSeq - maxSacked) > 0) {
+                    maxSacked = endSeq;
+                }
+                hasSacked = true;
+                if (i > 0) ++sackedAboveFront;
+            }
+        }
+        uint32_t pipe = 0;
+        for (const auto &seg : unacked_) {
+            if (seg.sacked) continue;
+            uint32_t endSeq = seg.seq + uint32_t(seg.data.size());
+            if (hasSacked && int32_t(maxSacked - endSeq) > 0) {
+                if (seg.retransmitted) pipe += uint32_t(seg.data.size());
+            } else {
+                pipe += uint32_t(seg.data.size());
+            }
+        }
+        maxSackedSeqOut = maxSacked;
+        sackedAboveFrontOut = sackedAboveFront;
+        pipeOut = pipe;
+        return hasSacked;
+    }
+
+    // RFC 6675 §5: Retransmit un-SACKed holes strictly below maxSackedSeq bounded by cwnd_
+    void retransmitSackHoles() {
+        uint32_t maxSackedSeq = sndUna_, sackedAbove = 0, pipe = 0;
+        if (!computeSackMetrics(maxSackedSeq, sackedAbove, pipe) || unacked_.empty()) return;
+        uint32_t budget = std::max<uint32_t>(peerMSS_, std::min(cwnd_, peerRwnd_));
+        bool sentAny = false;
+        auto now = std::chrono::steady_clock::now();
+        for (auto &seg : unacked_) {
+            uint32_t endSeq = seg.seq + uint32_t(seg.data.size());
+            if (int32_t(maxSackedSeq - endSeq) <= 0) break;
+            if (seg.sacked || seg.retransmitted) continue;
+            uint32_t sz = uint32_t(seg.data.size());
+            if (sentAny && pipe + sz > budget) break;
+            seg.retransmitted = true;
+            ++seg.retries;
+            seg.txTime = now;
+            pipe += sz;
+            sentAny = true;
+            sendTCPSegment(seg.seq, rcvNxt_, 0x18 /* PSH|ACK */, seg.data, false);
+        }
+    }
+
+    void drainDeferredWritesIfReady() {
+        if (closed_ || deferredWriteCompletions_.empty()) return;
+        if (unsentBytes_ + size_t(inFlightBytes()) < kWriteLowWaterBytes) {
+            auto ready = std::move(deferredWriteCompletions_);
+            deferredWriteCompletions_.clear();
+            for (auto &cb : ready) {
+                if (cb) cb({});
+            }
+        }
+    }
+
+    void schedulePeriodicTick() {
+        if (closed_ || periodicTickScheduled_ || !factory_ || !factory_->after) return;
+        periodicTickScheduled_ = true;
+        std::weak_ptr<WireGuardTCPStream> weak = shared_from_this();
+        // RFC 5681 §4.2 delayed-ACK bound <= 25 ms (20 ms tick)
+        factory_->after(0.020, [weak] {
+            auto self = weak.lock();
+            if (!self) return;
+            self->periodicTickScheduled_ = false;
+            if (self->closed_ || self->tcpState_ != TCPState::Established) return;
+            if (self->ackDeferred_) {
+                self->sendTCPSegment(self->sndNxt_, self->rcvNxt_, 0x10 /* ACK */, {}, false);
+            }
+        });
+    }
+
     void flushSendQueue() {
         if (closed_ || tcpState_ != TCPState::Established) return;
         bool wasEmpty = unacked_.empty();
         uint32_t sendWnd = std::max<uint32_t>(peerMSS_, std::min(cwnd_, peerRwnd_));
+        uint32_t maxSackedSeq = sndUna_, sackedAbove = 0, sackPipe = 0;
+        bool useSackPipe = inFastRecovery_ && computeSackMetrics(maxSackedSeq, sackedAbove, sackPipe);
         while (!unsent_.empty()) {
             const auto &seg = unsent_.front();
-            if (!unacked_.empty() && inFlightBytes() + uint32_t(seg.size()) > sendWnd) {
+            uint32_t currentFlight = useSackPipe ? sackPipe : inFlightBytes();
+            if (!unacked_.empty() && currentFlight + uint32_t(seg.size()) > sendWnd) {
                 break;
             }
             uint32_t seq = sndNxt_;
-            sndNxt_ += uint32_t(seg.size());
-            unacked_.push_back({seq, seg, 0, false, std::chrono::steady_clock::now()});
+            size_t segLen = seg.size();
+            sndNxt_ += uint32_t(segLen);
+            if (useSackPipe) sackPipe += uint32_t(segLen);
+            unacked_.push_back({seq, seg, 0, false, false, std::chrono::steady_clock::now()});
             sendTCPSegment(seq, rcvNxt_, 0x18 /* PSH|ACK */, seg, false);
+            unsentBytes_ = unsentBytes_ >= segLen ? (unsentBytes_ - segLen) : 0;
             unsent_.pop_front();
         }
         if (finQueued_ && !finSent_ && unsent_.empty()) {
@@ -1070,17 +1175,26 @@ private:
                     return;
                 }
                 // RFC 6298 / RFC 5681 exponential backoff + congestion window collapse on timeout
+                self->inFastRecovery_ = false;
+                for (auto &seg : self->unacked_) seg.retransmitted = false;
+                first.retransmitted = true;
                 self->rto_ = std::min(60.0, self->rto_ * 2.0);
                 self->ssthresh_ = std::max<uint32_t>(self->cwnd_ / 2, 2U * self->peerMSS_);
                 self->cwnd_ = self->peerMSS_;
                 self->sendTCPSegment(first.seq, self->rcvNxt_, 0x18 /* PSH|ACK */, first.data, false);
                 self->scheduleRetransmit();
+            } else if (self->tcpState_ == TCPState::Established && self->ackDeferred_) {
+                self->sendTCPSegment(self->sndNxt_, self->rcvNxt_, 0x10 /* ACK */, {}, false);
             }
         });
     }
 
     void sendTCPSegment(uint32_t seq, uint32_t ack, uint8_t flags, const Buffer &payload, bool synOptions) {
         if (closed_ || !tunnel_) return;
+        if (!synOptions && (flags & 0x10) && ack == rcvNxt_) {
+            ackDeferred_ = false;
+            unackedRxSegs_ = 0;
+        }
         uint16_t wnd = synOptions ? 65535 : advertisedWindow();
         std::vector<TCPSackBlock> sacks = (!synOptions && (flags & 0x10)) ? buildSackBlocks() : std::vector<TCPSackBlock>{};
         Buffer ipPkt = isIPv6Target_
@@ -1181,7 +1295,7 @@ private:
                 while (!unacked_.empty()) {
                     const auto &front = unacked_.front();
                     if (int32_t(ack - (front.seq + uint32_t(front.data.size()))) >= 0) {
-                        if (front.retries == 0 && front.txTime.time_since_epoch().count() > 0) {
+                        if (front.retries == 0 && !front.retransmitted && front.txTime.time_since_epoch().count() > 0) {
                             updateRTT(std::chrono::duration<double>(now - front.txTime).count());
                         }
                         unacked_.pop_front();
@@ -1189,31 +1303,81 @@ private:
                         break;
                     }
                 }
-                // NewReno congestion window update
-                if (cwnd_ < ssthresh_) {
-                    cwnd_ += std::min<uint32_t>(ackedBytes, peerMSS_);
+                if (inFastRecovery_) {
+                    if (int32_t(ack - recoverSeq_) >= 0) {
+                        // Full ACK covering RecoveryPoint (RFC 6675 §5.2)
+                        inFastRecovery_ = false;
+                        cwnd_ = std::max<uint32_t>(ssthresh_, peerMSS_);
+                    } else if (!unacked_.empty()) {
+                        // Partial ACK during Fast Recovery (RFC 6675 §5.1 / NewReno)
+                        uint32_t maxSackedSeq = sndUna_, sackedAbove = 0, pipe = 0;
+                        if (computeSackMetrics(maxSackedSeq, sackedAbove, pipe)) {
+                            retransmitSackHoles();
+                        } else if (!unacked_.front().retransmitted) {
+                            auto &first = unacked_.front();
+                            first.retransmitted = true;
+                            ++first.retries;
+                            first.txTime = now;
+                            sendTCPSegment(first.seq, rcvNxt_, 0x18 /* PSH|ACK */, first.data, false);
+                        }
+                    }
                 } else {
-                    cwnd_ += std::max<uint32_t>(1U, (uint32_t(peerMSS_) * uint32_t(peerMSS_)) / cwnd_);
+                    // RFC 5681 Slow Start / Congestion Avoidance
+                    if (cwnd_ < ssthresh_) {
+                        cwnd_ += std::min<uint32_t>(ackedBytes, peerMSS_);
+                    } else {
+                        cwnd_ += std::max<uint32_t>(1U, (uint32_t(peerMSS_) * uint32_t(peerMSS_)) / cwnd_);
+                    }
+                    uint32_t maxSackedSeq = sndUna_, sackedAbove = 0, pipe = 0;
+                    if (!unacked_.empty() && computeSackMetrics(maxSackedSeq, sackedAbove, pipe) && sackedAbove >= 3) {
+                        inFastRecovery_ = true;
+                        recoverSeq_ = sndNxt_;
+                        ssthresh_ = std::max<uint32_t>(cwnd_ / 2, 2U * peerMSS_);
+                        cwnd_ = ssthresh_;
+                        retransmitSackHoles();
+                    }
                 }
                 flushSendQueue();
+                drainDeferredWritesIfReady();
             } else if (ack == sndUna_ && payloadLen == 0 && !(flags & 0x01) && !unacked_.empty()) {
-                // RFC 5681 3x duplicate-ACK Fast Retransmit & Fast Recovery
-                if (++dupAckCount_ == 3) {
+                // RFC 5681 / RFC 6675 duplicate-ACK & SACK loss recovery
+                ++dupAckCount_;
+                uint32_t maxSackedSeq = sndUna_, sackedAbove = 0, pipe = 0;
+                bool hasSacked = computeSackMetrics(maxSackedSeq, sackedAbove, pipe);
+                if (!inFastRecovery_ && (dupAckCount_ >= 3 || sackedAbove >= 3)) {
+                    inFastRecovery_ = true;
+                    recoverSeq_ = sndNxt_;
                     ssthresh_ = std::max<uint32_t>(cwnd_ / 2, 2U * peerMSS_);
-                    cwnd_ = ssthresh_ + 3U * peerMSS_;
-                    auto &first = unacked_.front();
-                    ++first.retries;
-                    sendTCPSegment(first.seq, rcvNxt_, 0x18 /* PSH|ACK */, first.data, false);
-                } else if (dupAckCount_ > 3) {
-                    cwnd_ += peerMSS_;
+                    if (hasSacked) {
+                        cwnd_ = ssthresh_;
+                        retransmitSackHoles();
+                    } else {
+                        cwnd_ = ssthresh_ + 3U * peerMSS_;
+                        auto &first = unacked_.front();
+                        first.retransmitted = true;
+                        ++first.retries;
+                        first.txTime = std::chrono::steady_clock::now();
+                        sendTCPSegment(first.seq, rcvNxt_, 0x18 /* PSH|ACK */, first.data, false);
+                    }
+                    flushSendQueue();
+                } else if (inFastRecovery_) {
+                    if (hasSacked) {
+                        retransmitSackHoles();
+                    } else {
+                        cwnd_ += peerMSS_;
+                    }
                     flushSendQueue();
                 }
             }
         }
 
+        const bool hadOutOfOrder = !outOfOrder_.empty();
+        bool inOrderArrival = false;
+        bool nonSequentialArrival = false;
         if (payloadLen > 0) {
             Buffer segData(tcp + dataOff, tcp + dataOff + payloadLen);
             if (seq == rcvNxt_) {
+                inOrderArrival = true;
                 recvBuf_.append(segData);
                 rcvNxt_ += uint32_t(payloadLen);
                 while (!outOfOrder_.empty()) {
@@ -1230,9 +1394,15 @@ private:
                         break;
                     }
                 }
-            } else if (int32_t(seq - rcvNxt_) > 0 && outOfOrder_.size() < 512) {
-                outOfOrder_[seq] = std::move(segData);
+            } else {
+                nonSequentialArrival = true;
+                if (int32_t(seq - rcvNxt_) > 0 && outOfOrder_.size() < 512) {
+                    outOfOrder_[seq] = std::move(segData);
+                }
             }
+        } else if (!(flags & 0x01) && seq + 1 == rcvNxt_) {
+            // Peer TCP keepalive probe (1 byte below rcvNxt_)
+            sendTCPSegment(sndNxt_, rcvNxt_, 0x10 /* ACK */, {}, false);
         }
 
         if (flags & 0x01 /* FIN */) {
@@ -1245,8 +1415,20 @@ private:
         }
 
         if (payloadLen > 0 || (flags & 0x01)) {
-            sendTCPSegment(sndNxt_, rcvNxt_, 0x10 /* ACK */, {}, false);
             deliverRead();
+            // RFC 5681 §4.2 Delayed ACK: immediate ACK every 2nd in-order segment,
+            // or immediately on FIN, out-of-order/duplicate segment, or gap fill;
+            // otherwise defer up to 20 ms (<= 25 ms).
+            if ((flags & 0x01) || nonSequentialArrival || hadOutOfOrder || !outOfOrder_.empty()) {
+                sendTCPSegment(sndNxt_, rcvNxt_, 0x10 /* ACK */, {}, false);
+            } else if (inOrderArrival) {
+                if (++unackedRxSegs_ >= 2) {
+                    sendTCPSegment(sndNxt_, rcvNxt_, 0x10 /* ACK */, {}, false);
+                } else {
+                    ackDeferred_ = true;
+                    schedulePeriodicTick();
+                }
+            }
         }
     }
 
@@ -1269,10 +1451,18 @@ private:
         terminal_ = std::move(err);
         if (tunnel_ && localPort_) tunnel_->unregisterTCP(localPort_);
         unsent_.clear();
+        unsentBytes_ = 0;
         unacked_.clear();
         outOfOrder_.clear();
+        ackDeferred_ = false;
+        auto deferredWrites = std::move(deferredWriteCompletions_);
+        deferredWriteCompletions_.clear();
         auto keep = std::move(selfKeepAlive_);
         if (auto c = std::exchange(completion_, {})) c({}, terminal_);
+        Error writeErr = terminal_.empty() ? Error("WireGuard TCP stream closed") : terminal_;
+        for (auto &wcb : deferredWrites) {
+            if (wcb) wcb(writeErr);
+        }
         deliverRead();
     }
 };
@@ -1411,6 +1601,53 @@ bool wireGuardProtocolSelfTest() {
         auto sackParsed = parseTCPOptions(sackPkt.data() + 40, sackOptLen);
         if (sackParsed.sackBlocks.size() != 1 || sackParsed.sackBlocks[0].leftEdge != 500 || sackParsed.sackBlocks[0].rightEdge != 1500)
             return false;
+
+        // 2c. Verify RFC 6479 2048-packet sliding anti-replay window & checkReplay/acceptReplay separation
+        {
+            WGHandshakeState replayHs;
+            replayHs.clientIndex = 0x11223344U;
+            replayHs.serverIndex = 0x11223344U;
+            replayHs.sendKey = Buffer(32, 0x55);
+            replayHs.recvKey = replayHs.sendKey;
+
+            // Accept counter 0
+            auto pkt0 = encryptTransportPacket(cfg, replayHs, ipUDP);
+            Buffer outTmp;
+            if (!decryptTransportPacket(replayHs, pkt0, outTmp) || outTmp != ipUDP) return false;
+            // Duplicate counter 0 must be rejected
+            if (decryptTransportPacket(replayHs, pkt0, outTmp)) return false;
+
+            // Unauthenticated spoofed packet with huge counter 5000 must NOT advance replayMax
+            Buffer spoofed = pkt0;
+            writeLE64(spoofed.data() + 8, 5000ULL);
+            spoofed.back() ^= 0xff;
+            if (decryptTransportPacket(replayHs, spoofed, outTmp)) return false;
+            if (replayHs.replayMax != 0) return false;
+
+            // Advance sendCounter to 2047 (2047 packets ahead of 0: 0 is at diff=2047, still inside 2048-bit window)
+            replayHs.sendCounter = 2047;
+            auto pkt2047 = encryptTransportPacket(cfg, replayHs, ipUDP);
+            if (!decryptTransportPacket(replayHs, pkt2047, outTmp)) return false;
+            // Counter 0 was already accepted (diff=2047) -> must still be rejected as duplicate
+            if (decryptTransportPacket(replayHs, pkt0, outTmp)) return false;
+            // Out-of-order packets at counter=1 (diff=2046), counter=64 (word boundary), counter=1983 must be accepted!
+            for (uint64_t c : {1ULL, 63ULL, 64ULL, 65ULL, 1983ULL}) {
+                replayHs.sendCounter = c;
+                auto pktC = encryptTransportPacket(cfg, replayHs, ipUDP);
+                if (!decryptTransportPacket(replayHs, pktC, outTmp)) return false;
+                if (decryptTransportPacket(replayHs, pktC, outTmp)) return false;
+            }
+            // Advance to 2050: counter=2 (diff=2048 >= 2048) must now be rejected, counter=3 (diff=2047) accepted!
+            replayHs.sendCounter = 2050;
+            auto pkt2050 = encryptTransportPacket(cfg, replayHs, ipUDP);
+            if (!decryptTransportPacket(replayHs, pkt2050, outTmp)) return false;
+            replayHs.sendCounter = 2;
+            auto pkt2 = encryptTransportPacket(cfg, replayHs, ipUDP);
+            if (decryptTransportPacket(replayHs, pkt2, outTmp)) return false;
+            replayHs.sendCounter = 3;
+            auto pkt3 = encryptTransportPacket(cfg, replayHs, ipUDP);
+            if (!decryptTransportPacket(replayHs, pkt3, outTmp)) return false;
+        }
 
         // 3. Regression test for asynchronous WireGuardTCPStream & WireGuardUDPDatagram
         // lifecycle with synchronous Datagram::send (verifying no std::bad_weak_ptr

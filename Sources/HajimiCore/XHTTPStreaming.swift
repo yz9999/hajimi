@@ -309,22 +309,44 @@ final class XHTTPStreamingByteTransport: ByteTransport {
         flushWrites()
     }
 
+    private static let maximumCoalescedChunkBytes = 65_536
+
     private func flushWrites() {
         lock.lock()
         guard !writeInFlight, !writes.isEmpty, !cancelled, failure == nil,
               let connection = uplink else { lock.unlock(); return }
         writeInFlight = true
-        let item = writes.removeFirst()
+
+        var takeCount = 1
+        var totalBytes = writes[0].data.count
+        while takeCount < writes.count {
+            let nextLen = writes[takeCount].data.count
+            guard nextLen > 0, totalBytes + nextLen <= Self.maximumCoalescedChunkBytes else { break }
+            totalBytes += nextLen
+            takeCount += 1
+        }
+        let batch = Array(writes.prefix(takeCount))
+        writes.removeFirst(takeCount)
         lock.unlock()
 
-        var chunk = Data(String(item.data.count, radix: 16).utf8)
-        chunk.append(contentsOf: [0x0d, 0x0a])
-        chunk.append(item.data)
-        chunk.append(contentsOf: [0x0d, 0x0a])
+        let hexHeader = String(totalBytes, radix: 16)
+        var chunk = Data(capacity: hexHeader.utf8.count + 2 + totalBytes + 2)
+        chunk.append(contentsOf: hexHeader.utf8)
+        chunk.append(0x0D)
+        chunk.append(0x0A)
+        for item in batch {
+            chunk.append(item.data)
+        }
+        chunk.append(0x0D)
+        chunk.append(0x0A)
+
         connection.send(chunk) { [weak self] error in
-            guard let self else { return }
+            guard let self else {
+                for item in batch { item.completion(error) }
+                return
+            }
             self.lock.lock(); self.writeInFlight = false; self.lock.unlock()
-            item.completion(error)
+            for item in batch { item.completion(error) }
             if let error { self.fail(error) } else { self.flushWrites() }
         }
     }

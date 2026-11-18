@@ -317,11 +317,17 @@ enum PacketBuilder {
             let capacity = max(0, (40 - options.count - 4) / 8)
             let emitted = sackBlocks.prefix(min(4, capacity))
             if !emitted.isEmpty {
+                options.reserveCapacity(options.count + 4 + emitted.count * 8)
                 options.append(contentsOf: [1, 1, 5, UInt8(2 + emitted.count * 8)])
                 for block in emitted {
-                    var encoded = Data()
-                    append32(block.start, to: &encoded); append32(block.end, to: &encoded)
-                    options.append(contentsOf: encoded)
+                    options.append(UInt8(block.start >> 24))
+                    options.append(UInt8((block.start >> 16) & 0xff))
+                    options.append(UInt8((block.start >> 8) & 0xff))
+                    options.append(UInt8(block.start & 0xff))
+                    options.append(UInt8(block.end >> 24))
+                    options.append(UInt8((block.end >> 16) & 0xff))
+                    options.append(UInt8((block.end >> 8) & 0xff))
+                    options.append(UInt8(block.end & 0xff))
                 }
             }
         }

@@ -71,6 +71,11 @@ void hajimi_tcp_reassembly_fin(hajimi_tcp_reassembly *state, uint32_t sequence);
 uint32_t hajimi_tcp_reassembly_expected(const hajimi_tcp_reassembly *state);
 size_t hajimi_tcp_reassembly_buffered(const hajimi_tcp_reassembly *state);
 int hajimi_tcp_reassembly_finished(const hajimi_tcp_reassembly *state);
+/* Extracts up to min(max_ranges, 4) contiguous out-of-order sequence intervals
+ * currently buffered above expected, suitable for RFC 2018 TCP SACK options. */
+size_t hajimi_tcp_reassembly_sack_blocks(const hajimi_tcp_reassembly *state,
+                                         hajimi_sack_range *out_ranges,
+                                         size_t max_ranges);
 /* Run only in a quiescent unit-test process: quota tests reserve all remaining
  * shared budget briefly, without allocating that artificial reservation. */
 int hajimi_flow_self_test(void);

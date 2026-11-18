@@ -3,6 +3,9 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <sys/socket.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 // MARK: - Checksums
 
@@ -14,9 +17,35 @@ uint64_t hajimi_checksum_sum(const uint8_t *data, size_t length) {
     uint64_t sum = 0;
     size_t index = 0;
 
-#if (defined(__LITTLE_ENDIAN__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)) && defined(__SIZEOF_INT128__)
+#if defined(__aarch64__) && (defined(__LITTLE_ENDIAN__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+    // ARM64 NEON SIMD path: reverse byte pairs into big-endian 16-bit lanes and
+    // accumulate pairwise into dual 32-bit lane vectors across 64-byte cache lines.
+    // Chunking at 64 KiB guarantees 32-bit lanes stay >= 16x below UINT32_MAX.
+    while (index + 64 <= length) {
+        size_t block_bytes = length - index;
+        if (block_bytes > 65536) {
+            block_bytes = 65536;
+        }
+        const size_t block_end = index + (block_bytes & ~(size_t)63);
+        uint32x4_t acc0 = vdupq_n_u32(0);
+        uint32x4_t acc1 = vdupq_n_u32(0);
+        while (index < block_end) {
+            const uint16x8_t v0 = vreinterpretq_u16_u8(vrev16q_u8(vld1q_u8(data + index)));
+            const uint16x8_t v1 = vreinterpretq_u16_u8(vrev16q_u8(vld1q_u8(data + index + 16)));
+            const uint16x8_t v2 = vreinterpretq_u16_u8(vrev16q_u8(vld1q_u8(data + index + 32)));
+            const uint16x8_t v3 = vreinterpretq_u16_u8(vrev16q_u8(vld1q_u8(data + index + 48)));
+            acc0 = vpadalq_u16(acc0, v0);
+            acc1 = vpadalq_u16(acc1, v1);
+            acc0 = vpadalq_u16(acc0, v2);
+            acc1 = vpadalq_u16(acc1, v3);
+            index += 64;
+        }
+        sum += vaddlvq_u32(acc0) + vaddlvq_u32(acc1);
+    }
+#elif (defined(__LITTLE_ENDIAN__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)) && defined(__SIZEOF_INT128__)
     if (length >= 64) {
-        __uint128_t wide_sum = 0;
+        __uint128_t wide_sum0 = 0;
+        __uint128_t wide_sum1 = 0;
         while (index + 64 <= length) {
             uint64_t q0, q1, q2, q3, q4, q5, q6, q7;
             memcpy(&q0, data + index, 8);
@@ -27,18 +56,19 @@ uint64_t hajimi_checksum_sum(const uint8_t *data, size_t length) {
             memcpy(&q5, data + index + 40, 8);
             memcpy(&q6, data + index + 48, 8);
             memcpy(&q7, data + index + 56, 8);
-            wide_sum += (__uint128_t)__builtin_bswap64(q0)
-                      + (__uint128_t)__builtin_bswap64(q1)
-                      + (__uint128_t)__builtin_bswap64(q2)
-                      + (__uint128_t)__builtin_bswap64(q3)
-                      + (__uint128_t)__builtin_bswap64(q4)
-                      + (__uint128_t)__builtin_bswap64(q5)
-                      + (__uint128_t)__builtin_bswap64(q6)
-                      + (__uint128_t)__builtin_bswap64(q7);
+            wide_sum0 += (__uint128_t)__builtin_bswap64(q0)
+                       + (__uint128_t)__builtin_bswap64(q1)
+                       + (__uint128_t)__builtin_bswap64(q2)
+                       + (__uint128_t)__builtin_bswap64(q3);
+            wide_sum1 += (__uint128_t)__builtin_bswap64(q4)
+                       + (__uint128_t)__builtin_bswap64(q5)
+                       + (__uint128_t)__builtin_bswap64(q6)
+                       + (__uint128_t)__builtin_bswap64(q7);
             index += 64;
         }
-        uint64_t lo = (uint64_t)wide_sum;
-        uint64_t hi = (uint64_t)(wide_sum >> 64);
+        const __uint128_t wide_sum = wide_sum0 + wide_sum1;
+        const uint64_t lo = (uint64_t)wide_sum;
+        const uint64_t hi = (uint64_t)(wide_sum >> 64);
         sum += (lo >> 32) + (lo & 0xffffffffULL) + (hi >> 32) + (hi & 0xffffffffULL);
     }
 #endif
@@ -60,8 +90,26 @@ uint64_t hajimi_checksum_sum(const uint8_t *data, size_t length) {
              + (q3 >> 32) + (q3 & 0xffffffffULL);
         index += 32;
     }
-#endif
 
+    if (index + 16 <= length) {
+        uint64_t q0, q1;
+        memcpy(&q0, data + index, 8);
+        memcpy(&q1, data + index + 8, 8);
+        q0 = __builtin_bswap64(q0);
+        q1 = __builtin_bswap64(q1);
+        sum += (q0 >> 32) + (q0 & 0xffffffffULL)
+             + (q1 >> 32) + (q1 & 0xffffffffULL);
+        index += 16;
+    }
+
+    if (index + 8 <= length) {
+        uint64_t q0;
+        memcpy(&q0, data + index, 8);
+        q0 = __builtin_bswap64(q0);
+        sum += (q0 >> 32) + (q0 & 0xffffffffULL);
+        index += 8;
+    }
+#else
     // Sixteen bytes per iteration. `memcpy` of a fixed size compiles to a
     // plain unaligned load, so this stays correct on buffers that are not
     // word aligned - which packet payloads routinely are not.
@@ -75,6 +123,7 @@ uint64_t hajimi_checksum_sum(const uint8_t *data, size_t length) {
              + (uint64_t)ntohl(w2) + (uint64_t)ntohl(w3);
         index += 16;
     }
+#endif
 
     while (index + 4 <= length) {
         uint32_t word;
@@ -398,7 +447,13 @@ int hajimi_parse_tcp_options(const uint8_t *bytes, size_t length, hajimi_tcp_opt
         if (cursor + 2 > length) return HAJIMI_PARSE_MALFORMED;
         const uint8_t n = bytes[cursor + 1];
         if (n < 2 || n > length - cursor) return HAJIMI_PARSE_MALFORMED;
-        if (kind == 3) {
+        if (kind == 2) {
+            if (n != 4) return HAJIMI_PARSE_MALFORMED;
+            uint16_t mss;
+            memcpy(&mss, bytes + cursor + 2, 2);
+            out->has_mss = 1;
+            out->mss = ntohs(mss);
+        } else if (kind == 3) {
             if (n != 3) return HAJIMI_PARSE_MALFORMED;
             out->has_window_scale = 1;
             out->window_scale = bytes[cursor + 2] > 14 ? 14 : bytes[cursor + 2];
@@ -493,6 +548,35 @@ static void write_tcp_header(uint8_t *tcp, uint16_t source_port,
     tcp[19] = 0;
 }
 
+/// Computes the transport checksum over an even-length transport header (20B TCP
+/// or 8B UDP) plus the caller's source `payload` buffer directly, avoiding a
+/// second cache-line read pass over the newly copied destination payload.
+static uint16_t transport_checksum_split(const uint8_t *source,
+                                         const uint8_t *destination,
+                                         size_t address_length,
+                                         uint8_t protocol,
+                                         const uint8_t *header,
+                                         size_t header_length,
+                                         const uint8_t *payload,
+                                         size_t payload_length) {
+    const size_t transport_length = header_length + payload_length;
+    uint64_t sum = (uint64_t)protocol + (uint64_t)transport_length;
+    if (address_length == 4) {
+        uint32_t s, d;
+        memcpy(&s, source, 4);
+        memcpy(&d, destination, 4);
+        sum += (uint64_t)ntohl(s) + (uint64_t)ntohl(d);
+    } else {
+        sum += hajimi_checksum_sum(source, address_length)
+             + hajimi_checksum_sum(destination, address_length);
+    }
+    sum += hajimi_checksum_sum(header, header_length);
+    if (payload_length > 0) {
+        sum += hajimi_checksum_sum(payload, payload_length);
+    }
+    return hajimi_checksum_fold(sum);
+}
+
 size_t hajimi_build_ipv4_tcp(uint8_t *out, size_t out_capacity,
                             const uint8_t source[4], uint16_t source_port,
                             const uint8_t destination[4], uint16_t destination_port,
@@ -528,12 +612,13 @@ size_t hajimi_build_ipv4_tcp(uint8_t *out, size_t out_capacity,
     uint8_t *tcp = out + 20;
     write_tcp_header(tcp, source_port, destination_port, sequence,
                      acknowledgment, flags, window);
+    const uint16_t tcp_sum = transport_checksum_split(source, destination, 4, 6,
+                                                      tcp, 20,
+                                                      payload, payload_length);
+    write16(tcp + 16, tcp_sum);
     if (payload_length > 0) {
         memcpy(tcp + 20, payload, payload_length);
     }
-    const uint16_t tcp_sum = hajimi_transport_checksum(source, destination, 4, 6,
-                                                      tcp, 20 + payload_length);
-    write16(tcp + 16, tcp_sum);
     return total;
 }
 
@@ -549,7 +634,7 @@ size_t hajimi_build_ipv6_tcp(uint8_t *out, size_t out_capacity,
     if (payload_length > 0 && payload == NULL) {
         return 0;
     }
-    if (payload_length > 0xffff || 60 + payload_length > out_capacity) {
+    if (payload_length > 0xffff - 20 || 60 + payload_length > out_capacity) {
         return 0;
     }
 
@@ -566,12 +651,13 @@ size_t hajimi_build_ipv6_tcp(uint8_t *out, size_t out_capacity,
     uint8_t *tcp = out + 40;
     write_tcp_header(tcp, source_port, destination_port, sequence,
                      acknowledgment, flags, window);
+    const uint16_t tcp_sum = transport_checksum_split(source, destination, 16, 6,
+                                                      tcp, 20,
+                                                      payload, payload_length);
+    write16(tcp + 16, tcp_sum);
     if (payload_length > 0) {
         memcpy(tcp + 20, payload, payload_length);
     }
-    const uint16_t tcp_sum = hajimi_transport_checksum(source, destination, 16, 6,
-                                                      tcp, 20 + payload_length);
-    write16(tcp + 16, tcp_sum);
     return 60 + payload_length;
 }
 
@@ -613,15 +699,16 @@ size_t hajimi_build_ipv4_udp(uint8_t *out, size_t out_capacity,
     write16(udp + 4, (uint16_t)(8 + payload_length));
     udp[6] = 0;
     udp[7] = 0;
-    if (payload_length > 0) {
-        memcpy(udp + 8, payload, payload_length);
-    }
-    uint16_t checksum = hajimi_transport_checksum(source, destination, 4, 17,
-                                                 udp, 8 + payload_length);
+    uint16_t checksum = transport_checksum_split(source, destination, 4, 17,
+                                                 udp, 8,
+                                                 payload, payload_length);
     if (checksum == 0) {
         checksum = 0xffff;
     }
     write16(udp + 6, checksum);
+    if (payload_length > 0) {
+        memcpy(udp + 8, payload, payload_length);
+    }
     return total;
 }
 
@@ -655,15 +742,16 @@ size_t hajimi_build_ipv6_udp(uint8_t *out, size_t out_capacity,
     write16(udp + 4, (uint16_t)(8 + payload_length));
     udp[6] = 0;
     udp[7] = 0;
-    if (payload_length > 0) {
-        memcpy(udp + 8, payload, payload_length);
-    }
-    uint16_t checksum = hajimi_transport_checksum(source, destination, 16, 17,
-                                                 udp, 8 + payload_length);
+    uint16_t checksum = transport_checksum_split(source, destination, 16, 17,
+                                                 udp, 8,
+                                                 payload, payload_length);
     if (checksum == 0) {
         checksum = 0xffff;
     }
     write16(udp + 6, checksum);
+    if (payload_length > 0) {
+        memcpy(udp + 8, payload, payload_length);
+    }
     return 48 + payload_length;
 }
 
@@ -834,11 +922,54 @@ int hajimi_dataplane_self_test(void) {
     static const uint8_t options[] = {1, 3, 3, 20, 4, 2, 5, 10, 0, 0, 0, 1, 0, 0, 0, 8};
     hajimi_tcp_options parsed_options;
     if (hajimi_parse_tcp_options(options, sizeof(options), &parsed_options) != HAJIMI_PARSE_OK ||
+        parsed_options.has_mss != 0 || parsed_options.mss != 0 ||
         !parsed_options.has_window_scale || parsed_options.window_scale != 14 ||
         !parsed_options.sack_permitted || parsed_options.sack_count != 1 ||
         parsed_options.sacks[0].start != 1 || parsed_options.sacks[0].end != 8) return 29;
     if (hajimi_parse_tcp_options(options, sizeof(options) - 1, &parsed_options) != HAJIMI_PARSE_MALFORMED) return 30;
     if (hajimi_parse_tcp_options(NULL, 0, &parsed_options) != HAJIMI_PARSE_OK) return 31;
+
+    // Verify RFC 9293 §3.7.1 MSS option parsing (Kind=2, Length=4) and malformed length rejection.
+    if (hajimi_parse_tcp_options(segment + tcp.options_offset, tcp.options_length, &parsed_options) != HAJIMI_PARSE_OK ||
+        !parsed_options.has_mss || parsed_options.mss != 0x2300) return 36;
+    static const uint8_t syn_options[] = {2, 4, 0x05, 0xb4, 1, 3, 3, 6, 4, 2, 0};
+    if (hajimi_parse_tcp_options(syn_options, sizeof(syn_options), &parsed_options) != HAJIMI_PARSE_OK ||
+        !parsed_options.has_mss || parsed_options.mss != 1460 ||
+        !parsed_options.has_window_scale || parsed_options.window_scale != 6 ||
+        !parsed_options.sack_permitted) return 37;
+    static const uint8_t bad_mss_option[] = {2, 3, 0x05};
+    if (hajimi_parse_tcp_options(bad_mss_option, sizeof(bad_mss_option), &parsed_options) != HAJIMI_PARSE_MALFORMED) return 38;
+
+    // Verify SIMD / 64-bit unrolled checksum across unaligned offsets and split IPv6 TCP build.
+    uint8_t unaligned_buf[533];
+    for (size_t i = 0; i < sizeof(unaligned_buf); ++i) {
+        unaligned_buf[i] = (uint8_t)((i * 73u + 19u) ^ (i >> 2));
+    }
+    for (size_t off = 0; off < 8; ++off) {
+        const size_t len = sizeof(unaligned_buf) - off - (off & 1u);
+        uint64_t ref_sum = 0;
+        for (size_t j = 0; j + 1 < len; j += 2) {
+            ref_sum += ((uint64_t)unaligned_buf[off + j] << 8) | (uint64_t)unaligned_buf[off + j + 1];
+        }
+        if (len & 1u) {
+            ref_sum += (uint64_t)unaligned_buf[off + len - 1] << 8;
+        }
+        if (hajimi_checksum(unaligned_buf + off, len) != hajimi_checksum_fold(ref_sum)) {
+            return 39;
+        }
+    }
+    static const uint8_t src6[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    static const uint8_t dst6[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2};
+    uint8_t built6[128];
+    const size_t tcp6_len = hajimi_build_ipv6_tcp(built6, sizeof(built6), src6, 443,
+                                                  dst6, 51000, 10, 20,
+                                                  HAJIMI_TCP_ACK | HAJIMI_TCP_PSH,
+                                                  65535, body, sizeof(body));
+    if (tcp6_len != 65 ||
+        hajimi_transport_checksum(src6, dst6, 16, 6, built6 + 40, 25) != 0 ||
+        memcmp(built6 + 60, body, sizeof(body)) != 0) {
+        return 40;
+    }
 
     uint8_t parsed_ip[4];
     char formatted_ip[16];

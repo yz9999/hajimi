@@ -344,19 +344,26 @@ private:
             cachedTxKey_ = deriveSudokuEpochKey(txBaseKey_, cfg_.aeadMethod, epoch);
             cachedTxEpoch_ = epoch;
         }
-        Buffer header;
-        header.reserve(12);
-        appendBE32(header, epoch);
-        appendBE64(header, seq);
+        uint8_t header[12];
+        header[0] = uint8_t((epoch >> 24) & 0xff);
+        header[1] = uint8_t((epoch >> 16) & 0xff);
+        header[2] = uint8_t((epoch >> 8) & 0xff);
+        header[3] = uint8_t(epoch & 0xff);
+        for (int i = 7; i >= 0; --i) {
+            header[4 + (7 - i)] = uint8_t((seq >> (i * 8)) & 0xff);
+        }
 
         auto method = (cfg_.aeadMethod == "aes-128-gcm") ? crypto::AEAD::AES128GCM : crypto::AEAD::ChaCha20Poly1305;
-        Buffer cipher = crypto::seal(method, cachedTxKey_, header, plain, header);
-        uint16_t bodyLen = uint16_t(header.size() + cipher.size());
-        Buffer frame;
-        frame.reserve(2 + bodyLen);
-        appendBE16(frame, bodyLen);
-        frame.insert(frame.end(), header.begin(), header.end());
-        frame.insert(frame.end(), cipher.begin(), cipher.end());
+        uint16_t bodyLen = uint16_t(12 + plain.size() + 16);
+        Buffer frame(2 + size_t(bodyLen));
+        frame[0] = uint8_t(bodyLen >> 8);
+        frame[1] = uint8_t(bodyLen & 0xff);
+        std::memcpy(frame.data() + 2, header, 12);
+        if (!crypto::sealInto(method, cachedTxKey_.data(), cachedTxKey_.size(),
+                              header, 12, plain.data(), plain.size(),
+                              frame.data() + 14, header, 12)) {
+            throw std::runtime_error("Sudoku AEAD seal failed");
+        }
         return frame;
     }
 
@@ -679,7 +686,7 @@ class SudokuMuxSession final : public std::enable_shared_from_this<SudokuMuxSess
 public:
     explicit SudokuMuxSession(std::shared_ptr<SudokuStream> carrier)
         : carrier_(std::move(carrier)), reader_(std::make_shared<Reader>(carrier_)),
-          writer_(std::make_shared<OrderedWriter>(carrier_)) {}
+          writer_(std::make_shared<OrderedWriter>(carrier_, maximumQueuedBytes, 128, proto_stream::kMaxCoalescedWriteBytes)) {}
 
     bool isClosed() const noexcept { return closed_; }
 

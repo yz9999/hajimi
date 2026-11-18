@@ -49,26 +49,57 @@ public:
             return;
         }
         try {
-            Buffer wire;
-            wire.reserve(initialHandshakeWire_.size() + data.size() + ((data.size() + 16383) / 16384) * 64);
+            const size_t numChunks = (data.size() + 16383) / 16384;
+            const size_t totalWire = initialHandshakeWire_.size() + data.size() + numChunks * 64;
+            Buffer wire(totalWire);
+            size_t pos = 0;
             if (!initialHandshakeWire_.empty()) {
-                wire.insert(wire.end(), initialHandshakeWire_.begin(), initialHandshakeWire_.end());
+                std::memcpy(wire.data(), initialHandshakeWire_.data(), initialHandshakeWire_.size());
+                pos += initialHandshakeWire_.size();
                 initialHandshakeWire_.clear();
             }
+            const uint32_t tsMin = uint32_t(unixSeconds() / 60);
             size_t offset = 0;
             while (offset < data.size()) {
                 size_t chunkLen = std::min<size_t>(16384, data.size() - offset);
-                Buffer meta = buildMieruDataMetadata(kMieruDataClientToServer, sessionID_,
-                                                     txSeq_++, rxHighestSeq_, 4096,
-                                                     0, uint16_t(chunkLen), 0);
-                Buffer sealedMeta = crypto::sealSlice(crypto::AEAD::XChaCha20Poly1305, txKey_, txNonce_, meta.data(), meta.size());
-                incrementNonceBE(txNonce_);
-                wire.insert(wire.end(), sealedMeta.begin(), sealedMeta.end());
+                uint8_t meta[32]{};
+                meta[0] = kMieruDataClientToServer;
+                meta[2] = uint8_t((tsMin >> 24) & 0xff);
+                meta[3] = uint8_t((tsMin >> 16) & 0xff);
+                meta[4] = uint8_t((tsMin >> 8) & 0xff);
+                meta[5] = uint8_t(tsMin & 0xff);
+                meta[6] = uint8_t((sessionID_ >> 24) & 0xff);
+                meta[7] = uint8_t((sessionID_ >> 16) & 0xff);
+                meta[8] = uint8_t((sessionID_ >> 8) & 0xff);
+                meta[9] = uint8_t(sessionID_ & 0xff);
+                const uint32_t seq = txSeq_++;
+                meta[10] = uint8_t((seq >> 24) & 0xff);
+                meta[11] = uint8_t((seq >> 16) & 0xff);
+                meta[12] = uint8_t((seq >> 8) & 0xff);
+                meta[13] = uint8_t(seq & 0xff);
+                meta[14] = uint8_t((rxHighestSeq_ >> 24) & 0xff);
+                meta[15] = uint8_t((rxHighestSeq_ >> 16) & 0xff);
+                meta[16] = uint8_t((rxHighestSeq_ >> 8) & 0xff);
+                meta[17] = uint8_t(rxHighestSeq_ & 0xff);
+                meta[18] = uint8_t(4096 >> 8);
+                meta[19] = uint8_t(4096 & 0xff);
+                meta[22] = uint8_t(chunkLen >> 8);
+                meta[23] = uint8_t(chunkLen & 0xff);
 
-                Buffer sealedPayload = crypto::sealSlice(crypto::AEAD::XChaCha20Poly1305, txKey_, txNonce_,
-                                                         data.data() + offset, chunkLen);
+                if (!crypto::sealInto(crypto::AEAD::XChaCha20Poly1305, txKey_.data(), txKey_.size(),
+                                      txNonce_.data(), txNonce_.size(), meta, 32, wire.data() + pos)) {
+                    throw std::runtime_error("Mieru AEAD metadata encryption failed");
+                }
                 incrementNonceBE(txNonce_);
-                wire.insert(wire.end(), sealedPayload.begin(), sealedPayload.end());
+                pos += 48;
+
+                if (!crypto::sealInto(crypto::AEAD::XChaCha20Poly1305, txKey_.data(), txKey_.size(),
+                                      txNonce_.data(), txNonce_.size(),
+                                      data.data() + offset, chunkLen, wire.data() + pos)) {
+                    throw std::runtime_error("Mieru AEAD payload encryption failed");
+                }
+                incrementNonceBE(txNonce_);
+                pos += chunkLen + 16;
                 offset += chunkLen;
             }
             writer_->write(std::move(wire), std::move(completion));
@@ -1371,19 +1402,23 @@ void connectMieru(const Node &node, const Target &target,
             Buffer nonce = mieruMakeNonce(cfg.username, crypto::randomBytes(20));
             Buffer nextNonce = nonce;
 
-            Buffer wire;
-            wire.reserve(24 + 48 + openReq.size() + 16);
-            wire.insert(wire.end(), nonce.begin(), nonce.end());
+            Buffer wire(24 + 48 + openReq.size() + 16);
+            std::memcpy(wire.data(), nonce.data(), 24);
             // Segment 0: openSessionRequest carrying the SOCKS5 target request
             Buffer openMeta = buildMieruSessionMetadata(
                 kMieruOpenSessionReq, sessionID, 0, 0, uint16_t(openReq.size()), 0);
-            Buffer sealedMeta = crypto::seal(crypto::AEAD::XChaCha20Poly1305, sessionKey, nextNonce, openMeta);
+            if (!crypto::sealInto(crypto::AEAD::XChaCha20Poly1305, sessionKey.data(), sessionKey.size(),
+                                  nextNonce.data(), nextNonce.size(), openMeta.data(), 32, wire.data() + 24)) {
+                throw std::runtime_error("Mieru AEAD metadata encryption failed");
+            }
             incrementNonceBE(nextNonce);
-            wire.insert(wire.end(), sealedMeta.begin(), sealedMeta.end());
 
-            Buffer sealedPayload = crypto::seal(crypto::AEAD::XChaCha20Poly1305, sessionKey, nextNonce, openReq);
+            if (!crypto::sealInto(crypto::AEAD::XChaCha20Poly1305, sessionKey.data(), sessionKey.size(),
+                                  nextNonce.data(), nextNonce.size(),
+                                  openReq.data(), openReq.size(), wire.data() + 72)) {
+                throw std::runtime_error("Mieru AEAD payload encryption failed");
+            }
             incrementNonceBE(nextNonce);
-            wire.insert(wire.end(), sealedPayload.begin(), sealedPayload.end());
 
             auto mieruStream = std::make_shared<MieruTCPStream>(
                 raw, std::move(candKeys), std::move(nextNonce), sessionID, 1);

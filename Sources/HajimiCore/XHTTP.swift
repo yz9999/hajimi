@@ -146,6 +146,8 @@ final class HTTP1ResponseParser {
     /// The head of a response has no business being large; a peer that never
     /// sends the terminator would otherwise grow this without bound.
     private static let maximumHeadBytes = 64 * 1024
+    private static let crlf = Data([0x0D, 0x0A])
+    private static let headerTerminator = Data([0x0D, 0x0A, 0x0D, 0x0A])
 
     func ingest(_ data: Data) throws -> (payload: Data, complete: Bool) {
         if !data.isEmpty {
@@ -160,7 +162,7 @@ final class HTTP1ResponseParser {
 
         loop: while true {
             if !headComplete {
-                guard let terminator = range(of: "\r\n\r\n", from: cursor) else {
+                guard let terminator = range(of: Self.headerTerminator, from: cursor) else {
                     if buffer.count - cursor > Self.maximumHeadBytes {
                         throw NativeOutboundError.protocolError("XHTTP 响应头过长")
                     }
@@ -194,7 +196,7 @@ final class HTTP1ResponseParser {
                 if left > 0 { break loop }
 
             case .chunkHeader:
-                guard let line = range(of: "\r\n", from: cursor) else { break loop }
+                guard let line = range(of: Self.crlf, from: cursor) else { break loop }
                 let text = String(decoding: buffer.subdata(in: cursor..<line.lowerBound), as: UTF8.self)
                 // A chunk size may carry extensions after a semicolon.
                 let sizeText = text.split(separator: ";", maxSplits: 1).first
@@ -230,7 +232,7 @@ final class HTTP1ResponseParser {
                     body = .complete
                     break loop
                 }
-                guard let terminator = range(of: "\r\n\r\n", from: cursor) else { break loop }
+                guard let terminator = range(of: Self.headerTerminator, from: cursor) else { break loop }
                 cursor = terminator.upperBound
                 body = .complete
                 break loop
@@ -249,9 +251,10 @@ final class HTTP1ResponseParser {
         return (payload, complete)
     }
 
-    private func range(of token: String, from cursor: Int) -> Range<Int>? {
+    @inline(__always)
+    private func range(of token: Data, from cursor: Int) -> Range<Int>? {
         guard cursor <= buffer.count else { return nil }
-        return buffer.range(of: Data(token.utf8), in: cursor..<buffer.count)
+        return buffer.range(of: token, in: cursor..<buffer.count)
     }
 
     private func parseHead(_ head: Data) throws {

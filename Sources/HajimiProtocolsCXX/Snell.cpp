@@ -313,29 +313,41 @@ Buffer Encoder::frameSlice(const uint8_t *payload, size_t payloadLen) {
     if (payloadLen > maximumFrame) throw std::runtime_error("Snell payload exceeds its bound");
     size_t padding = !saltSent_ && payloadLen > 0 ? padding_ : 0;
     size_t bodyCipherLen = payloadLen ? payloadLen + 16 : 0;
-    size_t totalSize = (!saltSent_ ? 16 : 0) + 23 + padding + bodyCipherLen;
-    Buffer output;
-    output.reserve(totalSize);
-    if (!saltSent_) output.insert(output.end(), salt_.begin(), salt_.end());
+    size_t saltPrefix = !saltSent_ ? 16 : 0;
+    size_t totalSize = saltPrefix + 23 + padding + bodyCipherLen;
+    Buffer output(totalSize);
+    size_t pos = 0;
+    if (!saltSent_) {
+        std::memcpy(output.data(), salt_.data(), 16);
+        pos += 16;
+    }
 
     uint8_t headerPlain[7] = {
         4, 0, 0,
         uint8_t(padding >> 8), uint8_t(padding),
         uint8_t(payloadLen >> 8), uint8_t(payloadLen)
     };
-    auto encryptedHeader = crypto::sealSlice(snellCipher(version_), key_, nonce_, headerPlain, sizeof(headerPlain));
+    if (!crypto::sealInto(snellCipher(version_), key_.data(), key_.size(),
+                          nonce_.data(), nonce_.size(), headerPlain, sizeof(headerPlain),
+                          output.data() + pos)) {
+        throw std::runtime_error("Snell AEAD header encryption failed");
+    }
     nextNonce(nonce_);
-    output.insert(output.end(), encryptedHeader.begin(), encryptedHeader.end());
+    pos += 23;
 
-    size_t bodyOffset = output.size();
+    size_t bodyOffset = pos;
     if (padding > 0) {
         auto padBytes = crypto::randomBytes(padding);
-        output.insert(output.end(), padBytes.begin(), padBytes.end());
+        std::memcpy(output.data() + pos, padBytes.data(), padding);
+        pos += padding;
     }
     if (payloadLen > 0) {
-        auto encryptedBody = crypto::sealSlice(snellCipher(version_), key_, nonce_, payload, payloadLen);
+        if (!crypto::sealInto(snellCipher(version_), key_.data(), key_.size(),
+                              nonce_.data(), nonce_.size(), payload, payloadLen,
+                              output.data() + pos)) {
+            throw std::runtime_error("Snell AEAD body encryption failed");
+        }
         nextNonce(nonce_);
-        output.insert(output.end(), encryptedBody.begin(), encryptedBody.end());
     }
     if (padding > 0 && bodyCipherLen > 0) {
         swapPadding(output.data() + bodyOffset, padding, bodyCipherLen);
@@ -353,13 +365,17 @@ Decoder::Decoder(const std::string &psk, unsigned version, const Buffer &salt)
 
 Lengths Decoder::header(const Buffer &sealed) {
     if (sealed.size() != headerSize()) throw std::runtime_error("Invalid Snell header size");
-    auto plain = crypto::openSlice(snellCipher(version_), key_, nonce_, sealed.data(), sealed.size());
+    uint8_t plain[7]{};
+    if (!crypto::openInto(snellCipher(version_), key_.data(), key_.size(),
+                          nonce_.data(), nonce_.size(), sealed.data(), sealed.size(), plain)) {
+        throw std::runtime_error("AEAD authentication failed");
+    }
     nextNonce(nonce_);
-    if (plain.size() != 7 || (plain[0] != 4 && plain[0] != uint8_t(version_)))
+    if (plain[0] != 4 && plain[0] != uint8_t(version_))
         throw std::runtime_error("Invalid Snell v4+ header");
     Lengths result;
-    result.padding = snellWord(plain.data() + 3);
-    result.payload = snellWord(plain.data() + 5);
+    result.padding = snellWord(plain + 3);
+    result.payload = snellWord(plain + 5);
     if (result.padding > maximumFrame || result.payload > maximumFrame)
         throw std::runtime_error("Snell encrypted frame exceeds its bound");
     return result;
@@ -370,10 +386,13 @@ Buffer Decoder::body(Buffer sealed, Lengths lengths) {
     if (sealed.size() != lengths.padding + payloadCipher) throw std::runtime_error("Truncated Snell body");
     swapPadding(sealed.data(), lengths.padding, payloadCipher);
     if (!payloadCipher) return {};
-    auto plain = crypto::openSlice(snellCipher(version_), key_, nonce_,
-                                   sealed.data() + lengths.padding, payloadCipher);
+    Buffer plain(lengths.payload);
+    if (!crypto::openInto(snellCipher(version_), key_.data(), key_.size(),
+                          nonce_.data(), nonce_.size(),
+                          sealed.data() + lengths.padding, payloadCipher, plain.data())) {
+        throw std::runtime_error("AEAD authentication failed");
+    }
     nextNonce(nonce_);
-    if (plain.size() != lengths.payload) throw std::runtime_error("Invalid Snell payload size");
     return plain;
 }
 
@@ -480,25 +499,75 @@ void SnellStream::enqueue(Buffer data, bool packet, bool end, WriteCallback comp
 }
 void SnellStream::pumpWrites() {
     if (closed_ || writing_ || writes_.empty()) return;
-    auto &pending = writes_.front();
-    size_t count = pending.packet ? pending.data.size() : std::min(pending.data.size() - pending.offset, encoder_.payloadLimit());
-    Buffer frame;
+    constexpr size_t kMaxBatchWireBytes = 65536;
+    Buffer wire;
+    size_t completedEntries = 0;
+    size_t partialBytesOnNext = 0;
     try {
-        frame = encoder_.frameSlice(pending.data.data() + pending.offset, count);
+        for (size_t idx = 0; idx < writes_.size(); ++idx) {
+            auto &entry = writes_[idx];
+            size_t cursor = entry.offset;
+            if (entry.data.empty() && entry.end) {
+                if (!wire.empty() && wire.size() + 23 > kMaxBatchWireBytes) break;
+                Buffer eofFrame = encoder_.frameSlice(nullptr, 0);
+                if (wire.empty()) wire = std::move(eofFrame);
+                else wire.insert(wire.end(), eofFrame.begin(), eofFrame.end());
+                ++completedEntries;
+                continue;
+            }
+            bool entryFinished = true;
+            while (cursor < entry.data.size()) {
+                size_t limit = entry.packet ? (entry.data.size() - cursor) : encoder_.payloadLimit();
+                size_t count = std::min(entry.data.size() - cursor, limit);
+                if (!wire.empty() && wire.size() + count + 64 > kMaxBatchWireBytes) {
+                    entryFinished = false;
+                    break;
+                }
+                Buffer frame = encoder_.frameSlice(entry.data.data() + cursor, count);
+                const bool moreFollows = (cursor + count < entry.data.size()) || (idx + 1 < writes_.size());
+                if (wire.empty() && !moreFollows) {
+                    wire = std::move(frame);
+                } else {
+                    if (wire.empty()) {
+                        wire.reserve(std::min<size_t>(kMaxBatchWireBytes + 1024, queued_ + writes_.size() * 64 + 600));
+                    }
+                    wire.insert(wire.end(), frame.begin(), frame.end());
+                }
+                cursor += count;
+                if (entry.packet) break;
+            }
+            if (entryFinished) {
+                ++completedEntries;
+            } else {
+                partialBytesOnNext = cursor - entry.offset;
+                break;
+            }
+            if (wire.size() >= kMaxBatchWireBytes) break;
+        }
+    } catch (const std::exception &error) {
+        fail(error.what());
+        return;
     }
-    catch (const std::exception &error) { fail(error.what()); return; }
     writing_ = true;
     auto self = shared_from_this();
-    carrier_->write(std::move(frame), [self, count](Error error) {
-        self->post([self, count, error = std::move(error)]() mutable {
+    carrier_->write(std::move(wire), [self, completedEntries, partialBytesOnNext](Error error) {
+        self->post([self, completedEntries, partialBytesOnNext, error = std::move(error)]() mutable {
             self->writing_ = false;
             if (self->closed_) return;
             if (!error.empty()) { self->fail(std::move(error)); return; }
-            if (self->writes_.empty()) return;
-            auto &pending = self->writes_.front(); pending.offset += count;
-            if (pending.offset == pending.data.size()) {
-                self->queued_ -= pending.data.size(); auto callback = std::exchange(pending.completion, {});
-                self->writes_.pop_front(); callback({});
+            std::vector<WriteCallback> doneCallbacks;
+            doneCallbacks.reserve(completedEntries);
+            for (size_t i = 0; i < completedEntries && !self->writes_.empty(); ++i) {
+                auto &front = self->writes_.front();
+                self->queued_ -= front.data.size();
+                if (front.completion) doneCallbacks.push_back(std::exchange(front.completion, {}));
+                self->writes_.pop_front();
+            }
+            if (partialBytesOnNext > 0 && !self->writes_.empty()) {
+                self->writes_.front().offset += partialBytesOnNext;
+            }
+            for (auto &cb : doneCallbacks) {
+                if (cb) cb({});
             }
             self->pumpWrites();
         });
